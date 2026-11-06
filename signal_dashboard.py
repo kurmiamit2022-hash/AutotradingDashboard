@@ -1,6 +1,6 @@
 """
 CE + EMA + QQE MOD signal dashboard for NSE stocks.
-Python port of the TradingView indicator "Chandelier Exit + EMA + QQE MOD Signals".
+Python port of the TradingView indicator "AI Powered Signals".
 
 Setup:   pip install fastapi uvicorn pandas numpy yfinance
 Run:     python signal_dashboard.py
@@ -57,7 +57,7 @@ IST = "Asia/Kolkata"
 MIN_BARS = 150
 
 DEFAULT_SYMBOLS = [
-    "NSEI","RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "LT", "ITC", "AXISBANK", "KOTAKBANK",
+    "NIFTY50","RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "LT", "ITC", "AXISBANK", "KOTAKBANK",
     "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL", "NTPC",
     "POWERGRID", "ONGC", "ADANIENT", "ADANIPORTS", "ASIANPAINT", "ULTRACEMCO", "TITAN", "WIPRO",
     "HCLTECH", "TECHM", "M&M", "COALINDIA", "JSWSTEEL", "HINDALCO", "GRASIM", "CIPLA", "DRREDDY",
