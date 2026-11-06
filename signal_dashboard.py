@@ -14,6 +14,7 @@ This dashboard only reads market data and shows signals. It never places orders.
 """
 import base64
 import os
+import re
 import secrets
 import threading
 import time
@@ -21,6 +22,7 @@ from datetime import datetime, time as dtime
 
 import numpy as np
 import pandas as pd
+import requests
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -45,6 +47,8 @@ CONFIRMED_ONLY = True     # ignore the candle that is still forming
 REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "300"))
 PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "127.0.0.1")
+OPTION_TTL = int(os.getenv("OPTION_TTL", "120"))                 # seconds an option chain stays cached
+STRIKES_EACH_SIDE = int(os.getenv("STRIKES_EACH_SIDE", "8"))       # strikes shown above and below the money
 PASSWORD = os.getenv("DASH_PASSWORD")  # set this when the dashboard is on the internet
 
 PERIODS = {"5m": "30d", "15m": "60d", "1d": "2y"}
@@ -53,8 +57,8 @@ IST = "Asia/Kolkata"
 MIN_BARS = 150
 
 DEFAULT_SYMBOLS = [
-    "NIFTY","RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "LT", "ITC", "AXISBANK", "KOTAKBANK",
-    "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL", "NTPC",
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "LT", "ITC", "AXISBANK", "KOTAKBANK",
+    "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATAMOTORS", "TATASTEEL", "NTPC",
     "POWERGRID", "ONGC", "ADANIENT", "ADANIPORTS", "ASIANPAINT", "ULTRACEMCO", "TITAN", "WIPRO",
     "HCLTECH", "TECHM", "M&M", "COALINDIA", "JSWSTEEL", "HINDALCO", "GRASIM", "CIPLA", "DRREDDY",
     "EICHERMOT", "BAJAJ-AUTO", "HEROMOTOCO", "BRITANNIA", "NESTLEIND",
@@ -312,6 +316,144 @@ def ensure_fresh(interval):
         threading.Thread(target=refresh, args=(interval,), daemon=True).start()
 
 
+# ── Option chain (NSE public website, unofficial) ──
+NSE_BASE = "https://www.nseindia.com"
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": NSE_BASE + "/option-chain",
+}
+EXPIRY_FMT = "%d-%b-%Y"
+BLOCKED_MSG = ("NSE did not return data. NSE often blocks servers in data centres and sometimes rejects requests "
+               "for a few minutes. Try again shortly, or run the dashboard from your own PC.")
+
+
+class NSEClient:
+    """Small polite client: one session, cookies from the option-chain page, one request at a time."""
+
+    def __init__(self):
+        self.session = None
+        self.lock = threading.Lock()
+        self.last = 0.0
+
+    def _prime(self):
+        self.session = requests.Session()
+        self.session.headers.update(NSE_HEADERS)
+        self.session.get(NSE_BASE + "/option-chain", timeout=10)
+
+    def get_json(self, path, params=None):
+        with self.lock:
+            for _ in range(2):  # second try starts a fresh session
+                wait = 0.5 - (time.time() - self.last)
+                if wait > 0:
+                    time.sleep(wait)
+                try:
+                    if self.session is None:
+                        self._prime()
+                    r = self.session.get(NSE_BASE + path, params=params, timeout=10)
+                    self.last = time.time()
+                    if r.status_code == 200 and r.text.strip():
+                        return r.json()
+                except Exception:
+                    pass
+                self.session = None
+            return None
+
+
+nse = NSEClient()
+CHAIN_CACHE = {}
+
+
+def _num(x):
+    try:
+        v = float(x)
+        return None if v != v else v
+    except (TypeError, ValueError):
+        return None
+
+
+def _leg(d):
+    d = d or {}
+    return {"oi": _num(d.get("openInterest")), "doi": _num(d.get("changeinOpenInterest")),
+            "vol": _num(d.get("totalTradedVolume")), "iv": _num(d.get("impliedVolatility")),
+            "ltp": _num(d.get("lastPrice")), "chg": _num(d.get("pChange"))}
+
+
+def _sorted_expiries(dates):
+    out = []
+    for d in set(dates or []):
+        try:
+            out.append((datetime.strptime(d, EXPIRY_FMT).date(), d))
+        except ValueError:
+            pass
+    return [d for _, d in sorted(out)]
+
+
+def parse_chain(raw, expiry):
+    """Turn NSE's option chain JSON into strikes around the money plus a few summary numbers."""
+    rec = raw.get("records") or raw
+    underlying = _num(rec.get("underlyingValue"))
+    rows = []
+    for e in rec.get("data") or []:
+        exp = e.get("expiryDate") or e.get("expiryDates")
+        if expiry and exp and exp != expiry:
+            continue
+        k = _num(e.get("strikePrice"))
+        if k is None:
+            continue
+        ce, pe = e.get("CE"), e.get("PE")
+        if underlying is None:
+            underlying = _num((ce or pe or {}).get("underlyingValue"))
+        rows.append({"strike": k, "ce": _leg(ce), "pe": _leg(pe)})
+    if not rows or underlying is None:
+        return None
+    rows.sort(key=lambda r: r["strike"])
+    ce_oi = sum(r["ce"]["oi"] or 0 for r in rows)
+    pe_oi = sum(r["pe"]["oi"] or 0 for r in rows)
+    max_ce = max(rows, key=lambda r: r["ce"]["oi"] or 0)["strike"]
+    max_pe = max(rows, key=lambda r: r["pe"]["oi"] or 0)["strike"]
+    i = min(range(len(rows)), key=lambda n: abs(rows[n]["strike"] - underlying))
+    return {"underlying": underlying, "timestamp": rec.get("timestamp"), "atm": rows[i]["strike"],
+            "rows": rows[max(0, i - STRIKES_EACH_SIDE): i + STRIKES_EACH_SIDE + 1],
+            "pcr": round(pe_oi / ce_oi, 2) if ce_oi > 0 else None, "max_ce": max_ce, "max_pe": max_pe}
+
+
+def build_chain(symbol, expiry=None):
+    key = (symbol, expiry or "")
+    hit = CHAIN_CACHE.get(key)
+    if hit and time.time() - hit["t"] < OPTION_TTL:
+        return hit["v"]
+
+    today = datetime.now().date()
+    info = nse.get_json("/api/option-chain-contract-info", {"symbol": symbol})
+    expiries = _sorted_expiries((info or {}).get("expiryDates"))
+    upcoming = [d for d in expiries if datetime.strptime(d, EXPIRY_FMT).date() >= today]
+    if expiry not in upcoming:
+        expiry = upcoming[0] if upcoming else None
+
+    parsed = None
+    if expiry:
+        raw = nse.get_json("/api/option-chain-v3", {"type": "Equity", "symbol": symbol, "expiry": expiry})
+        parsed = parse_chain(raw, expiry) if raw else None
+    if not parsed:  # older endpoint as a fallback
+        raw = nse.get_json("/api/option-chain-equities", {"symbol": symbol})
+        if raw:
+            exps = _sorted_expiries((raw.get("records") or {}).get("expiryDates"))
+            expiries = exps or expiries
+            if expiry not in expiries:
+                expiry = expiries[0] if expiries else None
+            parsed = parse_chain(raw, expiry)
+
+    if not parsed:
+        if hit:  # serve the last good copy rather than nothing
+            return {**hit["v"], "stale": True}
+        return {"error": BLOCKED_MSG}
+    out = {**parsed, "symbol": symbol, "expiry": expiry, "expiries": expiries[:4], "stale": False}
+    CHAIN_CACHE[key] = {"t": time.time(), "v": out}
+    return out
+
+
 # ── Web app ──
 app = FastAPI(title="Signal dashboard")
 
@@ -349,6 +491,7 @@ def api_signals(tf: str = DEFAULT_INTERVAL):
             "intervals": INTERVALS,
             "settings": f"Chandelier {ATR_LEN}x{ATR_MULT} + EMA {EMA_LEN} + QQE MOD",
             "fresh_bars": FRESH_BARS,
+            "symbols": SYMBOLS,
         })
 
 
@@ -358,6 +501,31 @@ def api_refresh(tf: str = DEFAULT_INTERVAL):
         tf = DEFAULT_INTERVAL
     threading.Thread(target=refresh, args=(tf,), daemon=True).start()
     return {"ok": True}
+
+
+@app.get("/api/options/chain")
+def api_chain(symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
+    symbol = symbol.upper().strip()
+    if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol):
+        return JSONResponse({"error": "Enter a valid NSE stock symbol, for example RELIANCE."})
+    if tf not in INTERVALS:
+        tf = DEFAULT_INTERVAL
+    chain = build_chain(symbol, expiry or None)
+    if "error" in chain:
+        return JSONResponse(chain)
+
+    with LOCK:
+        row = next((r for r in STATES[tf]["rows"] if r["symbol"] == symbol), None)
+    signal = row["signal"] if row else "–"
+    side = "CE" if signal.endswith("BUY") else "PE" if signal.endswith("SELL") else None
+    out = {**chain, "signal": signal, "bias": side, "suggested": None, "levels": None}
+    if side:
+        atm_row = next((r for r in chain["rows"] if r["strike"] == chain["atm"]), None)
+        if atm_row:
+            out["suggested"] = {"side": side, "strike": chain["atm"], "ltp": atm_row[side.lower()]["ltp"]}
+    if row and row.get("entry") is not None:
+        out["levels"] = {k: row[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")}
+    return JSONResponse(out)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -412,16 +580,54 @@ tr:last-child td{border-bottom:0}
 .up{color:var(--buy)}.dn{color:var(--sell)}
 .note{color:var(--mute);font-size:13px;margin-top:12px;max-width:80ch}
 .empty{padding:40px;text-align:center;color:var(--mute)}
+.mode{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid var(--line)}
+.mode button{background:none;border:0;border-bottom:2px solid transparent;padding:8px 14px;margin-bottom:-1px;cursor:pointer;font-weight:500;color:var(--mute)}
+.mode button[aria-pressed=true]{color:var(--ink);border-bottom-color:var(--ink)}
+.obar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.obar input{flex:1;min-width:220px;max-width:320px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+select{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:3px 6px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
+.chip{display:inline-flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:5px 12px;cursor:pointer}
+.chip[aria-pressed=true]{border-color:var(--ink)}
+.chip .pill{min-width:0;padding:0 8px;font-size:12px}
+.osum{display:flex;flex-wrap:wrap;gap:4px 28px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;margin-bottom:12px}
+.osum:not([hidden]){display:flex}
+.stat{display:flex;flex-direction:column;gap:2px}
+.stat span.l{color:var(--mute);font-size:13px}
+.stat .lv{margin-right:12px;font-weight:400}
+table.otab{min-width:760px}
+table.otab th,table.otab td{text-align:right}
+table.otab td.k,table.otab th.k{text-align:center;font-weight:700}
+table.otab th.g{text-align:center;color:var(--ink);cursor:default}
+tr.atm td{background:var(--flat)}
+td.bias-ce{background:color-mix(in srgb,var(--buy-bg) 55%,transparent)}
+td.bias-pe{background:color-mix(in srgb,var(--sell-bg) 55%,transparent)}
+td.pick-ce{box-shadow:inset 0 0 0 2px var(--buy);font-weight:700}
+td.pick-pe{box-shadow:inset 0 0 0 2px var(--sell);font-weight:700}
 @media(max-width:640px){.tally{grid-template-columns:repeat(2,1fr)}}
 </style></head><body><main>
 <header>
  <div><h1>Signal board</h1><div class="sub" id="meta">Loading first scan…</div></div>
  <div class="ctl"><div class="seg" id="tfs" role="group" aria-label="Timeframe"></div><button class="btn" id="refresh">Refresh now</button></div>
 </header>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="options">Options</button></nav>
+<section id="view-stocks">
 <div class="tally" id="tally"></div>
 <div class="bar"><input id="q" placeholder="Search symbol" aria-label="Search symbol"></div>
 <div class="wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
 <div class="note" id="note"></div>
+</section>
+<section id="view-options" hidden>
+<div class="obar">
+ <input id="osym" list="fno" placeholder="F&amp;O stock symbol, e.g. RELIANCE" aria-label="Stock symbol" autocomplete="off">
+ <datalist id="fno"></datalist>
+ <button class="btn" id="oload">Load chain</button>
+</div>
+<div class="chips" id="chips"></div>
+<div class="osum" id="osum" hidden></div>
+<div class="wrap"><table class="otab" id="otable"></table></div>
+<div class="note" id="onote">Pick a stock with a signal above, or type any F&amp;O stock symbol.</div>
+</section>
 </main>
 <script>
 const cols=[["symbol","Symbol"],["signal","Signal"],["close","Close"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"]];
@@ -437,7 +643,7 @@ document.getElementById("refresh").onclick=async()=>{const b=document.getElement
 document.getElementById("tfs").onclick=e=>{const b=e.target.closest("button");if(!b||b.dataset.tf===tf)return;
  tf=b.dataset.tf;try{localStorage.setItem("tf",tf)}catch(x){}
  data=null;document.getElementById("body").innerHTML=`<tr><td colspan="11" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;
- document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load()};
+ document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(osym)loadChain()};
 async function load(){clearTimeout(timer);const asked=tf;
  try{const d=await (await fetch("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;render();
   timer=setTimeout(load,(d.refreshing||!d.updated)?3000:20000)}
@@ -446,6 +652,7 @@ const isOpen=r=>r.signal.startsWith("Open");
 function render(){
  if(!data)return;
  document.getElementById("tfs").innerHTML=data.intervals.map(x=>`<button data-tf="${x}" aria-pressed="${x===tf}">${tfName[x]||x}</button>`).join("");
+ renderChips();
  const rows=data.rows,cnt=s=>rows.filter(r=>r.signal===s).length;
  const tabs=[["ALL","All symbols",rows.length,""],["BUY","Buy",cnt("BUY"),"buy"],["SELL","Sell",cnt("SELL"),"sell"],["OPEN","Open trades",rows.filter(isOpen).length,""]];
  const t=document.getElementById("tally");
@@ -459,6 +666,62 @@ function render(){
  document.getElementById("body").innerHTML=v.length?v.map(r=>`<tr><td><b>${r.symbol}</b></td><td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${fmt(r.close)}</td><td>${fmt(r.entry)}</td><td class="${r.sl_hit?"dn":""}">${fmt(r.sl)}${r.sl_hit?" ✖":""}</td>${tp(r,1)}${tp(r,2)}${tp(r,3)}${tp(r,4)}<td>${r.status}</td><td>${r.signal_time}</td></tr>`).join(""):`<tr><td colspan="11" class="empty">${data.updated?"No symbols match this filter.":"First scan is running. This page updates on its own."}</td></tr>`;
  document.getElementById("note").textContent=(data.errors.length?`${data.errors.length} symbol(s) skipped: ${data.errors.slice(0,3).join("; ")}${data.errors.length>3?"…":""}. `:"")+`BUY and SELL show for ${data.fresh_bars} candles after a signal. Open trades are older signals whose stop and T4 have not been reached. Entry, SL and targets come from the latest signal for each symbol.`;
 }
+// ── Options tab ──
+let mode="stocks",osym="",oexp="",oreq=0;
+try{mode=localStorage.getItem("mode")||"stocks"}catch(e){}
+const esc=s=>s.replace(/&/g,"&amp;");
+const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(a>=1e7?(a/1e7).toFixed(2)+" Cr":a>=1e5?(a/1e5).toFixed(2)+" L":a>=1e3?(a/1e3).toFixed(1)+" K":String(Math.round(a)))};
+const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
+function setMode(m){mode=m;try{localStorage.setItem("mode",m)}catch(e){}
+ document.getElementById("view-stocks").hidden=m!=="stocks";document.getElementById("view-options").hidden=m!=="options";
+ document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));if(m==="options")renderChips()}
+document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
+function renderChips(){
+ if(!data)return;
+ const dl=document.getElementById("fno");if(!dl.children.length&&data.symbols)dl.innerHTML=data.symbols.map(s=>`<option value="${esc(s)}">`).join("");
+ const sig=data.rows.filter(r=>r.signal!=="–").sort((a,b)=>rank[a.signal]-rank[b.signal]||(a.bars_ago??999)-(b.bars_ago??999));
+ document.getElementById("chips").innerHTML=sig.length?sig.map(r=>`<button class="chip" data-s="${esc(r.symbol)}" aria-pressed="${r.symbol===osym}"><b>${esc(r.symbol)}</b><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></button>`).join(""):`<span class="sub">No stocks have a signal on this timeframe. Type any F&amp;O symbol to see its chain.</span>`;
+}
+document.getElementById("chips").onclick=e=>{const b=e.target.closest(".chip");if(b){osym=b.dataset.s;document.getElementById("osym").value=osym;oexp="";loadChain()}};
+const startLoad=()=>{osym=document.getElementById("osym").value.trim().toUpperCase();oexp="";loadChain()};
+document.getElementById("oload").onclick=startLoad;
+document.getElementById("osym").onkeydown=e=>{if(e.key==="Enter")startLoad()};
+async function loadChain(quiet){
+ if(!osym)return;const my=++oreq,box=document.getElementById("onote");
+ if(!quiet){document.getElementById("otable").innerHTML="";document.getElementById("osum").hidden=true;box.textContent=`Loading the ${osym} option chain…`}
+ renderChips();
+ try{const u=`/api/options/chain?symbol=${encodeURIComponent(osym)}&tf=${tf||""}`+(oexp?`&expiry=${encodeURIComponent(oexp)}`:"");
+  const d=await (await fetch(u)).json();if(my!==oreq)return;renderChain(d)}
+ catch(e){if(my===oreq)box.textContent="Cannot reach the server."}
+}
+function renderChain(d){
+ const box=document.getElementById("onote"),sum=document.getElementById("osum"),tb=document.getElementById("otable");
+ if(d.error){sum.hidden=true;tb.innerHTML="";box.textContent=d.error;return}
+ oexp=d.expiry;const sg=d.signal||"–";
+ const stat=(l,v)=>`<div class="stat"><span class="l">${l}</span><b>${v}</b></div>`;
+ const lv=d.levels?["entry","sl","tp1","tp2","tp3","tp4"].map((k,i)=>`<span class="lv">${["Entry","SL","T1","T2","T3","T4"][i]} ${f2(d.levels[k])}</span>`).join(""):"";
+ sum.hidden=false;
+ sum.innerHTML=stat(esc(d.symbol)+" price",f2(d.underlying))
+  +`<div class="stat"><span class="l">Expiry</span><select id="oexp" aria-label="Expiry">${d.expiries.map(x=>`<option ${x===d.expiry?"selected":""}>${x}</option>`).join("")}</select></div>`
+  +stat("Put/call ratio (OI)",d.pcr??"–")+stat("Most call OI at",d.max_ce??"–")+stat("Most put OI at",d.max_pe??"–")
+  +stat("Stock signal",`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`)
+  +(d.suggested?stat("Option bias",`ATM ${d.suggested.strike} ${d.suggested.side}${d.suggested.ltp!=null?" at ₹"+f2(d.suggested.ltp):""}`):"")
+  +(lv?stat("Stock levels",lv):"");
+ document.getElementById("oexp").onchange=e=>{oexp=e.target.value;loadChain()};
+ const cls=(...a)=>a.filter(Boolean).join(" ");
+ const pickCe=(atm,i)=>d.suggested&&d.suggested.side==="CE"&&atm&&i===4?"pick-ce":"";
+ const pickPe=(atm,i)=>d.suggested&&d.suggested.side==="PE"&&atm&&i===0?"pick-pe":"";
+ const iv=l=>l.iv==null?"–":l.iv.toFixed(1);
+ const rows=d.rows.map(r=>{const atm=r.strike===d.atm;
+  const ce=[fk(r.ce.oi),sgn(r.ce.doi),fk(r.ce.vol),iv(r.ce),f2(r.ce.ltp)].map((c,i)=>`<td class="${cls(d.bias==="CE"&&"bias-ce",pickCe(atm,i))}">${c}</td>`).join("");
+  const pe=[f2(r.pe.ltp),iv(r.pe),fk(r.pe.vol),sgn(r.pe.doi),fk(r.pe.oi)].map((c,i)=>`<td class="${cls(d.bias==="PE"&&"bias-pe",pickPe(atm,i))}">${c}</td>`).join("");
+  return `<tr class="${atm?"atm":""}">${ce}<td class="k">${r.strike.toLocaleString("en-IN")}</td>${pe}</tr>`}).join("");
+ tb.innerHTML=`<thead><tr><th class="g" colspan="5">Calls</th><th class="k" rowspan="2">Strike</th><th class="g" colspan="5">Puts</th></tr><tr><th>OI</th><th>Change in OI</th><th>Volume</th><th>IV</th><th>LTP</th><th>LTP</th><th>IV</th><th>Volume</th><th>Change in OI</th><th>OI</th></tr></thead><tbody>${rows}</tbody>`;
+ box.textContent=(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The indicator runs on the stock's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded.";
+}
+setInterval(()=>{if(mode==="options"&&osym)loadChain(true)},60000);
+setMode(mode);
 load();
 </script></body></html>
 """
