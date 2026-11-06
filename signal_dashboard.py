@@ -7,7 +7,7 @@ Run:     python signal_dashboard.py
 Open:    http://127.0.0.1:8000
 Online:  see Dockerfile; set DASH_PASSWORD on a server.
 
-Optional env vars:  INTERVAL=5m|15m|1h|1d   REFRESH_SECONDS=300   PORT=8000   HOST=0.0.0.0
+Optional env vars:  INTERVAL=5m|15m|1d (default timeframe)   REFRESH_SECONDS=300   PORT=8000   HOST=0.0.0.0
 Optional file:      symbols.txt  (one NSE symbol per line, e.g. RELIANCE) overrides the default list.
 
 This dashboard only reads market data and shows signals. It never places orders.
@@ -26,7 +26,10 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ── Settings: keep these equal to the indicator's inputs ──
-INTERVAL = os.getenv("INTERVAL", "15m")
+INTERVALS = ["5m", "15m", "1d"]   # timeframes offered on the dashboard
+DEFAULT_INTERVAL = os.getenv("INTERVAL", "15m")
+if DEFAULT_INTERVAL not in INTERVALS:
+    DEFAULT_INTERVAL = "15m"
 ATR_LEN, ATR_MULT = 22, 3.0           # Chandelier Exit (close-only extremes)
 EMA_LEN = 20                          # trend filter
 QQE_P = dict(rsi_len=6, smooth=5, factor=3.0)    # QQE primary
@@ -44,14 +47,14 @@ PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "127.0.0.1")
 PASSWORD = os.getenv("DASH_PASSWORD")  # set this when the dashboard is on the internet
 
-PERIOD = {"5m": "30d", "15m": "60d", "1h": "180d", "1d": "2y"}[INTERVAL]
+PERIODS = {"5m": "30d", "15m": "60d", "1d": "2y"}
 STEP = {"5m": pd.Timedelta(minutes=5), "15m": pd.Timedelta(minutes=15), "1h": pd.Timedelta(hours=1)}
 IST = "Asia/Kolkata"
 MIN_BARS = 150
 
 DEFAULT_SYMBOLS = [
     "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "LT", "ITC", "AXISBANK", "KOTAKBANK",
-    "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL", "NTPC",
+    "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATAMOTORS", "TATASTEEL", "NTPC",
     "POWERGRID", "ONGC", "ADANIENT", "ADANIPORTS", "ASIANPAINT", "ULTRACEMCO", "TITAN", "WIPRO",
     "HCLTECH", "TECHM", "M&M", "COALINDIA", "JSWSTEEL", "HINDALCO", "GRASIM", "CIPLA", "DRREDDY",
     "EICHERMOT", "BAJAJ-AUTO", "HEROMOTOCO", "BRITANNIA", "NESTLEIND",
@@ -161,30 +164,30 @@ def within_lookback(flags):
     return pd.Series(flags.astype(float)).rolling(w, min_periods=1).max().to_numpy() > 0
 
 
-def drop_forming(df):
+def drop_forming(df, interval):
     """Remove the last candle if it has not closed yet."""
     if df.empty:
         return df
     now = pd.Timestamp.now(tz=IST)
     last = df.index[-1]
-    if INTERVAL == "1d":
+    if interval == "1d":
         forming = last.date() == now.date() and now.time() < dtime(15, 30)
     else:
-        forming = last + STEP[INTERVAL] > now
+        forming = last + STEP[interval] > now
     return df.iloc[:-1] if forming else df
 
 
-def fmt_time(ts):
-    return ts.strftime("%d %b %H:%M") if INTERVAL != "1d" else ts.strftime("%d %b")
+def fmt_time(ts, interval):
+    return ts.strftime("%d %b %H:%M") if interval != "1d" else ts.strftime("%d %b")
 
 
-def analyse(symbol, df):
+def analyse(symbol, df, interval):
     df = df.dropna(subset=["Close", "High", "Low"]).copy()
     if df.empty:
         return None
     df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
     if CONFIRMED_ONLY:
-        df = drop_forming(df)
+        df = drop_forming(df, interval)
     n = len(df)
     if n < MIN_BARS:
         return None
@@ -252,26 +255,26 @@ def analyse(symbol, df):
 
     base.update(signal=signal, entry=round(entry, 2), sl=round(float(sl), 2),
                 tp1=round(tps[0], 2), tp2=round(tps[1], 2), tp3=round(tps[2], 2), tp4=round(tps[3], 2),
-                hits=hits, sl_hit=sl_hit, status=status, bars_ago=int(bars_ago), signal_time=fmt_time(df.index[j]))
+                hits=hits, sl_hit=sl_hit, status=status, bars_ago=int(bars_ago), signal_time=fmt_time(df.index[j], interval))
     base["side"] = name
     return base
 
 
-# ── Data + cache ──
-STATE = {"rows": [], "updated": None, "errors": [], "refreshing": False}
+# ── Data + cache (one cache per timeframe) ──
+STATES = {tf: {"rows": [], "updated": None, "errors": [], "refreshing": False, "checked": 0.0} for tf in INTERVALS}
 LOCK = threading.Lock()
 
 
-def fetch_all():
+def fetch_all(interval):
     import yfinance as yf  # imported lazily so the module loads without it
 
     tickers = [s + ".NS" for s in SYMBOLS]
-    data = yf.download(tickers, period=PERIOD, interval=INTERVAL, group_by="ticker",
+    data = yf.download(tickers, period=PERIODS[interval], interval=interval, group_by="ticker",
                        auto_adjust=False, threads=True, progress=False)
     rows, errors = [], []
     for s in SYMBOLS:
         try:
-            row = analyse(s, data[s + ".NS"].dropna(how="all"))
+            row = analyse(s, data[s + ".NS"].dropna(how="all"), interval)
             if row:
                 rows.append(row)
             else:
@@ -281,27 +284,32 @@ def fetch_all():
     return rows, errors
 
 
-def refresh():
+def refresh(interval):
+    st = STATES[interval]
     with LOCK:
-        if STATE["refreshing"]:
+        if st["refreshing"]:
             return
-        STATE["refreshing"] = True
+        st["refreshing"] = True
     try:
-        rows, errors = fetch_all()
+        rows, errors = fetch_all(interval)
         with LOCK:
-            STATE.update(rows=rows, errors=errors, updated=datetime.now().strftime("%d %b %H:%M:%S"))
+            st.update(rows=rows, errors=errors, updated=datetime.now().strftime("%d %b %H:%M:%S"))
     except Exception as e:
         with LOCK:
-            STATE["errors"] = [f"Data fetch failed: {e}"]
+            st["errors"] = [f"Data fetch failed: {e}"]
     finally:
         with LOCK:
-            STATE["refreshing"] = False
+            st["refreshing"] = False
+            st["checked"] = time.time()
 
 
-def loop():
-    while True:
-        refresh()
-        time.sleep(REFRESH_SECONDS)
+def ensure_fresh(interval):
+    """Rescan a timeframe in the background when its data is older than REFRESH_SECONDS."""
+    st = STATES[interval]
+    with LOCK:
+        stale = not st["refreshing"] and time.time() - st["checked"] > REFRESH_SECONDS
+    if stale:
+        threading.Thread(target=refresh, args=(interval,), daemon=True).start()
 
 
 # ── Web app ──
@@ -326,23 +334,29 @@ async def basic_auth(request: Request, call_next):
 
 @app.on_event("startup")
 def start_worker():
-    threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=refresh, args=(DEFAULT_INTERVAL,), daemon=True).start()
 
 
 @app.get("/api/signals")
-def api_signals():
+def api_signals(tf: str = DEFAULT_INTERVAL):
+    if tf not in INTERVALS:
+        tf = DEFAULT_INTERVAL
+    ensure_fresh(tf)  # scans on demand, so a timeframe nobody is viewing costs nothing
     with LOCK:
         return JSONResponse({
-            **STATE,
-            "interval": INTERVAL,
+            **STATES[tf],
+            "interval": tf,
+            "intervals": INTERVALS,
             "settings": f"Chandelier {ATR_LEN}x{ATR_MULT} + EMA {EMA_LEN} + QQE MOD",
             "fresh_bars": FRESH_BARS,
         })
 
 
 @app.post("/api/refresh")
-def api_refresh():
-    threading.Thread(target=refresh, daemon=True).start()
+def api_refresh(tf: str = DEFAULT_INTERVAL):
+    if tf not in INTERVALS:
+        tf = DEFAULT_INTERVAL
+    threading.Thread(target=refresh, args=(tf,), daemon=True).start()
     return {"ok": True}
 
 
@@ -372,6 +386,10 @@ button,input{font:inherit;color:inherit}
 .btn{background:var(--ink);color:var(--bg);border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-weight:500}
 .btn:disabled{opacity:.5;cursor:wait}
 :focus-visible{outline:2px solid var(--buy);outline-offset:2px}
+.ctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
+.seg button{background:none;border:0;padding:8px 14px;cursor:pointer;font-weight:500;color:var(--mute)}
+.seg button[aria-pressed=true]{background:var(--ink);color:var(--bg)}
 .tally{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel);margin-bottom:14px}
 .tally button{background:none;border:0;border-right:1px solid var(--line);padding:12px 14px;text-align:left;cursor:pointer}
 .tally button:last-child{border-right:0}
@@ -398,7 +416,7 @@ tr:last-child td{border-bottom:0}
 </style></head><body><main>
 <header>
  <div><h1>Signal board</h1><div class="sub" id="meta">Loading first scan…</div></div>
- <button class="btn" id="refresh">Refresh now</button>
+ <div class="ctl"><div class="seg" id="tfs" role="group" aria-label="Timeframe"></div><button class="btn" id="refresh">Refresh now</button></div>
 </header>
 <div class="tally" id="tally"></div>
 <div class="bar"><input id="q" placeholder="Search symbol" aria-label="Search symbol"></div>
@@ -407,23 +425,33 @@ tr:last-child td{border-bottom:0}
 </main>
 <script>
 const cols=[["symbol","Symbol"],["signal","Signal"],["close","Close"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"]];
-let data=null,filter="ALL",sortKey="signal",sortDir=1,q="";
+let data=null,filter="ALL",sortKey="signal",sortDir=1,q="",timer=null,tf=null;
+try{tf=localStorage.getItem("tf")}catch(e){}
+const tfName={"5m":"5 min","15m":"15 min","1d":"Daily"};
 const rank={BUY:0,SELL:1,"Open BUY":2,"Open SELL":2,"–":3};
 const fmt=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 document.getElementById("head").innerHTML=cols.map(c=>`<th data-k="${c[0]}">${c[1]}</th>`).join("");
 document.getElementById("head").onclick=e=>{const k=e.target.dataset.k;if(!k)return;sortDir=sortKey===k?-sortDir:1;sortKey=k;render()};
 document.getElementById("q").oninput=e=>{q=e.target.value.trim().toUpperCase();render()};
-document.getElementById("refresh").onclick=async()=>{const b=document.getElementById("refresh");b.disabled=true;await fetch("/api/refresh",{method:"POST"});setTimeout(()=>{load();b.disabled=false},4000)};
-async function load(){try{data=await (await fetch("/api/signals")).json();render()}catch(e){document.getElementById("meta").textContent="Cannot reach the server."}}
+document.getElementById("refresh").onclick=async()=>{const b=document.getElementById("refresh");b.disabled=true;await fetch("/api/refresh?tf="+(tf||""),{method:"POST"});setTimeout(()=>{load();b.disabled=false},4000)};
+document.getElementById("tfs").onclick=e=>{const b=e.target.closest("button");if(!b||b.dataset.tf===tf)return;
+ tf=b.dataset.tf;try{localStorage.setItem("tf",tf)}catch(x){}
+ data=null;document.getElementById("body").innerHTML=`<tr><td colspan="11" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;
+ document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load()};
+async function load(){clearTimeout(timer);const asked=tf;
+ try{const d=await (await fetch("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;render();
+  timer=setTimeout(load,(d.refreshing||!d.updated)?3000:20000)}
+ catch(e){document.getElementById("meta").textContent="Cannot reach the server.";timer=setTimeout(load,10000)}}
 const isOpen=r=>r.signal.startsWith("Open");
 function render(){
  if(!data)return;
+ document.getElementById("tfs").innerHTML=data.intervals.map(x=>`<button data-tf="${x}" aria-pressed="${x===tf}">${tfName[x]||x}</button>`).join("");
  const rows=data.rows,cnt=s=>rows.filter(r=>r.signal===s).length;
  const tabs=[["ALL","All symbols",rows.length,""],["BUY","Buy",cnt("BUY"),"buy"],["SELL","Sell",cnt("SELL"),"sell"],["OPEN","Open trades",rows.filter(isOpen).length,""]];
  const t=document.getElementById("tally");
  t.innerHTML=tabs.map(x=>`<button class="${x[3]}" data-f="${x[0]}" aria-pressed="${filter===x[0]}"><b>${x[2]}</b><span>${x[1]}</span></button>`).join("");
  t.onclick=e=>{const b=e.target.closest("button");if(b){filter=b.dataset.f;render()}};
- document.getElementById("meta").textContent=(data.updated?`Updated ${data.updated} · `:"")+`${data.interval} candles · ${data.settings}`+(data.refreshing?" · scanning…":"");
+ document.getElementById("meta").textContent=(data.updated?`Updated ${data.updated} · `:"")+`${tfName[data.interval]} candles · ${data.settings}`+(data.refreshing?" · scanning…":"");
  let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q)));
  v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
   if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
@@ -431,7 +459,7 @@ function render(){
  document.getElementById("body").innerHTML=v.length?v.map(r=>`<tr><td><b>${r.symbol}</b></td><td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${fmt(r.close)}</td><td>${fmt(r.entry)}</td><td class="${r.sl_hit?"dn":""}">${fmt(r.sl)}${r.sl_hit?" ✖":""}</td>${tp(r,1)}${tp(r,2)}${tp(r,3)}${tp(r,4)}<td>${r.status}</td><td>${r.signal_time}</td></tr>`).join(""):`<tr><td colspan="11" class="empty">${data.updated?"No symbols match this filter.":"First scan is running. This page updates on its own."}</td></tr>`;
  document.getElementById("note").textContent=(data.errors.length?`${data.errors.length} symbol(s) skipped: ${data.errors.slice(0,3).join("; ")}${data.errors.length>3?"…":""}. `:"")+`BUY and SELL show for ${data.fresh_bars} candles after a signal. Open trades are older signals whose stop and T4 have not been reached. Entry, SL and targets come from the latest signal for each symbol.`;
 }
-load();setInterval(load,20000);
+load();
 </script></body></html>
 """
 
