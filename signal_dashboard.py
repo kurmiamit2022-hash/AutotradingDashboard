@@ -1,0 +1,439 @@
+"""
+CE + EMA + QQE MOD signal dashboard for NSE stocks.
+Python port of the TradingView indicator "Chandelier Exit + EMA + QQE MOD Signals".
+
+Setup:   pip install fastapi uvicorn pandas numpy yfinance
+Run:     python signal_dashboard.py
+Open:    http://127.0.0.1:8000
+Online:  see Dockerfile; set DASH_PASSWORD on a server.
+
+Optional env vars:  INTERVAL=5m|15m|1h|1d   REFRESH_SECONDS=300   PORT=8000   HOST=0.0.0.0
+Optional file:      symbols.txt  (one NSE symbol per line, e.g. RELIANCE) overrides the default list.
+
+This dashboard only reads market data and shows signals. It never places orders.
+"""
+import base64
+import os
+import secrets
+import threading
+import time
+from datetime import datetime, time as dtime
+
+import numpy as np
+import pandas as pd
+import uvicorn
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse
+
+# ── Settings: keep these equal to the indicator's inputs ──
+INTERVAL = os.getenv("INTERVAL", "15m")
+ATR_LEN, ATR_MULT = 22, 3.0           # Chandelier Exit (close-only extremes)
+EMA_LEN = 20                          # trend filter
+QQE_P = dict(rsi_len=6, smooth=5, factor=3.0)    # QQE primary
+QQE_S = dict(rsi_len=6, smooth=5, factor=1.61)   # QQE secondary
+QQE_THRESHOLD = 3.0
+BB_LEN, BB_MULT = 50, 0.35
+QQE_LOOKBACK = 0                      # 0 = QQE must be green/red on the CE flip candle
+R_MULTIPLES = (1.0, 2.0, 3.0, 4.0)    # T1..T4
+MIN_RISK_ATR, MAX_RISK_ATR = 1.0, 3.0
+
+FRESH_BARS = 3            # a signal shows as BUY/SELL for this many candles, then as "Open" while its trade is live
+CONFIRMED_ONLY = True     # ignore the candle that is still forming
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "300"))
+PORT = int(os.getenv("PORT", "8000"))
+HOST = os.getenv("HOST", "127.0.0.1")
+PASSWORD = os.getenv("DASH_PASSWORD")  # set this when the dashboard is on the internet
+
+PERIOD = {"5m": "30d", "15m": "60d", "1h": "180d", "1d": "2y"}[INTERVAL]
+STEP = {"5m": pd.Timedelta(minutes=5), "15m": pd.Timedelta(minutes=15), "1h": pd.Timedelta(hours=1)}
+IST = "Asia/Kolkata"
+MIN_BARS = 150
+
+DEFAULT_SYMBOLS = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "LT", "ITC", "AXISBANK", "KOTAKBANK",
+    "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATAMOTORS", "TATASTEEL", "NTPC",
+    "POWERGRID", "ONGC", "ADANIENT", "ADANIPORTS", "ASIANPAINT", "ULTRACEMCO", "TITAN", "WIPRO",
+    "HCLTECH", "TECHM", "M&M", "COALINDIA", "JSWSTEEL", "HINDALCO", "GRASIM", "CIPLA", "DRREDDY",
+    "EICHERMOT", "BAJAJ-AUTO", "HEROMOTOCO", "BRITANNIA", "NESTLEIND",
+]
+
+
+def load_symbols():
+    if os.path.exists("symbols.txt"):
+        with open("symbols.txt") as f:
+            syms = [ln.strip().upper() for ln in f if ln.strip() and not ln.startswith("#")]
+        if syms:
+            return syms
+    return DEFAULT_SYMBOLS
+
+
+SYMBOLS = load_symbols()
+
+
+# ── Indicator maths (ported from the Pine script) ──
+def chandelier(df):
+    """Close-only Chandelier Exit. Returns long stop, short stop, direction and plain ATR."""
+    c = df["Close"].to_numpy(float)
+    h = df["High"].to_numpy(float)
+    l = df["Low"].to_numpy(float)
+    n = len(c)
+    prev_c = np.roll(c, 1)
+    prev_c[0] = c[0]
+    tr = np.maximum.reduce([h - l, np.abs(h - prev_c), np.abs(l - prev_c)])
+    atr = pd.Series(tr).ewm(alpha=1 / ATR_LEN, adjust=False).mean().to_numpy()  # Wilder RMA
+    hh = pd.Series(c).rolling(ATR_LEN).max().to_numpy()
+    ll = pd.Series(c).rolling(ATR_LEN).min().to_numpy()
+
+    ls = np.full(n, np.nan)
+    ss = np.full(n, np.nan)
+    d = np.ones(n, dtype=int)
+    for i in range(n):
+        if np.isnan(hh[i]):
+            continue
+        lraw = hh[i] - ATR_MULT * atr[i]
+        sraw = ll[i] + ATR_MULT * atr[i]
+        lp = ls[i - 1] if i > 0 and not np.isnan(ls[i - 1]) else lraw
+        sp = ss[i - 1] if i > 0 and not np.isnan(ss[i - 1]) else sraw
+        ls[i] = max(lraw, lp) if c[i - 1] > lp else lraw
+        ss[i] = min(sraw, sp) if c[i - 1] < sp else sraw
+        d[i] = 1 if c[i] > sp else (-1 if c[i] < lp else d[i - 1])
+    return ls, ss, d, atr
+
+
+def qqe(close, rsi_len, smooth, factor):
+    """QQE as written in the indicator. Returns (trend line, smoothed RSI)."""
+    wilders = rsi_len * 2 - 1
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    dn = (-delta).clip(lower=0)
+    rma = lambda s: s.ewm(alpha=1 / rsi_len, adjust=False).mean()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rsi = 100 - 100 / (1 + rma(up) / rma(dn))
+    sm = rsi.ewm(span=smooth, adjust=False).mean()
+    dyn = (sm.shift(1) - sm).abs().ewm(span=wilders, adjust=False).mean() * factor
+    sm, dyn = sm.to_numpy(), dyn.to_numpy()
+
+    n = len(sm)
+    lb, sb = np.full(n, np.nan), np.full(n, np.nan)
+    lbp, sbp = np.full(n, np.nan), np.full(n, np.nan)
+    trend = np.full(n, np.nan)
+    tdir = 0
+    for i in range(n):
+        if np.isnan(sm[i]) or np.isnan(dyn[i]):
+            continue
+        nl, ns = sm[i] - dyn[i], sm[i] + dyn[i]
+        lp = lb[i - 1] if i > 0 and not np.isnan(lb[i - 1]) else nl
+        sp = sb[i - 1] if i > 0 and not np.isnan(sb[i - 1]) else ns
+        lbp[i], sbp[i] = lp, sp
+        prev = sm[i - 1] if i > 0 else np.nan
+        lb[i] = max(lp, nl) if (prev > lp and sm[i] > lp) else nl
+        sb[i] = min(sp, ns) if (prev < sp and sm[i] < sp) else ns
+
+        cross_short = cross_long = False
+        if i > 0 and not (np.isnan(lbp[i - 1]) or np.isnan(sbp[i - 1]) or np.isnan(sm[i - 1])):
+            # ta.cross(a, b): crossover or crossunder
+            cross_short = (sm[i] > sp and sm[i - 1] <= sbp[i - 1]) or (sm[i] < sp and sm[i - 1] >= sbp[i - 1])
+            cross_long = (lp > sm[i] and lbp[i - 1] <= sm[i - 1]) or (lp < sm[i] and lbp[i - 1] >= sm[i - 1])
+        if cross_short:
+            tdir = 1
+        elif cross_long:
+            tdir = -1
+        trend[i] = lb[i] if tdir == 1 else sb[i]
+    return trend, sm
+
+
+def qqe_states(close):
+    """Boolean arrays: QQE green (up) and QQE red (down) per candle."""
+    trend_p, rsi_p = qqe(close, **QQE_P)
+    _, rsi_s = qqe(close, **QQE_S)
+    x = pd.Series(trend_p - 50)
+    basis = x.rolling(BB_LEN).mean()
+    dev = BB_MULT * x.rolling(BB_LEN).std(ddof=0)  # ta.stdev is the population deviation
+    upper, lower = (basis + dev).to_numpy(), (basis - dev).to_numpy()
+    with np.errstate(invalid="ignore"):
+        green = (rsi_s - 50 > QQE_THRESHOLD) & (rsi_p - 50 > upper)
+        red = (rsi_s - 50 < -QQE_THRESHOLD) & (rsi_p - 50 < lower)
+    return green, red
+
+
+def within_lookback(flags):
+    w = QQE_LOOKBACK + 1
+    return pd.Series(flags.astype(float)).rolling(w, min_periods=1).max().to_numpy() > 0
+
+
+def drop_forming(df):
+    """Remove the last candle if it has not closed yet."""
+    if df.empty:
+        return df
+    now = pd.Timestamp.now(tz=IST)
+    last = df.index[-1]
+    if INTERVAL == "1d":
+        forming = last.date() == now.date() and now.time() < dtime(15, 30)
+    else:
+        forming = last + STEP[INTERVAL] > now
+    return df.iloc[:-1] if forming else df
+
+
+def fmt_time(ts):
+    return ts.strftime("%d %b %H:%M") if INTERVAL != "1d" else ts.strftime("%d %b")
+
+
+def analyse(symbol, df):
+    df = df.dropna(subset=["Close", "High", "Low"]).copy()
+    if df.empty:
+        return None
+    df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
+    if CONFIRMED_ONLY:
+        df = drop_forming(df)
+    n = len(df)
+    if n < MIN_BARS:
+        return None
+
+    close = df["Close"]
+    c = close.to_numpy(float)
+    hi, lo = df["High"].to_numpy(float), df["Low"].to_numpy(float)
+    ls, ss, d, atr = chandelier(df)
+    ema = close.ewm(span=EMA_LEN, adjust=False).mean().to_numpy()
+    green, red = qqe_states(close)
+    green_ok, red_ok = within_lookback(green), within_lookback(red)
+
+    flip_up = np.zeros(n, bool)
+    flip_dn = np.zeros(n, bool)
+    flip_up[1:] = (d[1:] == 1) & (d[:-1] == -1)
+    flip_dn[1:] = (d[1:] == -1) & (d[:-1] == 1)
+    buy = flip_up & (c > ema) & green_ok
+    sell = flip_dn & (c < ema) & red_ok
+    sig_idx = np.nonzero(buy | sell)[0]
+
+    base = {"symbol": symbol, "close": round(float(c[-1]), 2), "signal": "–", "entry": None, "sl": None,
+            "tp1": None, "tp2": None, "tp3": None, "tp4": None, "hits": 0, "sl_hit": False,
+            "status": "No signal yet", "bars_ago": None, "signal_time": "–"}
+    if len(sig_idx) == 0:
+        return base
+
+    j = int(sig_idx[-1])
+    side = 1 if buy[j] else -1
+    entry = float(c[j])
+    raw_stop = ls[j] if side == 1 else ss[j]
+    raw_risk = abs(entry - raw_stop)
+    risk = max(MIN_RISK_ATR * atr[j], min(raw_risk, MAX_RISK_ATR * atr[j]))
+    sl = entry - side * risk
+    tps = [float(entry + side * risk * r) for r in R_MULTIPLES]
+
+    # walk the candles after the signal, same order as the indicator: SL first, then targets
+    hits, sl_hit = 0, False
+    for k in range(j + 1, n):
+        if (lo[k] <= sl) if side == 1 else (hi[k] >= sl):
+            sl_hit = True
+            break
+        reached = sum(1 for t in tps if ((hi[k] >= t) if side == 1 else (lo[k] <= t)))
+        hits = max(hits, reached)
+        if hits == 4:
+            break
+
+    bars_ago = n - 1 - j
+    name = "BUY" if side == 1 else "SELL"
+    live = not sl_hit and hits < 4
+    if bars_ago <= FRESH_BARS:
+        signal = name
+    elif live:
+        signal = "Open " + name
+    else:
+        signal = "–"
+
+    if sl_hit:
+        status = f"T{hits} then SL" if hits else "SL hit"
+    elif hits == 4:
+        status = "T4 hit"
+    elif hits:
+        status = f"T{hits} hit"
+    else:
+        status = "Open"
+
+    base.update(signal=signal, entry=round(entry, 2), sl=round(float(sl), 2),
+                tp1=round(tps[0], 2), tp2=round(tps[1], 2), tp3=round(tps[2], 2), tp4=round(tps[3], 2),
+                hits=hits, sl_hit=sl_hit, status=status, bars_ago=int(bars_ago), signal_time=fmt_time(df.index[j]))
+    base["side"] = name
+    return base
+
+
+# ── Data + cache ──
+STATE = {"rows": [], "updated": None, "errors": [], "refreshing": False}
+LOCK = threading.Lock()
+
+
+def fetch_all():
+    import yfinance as yf  # imported lazily so the module loads without it
+
+    tickers = [s + ".NS" for s in SYMBOLS]
+    data = yf.download(tickers, period=PERIOD, interval=INTERVAL, group_by="ticker",
+                       auto_adjust=False, threads=True, progress=False)
+    rows, errors = [], []
+    for s in SYMBOLS:
+        try:
+            row = analyse(s, data[s + ".NS"].dropna(how="all"))
+            if row:
+                rows.append(row)
+            else:
+                errors.append(f"{s}: not enough data")
+        except Exception as e:  # keep going if one symbol fails
+            errors.append(f"{s}: {e}")
+    return rows, errors
+
+
+def refresh():
+    with LOCK:
+        if STATE["refreshing"]:
+            return
+        STATE["refreshing"] = True
+    try:
+        rows, errors = fetch_all()
+        with LOCK:
+            STATE.update(rows=rows, errors=errors, updated=datetime.now().strftime("%d %b %H:%M:%S"))
+    except Exception as e:
+        with LOCK:
+            STATE["errors"] = [f"Data fetch failed: {e}"]
+    finally:
+        with LOCK:
+            STATE["refreshing"] = False
+
+
+def loop():
+    while True:
+        refresh()
+        time.sleep(REFRESH_SECONDS)
+
+
+# ── Web app ──
+app = FastAPI(title="Signal dashboard")
+
+
+@app.middleware("http")
+async def basic_auth(request: Request, call_next):
+    if PASSWORD:
+        ok = False
+        h = request.headers.get("authorization", "")
+        if h.startswith("Basic "):
+            try:
+                _, _, pw = base64.b64decode(h[6:]).decode().partition(":")
+                ok = secrets.compare_digest(pw, PASSWORD)
+            except Exception:
+                ok = False
+        if not ok:
+            return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Signal board"'})
+    return await call_next(request)
+
+
+@app.on_event("startup")
+def start_worker():
+    threading.Thread(target=loop, daemon=True).start()
+
+
+@app.get("/api/signals")
+def api_signals():
+    with LOCK:
+        return JSONResponse({
+            **STATE,
+            "interval": INTERVAL,
+            "settings": f"Chandelier {ATR_LEN}x{ATR_MULT} + EMA {EMA_LEN} + QQE MOD",
+            "fresh_bars": FRESH_BARS,
+        })
+
+
+@app.post("/api/refresh")
+def api_refresh():
+    threading.Thread(target=refresh, daemon=True).start()
+    return {"ok": True}
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return PAGE
+
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Signal board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#eef1f4;--panel:#fff;--ink:#16202a;--mute:#6a7783;--line:#d9dfe5;
+--buy:#0b7a63;--buy-bg:#d8f0e8;--sell:#b3261e;--sell-bg:#f9dcd9;--flat:#e6eaee}
+@media(prefers-color-scheme:dark){:root{--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;
+--buy:#4cc9a8;--buy-bg:#16372f;--sell:#ff8a80;--sell-bg:#42221f;--flat:#252f38}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 "Schibsted Grotesk",system-ui,sans-serif;font-variant-numeric:tabular-nums}
+main{max-width:1180px;margin:0 auto;padding:28px 20px 60px}
+header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+h1{margin:0;font-size:26px;font-weight:700;letter-spacing:-.01em}
+.sub{color:var(--mute);font-size:13px;margin-top:2px}
+button,input{font:inherit;color:inherit}
+.btn{background:var(--ink);color:var(--bg);border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-weight:500}
+.btn:disabled{opacity:.5;cursor:wait}
+:focus-visible{outline:2px solid var(--buy);outline-offset:2px}
+.tally{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel);margin-bottom:14px}
+.tally button{background:none;border:0;border-right:1px solid var(--line);padding:12px 14px;text-align:left;cursor:pointer}
+.tally button:last-child{border-right:0}
+.tally button[aria-pressed=true]{background:var(--flat)}
+.tally b{display:block;font-size:24px;font-weight:700}
+.tally span{color:var(--mute);font-size:13px}
+.buy b{color:var(--buy)}.sell b{color:var(--sell)}
+.bar{display:flex;gap:10px;margin-bottom:10px}
+.bar input{flex:1;max-width:260px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+.wrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:900px}
+th,td{padding:10px 12px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(10),td:nth-child(10){text-align:left}
+th{font-weight:500;color:var(--mute);font-size:13px;cursor:pointer;user-select:none}
+tr:last-child td{border-bottom:0}
+.pill{display:inline-block;min-width:84px;text-align:center;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:500;background:var(--flat);color:var(--mute)}
+.pill.BUY{background:var(--buy-bg);color:var(--buy);font-weight:700}
+.pill.SELL{background:var(--sell-bg);color:var(--sell);font-weight:700}
+.pill.Open_BUY{color:var(--buy)}.pill.Open_SELL{color:var(--sell)}
+.up{color:var(--buy)}.dn{color:var(--sell)}
+.note{color:var(--mute);font-size:13px;margin-top:12px;max-width:80ch}
+.empty{padding:40px;text-align:center;color:var(--mute)}
+@media(max-width:640px){.tally{grid-template-columns:repeat(2,1fr)}}
+</style></head><body><main>
+<header>
+ <div><h1>Signal board</h1><div class="sub" id="meta">Loading first scan…</div></div>
+ <button class="btn" id="refresh">Refresh now</button>
+</header>
+<div class="tally" id="tally"></div>
+<div class="bar"><input id="q" placeholder="Search symbol" aria-label="Search symbol"></div>
+<div class="wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
+<div class="note" id="note"></div>
+</main>
+<script>
+const cols=[["symbol","Symbol"],["signal","Signal"],["close","Close"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"]];
+let data=null,filter="ALL",sortKey="signal",sortDir=1,q="";
+const rank={BUY:0,SELL:1,"Open BUY":2,"Open SELL":2,"–":3};
+const fmt=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+document.getElementById("head").innerHTML=cols.map(c=>`<th data-k="${c[0]}">${c[1]}</th>`).join("");
+document.getElementById("head").onclick=e=>{const k=e.target.dataset.k;if(!k)return;sortDir=sortKey===k?-sortDir:1;sortKey=k;render()};
+document.getElementById("q").oninput=e=>{q=e.target.value.trim().toUpperCase();render()};
+document.getElementById("refresh").onclick=async()=>{const b=document.getElementById("refresh");b.disabled=true;await fetch("/api/refresh",{method:"POST"});setTimeout(()=>{load();b.disabled=false},4000)};
+async function load(){try{data=await (await fetch("/api/signals")).json();render()}catch(e){document.getElementById("meta").textContent="Cannot reach the server."}}
+const isOpen=r=>r.signal.startsWith("Open");
+function render(){
+ if(!data)return;
+ const rows=data.rows,cnt=s=>rows.filter(r=>r.signal===s).length;
+ const tabs=[["ALL","All symbols",rows.length,""],["BUY","Buy",cnt("BUY"),"buy"],["SELL","Sell",cnt("SELL"),"sell"],["OPEN","Open trades",rows.filter(isOpen).length,""]];
+ const t=document.getElementById("tally");
+ t.innerHTML=tabs.map(x=>`<button class="${x[3]}" data-f="${x[0]}" aria-pressed="${filter===x[0]}"><b>${x[2]}</b><span>${x[1]}</span></button>`).join("");
+ t.onclick=e=>{const b=e.target.closest("button");if(b){filter=b.dataset.f;render()}};
+ document.getElementById("meta").textContent=(data.updated?`Updated ${data.updated} · `:"")+`${data.interval} candles · ${data.settings}`+(data.refreshing?" · scanning…":"");
+ let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q)));
+ v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
+  if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
+ const tp=(r,k)=>`<td class="${r.hits>=k?"up":""}">${fmt(r["tp"+k])}${r.hits>=k?" ✓":""}</td>`;
+ document.getElementById("body").innerHTML=v.length?v.map(r=>`<tr><td><b>${r.symbol}</b></td><td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${fmt(r.close)}</td><td>${fmt(r.entry)}</td><td class="${r.sl_hit?"dn":""}">${fmt(r.sl)}${r.sl_hit?" ✖":""}</td>${tp(r,1)}${tp(r,2)}${tp(r,3)}${tp(r,4)}<td>${r.status}</td><td>${r.signal_time}</td></tr>`).join(""):`<tr><td colspan="11" class="empty">${data.updated?"No symbols match this filter.":"First scan is running. This page updates on its own."}</td></tr>`;
+ document.getElementById("note").textContent=(data.errors.length?`${data.errors.length} symbol(s) skipped: ${data.errors.slice(0,3).join("; ")}${data.errors.length>3?"…":""}. `:"")+`BUY and SELL show for ${data.fresh_bars} candles after a signal. Open trades are older signals whose stop and T4 have not been reached. Entry, SL and targets come from the latest signal for each symbol.`;
+}
+load();setInterval(load,20000);
+</script></body></html>
+"""
+
+if __name__ == "__main__":
+    uvicorn.run(app, host=HOST, port=PORT)
