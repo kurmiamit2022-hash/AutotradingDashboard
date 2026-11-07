@@ -138,6 +138,33 @@ def yf_ticker(s):
     return INDEX_YF.get(s, s + ".NS")
 
 
+# Sector for each symbol (NSE-style groupings). Anything not listed falls under "Others".
+_SECTOR_LISTS = {
+    "Banking": "AUBANK AXISBANK BANDHANBNK BANKBARODA BANKINDIA CANBK CUB FEDERALBNK HDFCBANK ICICIBANK IDFCFIRSTB INDIANB INDUSINDBK KARURVYSYA KOTAKBANK MAHABANK PNB RBLBANK SBIN UJJIVANSFB UNIONBANK YESBANK",
+    "Financial Services": "360ONE ABCAPITAL ANANDRATHI ANGELONE BAJAJFINSV BAJFINANCE BSE CAMS CDSL CHOLAFIN HDFCAMC HDFCLIFE ICICIGI ICICILIFE IEX IRFC IREDA JIOFIN KFINTECH LICHSGFIN LICI LTF MANAPPURAM MCX MFSL MOTILALOFS MUTHOOTFIN NAM-INDIA PAYTM PFC PNBHOUSING POLICYBZR RECLTD SBICARD SBILIFE SHRIRAMFIN",
+    "IT": "COFORGE HCLTECH INFY KPITTECH LTM MPHASIS OFSS PERSISTENT SAGILITY TATAELXSI TCS TECHM WIPRO",
+    "Auto": "ASHOKLEY ATHERENERG BAJAJ-AUTO BHARATFORG BOSCHLTD EICHERMOT FORCEMOT HEROMOTOCO HYUNDAI M&M MARUTI MOTHERSON SONACOMS TIINDIA TMPV TVSMOTOR UNOMINDA",
+    "Pharma & Healthcare": "ALKEM APOLLOHOSP AUROPHARMA BIOCON CIPLA DIVISLAB DRREDDY FORTIS GLENMARK LAURUSLABS LUPIN MANKIND MAXHEALTH SUNPHARMA TORNTPHARM ZYDUSLIFE",
+    "FMCG": "BRITANNIA COLPAL DABUR GODFRYPHLP GODREJCP HINDUNILVR ITC MARICO NESTLEIND PATANJALI RADICO TATACONSUM UNITDSPR VBL",
+    "Metals & Mining": "COALINDIA HINDALCO HINDZINC JINDALSTEL JSWSTEEL NATIONALUM NMDC SAIL TATASTEEL VEDL",
+    "Oil, Gas & Energy": "BPCL GAIL HINDPETRO IOC OIL ONGC PETRONET RELIANCE",
+    "Power": "ADANIENSOL ADANIGREEN ADANIPOWER INOXWIND JSWENERGY NHPC NTPC POWERGRID PREMIERENE SUZLON TATAPOWER WAAREEENER",
+    "Capital Goods & Defence": "ABB BDL BEL BHEL CGPOWER COCHINSHIP CUMMINSIND DATAPATTNS ENRIN GVT&D HAL MAZDOCK POWERINDIA SIEMENS SOLARINDS",
+    "Consumer Durables": "AMBER BLUESTARCO CROMPTON DIXON HAVELLS KAYNES KEI PGEL POLYCAB SYRMA VOLTAS",
+    "Retail & Consumer": "DMART ETERNAL INDHOTEL JUBLFOOD KALYANKJIL NAUKRI NYKAA PAGEIND SWIGGY TITAN TRENT VMM",
+    "Infra & Logistics": "ADANIENT ADANIPORTS CONCOR DELHIVERY GMRAIRPORT INDIGO LT NBCC RVNL",
+    "Telecom": "BHARTIARTL IDEA INDUSTOWER",
+    "Cement & Building": "AMBUJACEM APLAPOLLO ASTRAL GRASIM SHREECEM SUPREMEIND ULTRACEMCO",
+    "Chemicals & Paints": "ASIANPAINT COROMANDEL NAVINFLUOR PIDILITIND PIIND SRF UPL",
+    "Realty": "DLF GODREJPROP LODHA OBEROIRLTY PHOENIXLTD PRESTIGE",
+}
+SECTOR_OF = {sym: sec for sec, names in _SECTOR_LISTS.items() for sym in names.split()}
+
+
+def sector_of(symbol):
+    return "Indices" if symbol in INDEX_YF else SECTOR_OF.get(symbol, "Others")
+
+
 
 # ── Indicator maths (ported from the Pine script) ──
 def chandelier(df):
@@ -252,6 +279,19 @@ def analyse(symbol, df, interval):
     if df.empty:
         return None
     df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
+    chg = None  # change since the previous session's close, using the latest price (even a candle that is still forming)
+    try:
+        cl = df["Close"].to_numpy(float)
+        if interval == "1d":
+            if len(cl) >= 2 and cl[-2] > 0:
+                chg = (cl[-1] / cl[-2] - 1) * 100
+        else:
+            days = np.array([t.date() for t in df.index])
+            before = np.nonzero(days != days[-1])[0]
+            if len(before) and cl[before[-1]] > 0:
+                chg = (cl[-1] / cl[before[-1]] - 1) * 100
+    except Exception:
+        chg = None
     if CONFIRMED_ONLY:
         df = drop_forming(df, interval)
     n = len(df)
@@ -275,6 +315,7 @@ def analyse(symbol, df, interval):
     sig_idx = np.nonzero(buy | sell)[0]
 
     base = {"symbol": symbol, "type": "index" if symbol in INDEX_YF else "stock", "close": round(float(c[-1]), 2), "signal": "–", "entry": None, "sl": None,
+            "sector": sector_of(symbol), "chg": None if chg is None else round(float(chg), 2),
             "tp1": None, "tp2": None, "tp3": None, "tp4": None, "hits": 0, "sl_hit": False,
             "status": "No signal yet", "bars_ago": None, "signal_time": "–"}
     if len(sig_idx) == 0:
@@ -2182,6 +2223,13 @@ button,input{font:inherit;color:inherit}
 .seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
 .seg button{background:none;border:0;padding:8px 14px;cursor:pointer;font-weight:500;color:var(--mute)}
 .seg button[aria-pressed=true]{background:var(--ink);color:var(--bg)}
+.sectors{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin-bottom:14px}
+.sectors button{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px;text-align:left;cursor:pointer;color:var(--ink);font:inherit;display:flex;flex-direction:column;gap:2px}
+.sectors button[aria-pressed=true]{border-color:var(--ink);box-shadow:inset 0 0 0 1px var(--ink)}
+.sectors .sn{font-size:13px;color:var(--mute);line-height:1.25}
+.sectors .sc{font-size:18px;font-weight:700}
+.sectors .ss{font-size:12px;color:var(--mute)}
+.sechead{display:flex;justify-content:space-between;align-items:baseline;margin:0 0 8px}
 .tally{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel);margin-bottom:14px}
 .tally button{background:none;border:0;border-right:1px solid var(--line);padding:12px 14px;text-align:left;cursor:pointer}
 .tally button:last-child{border-right:0}
@@ -2277,6 +2325,8 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
 <nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
+<div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
+<div class="sectors" id="sectors"></div>
 <div class="tally" id="tally"></div>
 <div class="bar"><input id="q" placeholder="Search symbol" aria-label="Search symbol"></div>
 <div class="wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
@@ -2369,9 +2419,9 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <script>
 let csrf="",me=null;
 const api=async(u,o={})=>{o.credentials="same-origin";o.headers={...(o.headers||{}),"X-CSRF-Token":csrf};const r=await fetch(u,o);if(r.status===401){location.href="/login";throw new Error("signed out")}return r};
-const colsStocks=[["symbol","Symbol"],["signal","Signal"],["close","Close"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"],["_t",""]];
-const colsFut=[["symbol","Symbol"],["signal","Signal"],["close","Spot"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"],["lot","Lot"],["fexp","Expiry"],["_t",""]];
-let data=null,filter="ALL",sortKey="signal",sortDir=1,q="",timer=null,tf=null,futInfo={},futLoaded=false;
+const colsStocks=[["symbol","Symbol"],["sector","Sector"],["signal","Signal"],["close","Close"],["chg","Day %"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"],["_t",""]];
+const colsFut=[["symbol","Symbol"],["sector","Sector"],["signal","Signal"],["close","Spot"],["chg","Day %"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"],["lot","Lot"],["fexp","Expiry"],["_t",""]];
+let data=null,sector="ALL",filter="ALL",sortKey="signal",sortDir=1,q="",timer=null,tf=null,futInfo={},futLoaded=false;
 try{tf=localStorage.getItem("tf")}catch(e){}
 const tfName={"5m":"5 min","15m":"15 min","1d":"Daily"};
 const rank={BUY:0,SELL:1,"Open BUY":2,"Open SELL":2,"–":3};
@@ -2396,6 +2446,8 @@ function cellFor(r,k){
  const tp=n=>`<td class="${r.hits>=n?"up":""}">${fmt(r["tp"+n])}${r.hits>=n?" ✓":""}</td>`;
  switch(k){
   case "symbol":return `<td><b>${esc(r.symbol)}</b>${r.type==="index"?'<span class="tag">Index</span>':""}</td>`;
+  case "sector":return `<td class="sub">${esc(r.sector||"")}</td>`;
+  case "chg":return r.chg==null?"<td>–</td>":`<td class="${r.chg>=0?"up":"dn"}">${r.chg>0?"+":""}${r.chg.toFixed(2)}%</td>`;
   case "signal":return `<td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td>`;
   case "close":case "entry":return `<td>${fmt(r[k])}</td>`;
   case "sl":return `<td class="${r.sl_hit?"dn":""}">${fmt(r.sl)}${r.sl_hit?" ✖":""}</td>`;
@@ -2412,13 +2464,26 @@ function render(){
  const fut=mode==="futures";
  const rows=fut?data.rows:data.rows.filter(r=>r.type!=="index");
  rows.forEach(r=>{const f=futInfo[r.symbol];r.lot=f?f.lot:null;r.fexp=f?f.expiry:null});
- const cnt=s=>rows.filter(r=>r.signal===s).length;
- const tabs=[["ALL","All symbols",rows.length,""],["BUY","Buy",cnt("BUY"),"buy"],["SELL","Sell",cnt("SELL"),"sell"],["OPEN","Open trades",rows.filter(isOpen).length,""]];
+ // sector tiles: average day change of the symbols in each sector
+ const grp={};rows.forEach(r=>{const k=r.sector||"Others";(grp[k]=grp[k]||[]).push(r)});
+ if(sector!=="ALL"&&!grp[sector])sector="ALL";
+ const avg=a=>{const v=a.filter(r=>r.chg!=null).map(r=>r.chg);return v.length?v.reduce((x,y)=>x+y,0)/v.length:null};
+ const pc=n=>n==null?"–":(n>0?"+":"")+n.toFixed(2)+"%";
+ const tile=(key,name,a)=>{const m=avg(a),up=a.filter(r=>r.chg>0).length,dn=a.filter(r=>r.chg<0).length,b=a.filter(r=>r.signal==="BUY").length,se=a.filter(r=>r.signal==="SELL").length;
+  return `<button data-sec="${esc(key)}" aria-pressed="${sector===key}"><span class="sn" title="${esc(name)}">${esc(name)}</span><span class="sc ${m==null?"":m>=0?"up":"dn"}">${pc(m)}</span><span class="ss">${a.length} · ${up} up, ${dn} down</span>${b||se?`<span class="ss">${b} buy, ${se} sell</span>`:""}</button>`};
+ const order=Object.keys(grp).sort((a,b)=>(avg(grp[b])??-1e9)-(avg(grp[a])??-1e9));
+ const sc=document.getElementById("sectors");
+ sc.innerHTML=tile("ALL","All sectors",rows)+order.map(k=>tile(k,k,grp[k])).join("");
+ sc.onclick=e=>{const b=e.target.closest("button");if(b){sector=b.dataset.sec;render()}};
+ document.getElementById("secnote").textContent="Average change since the previous session's close, best sector first";
+ const srows=sector==="ALL"?rows:grp[sector];
+ const cnt=s=>srows.filter(r=>r.signal===s).length;
+ const tabs=[["ALL","All symbols",srows.length,""],["BUY","Buy",cnt("BUY"),"buy"],["SELL","Sell",cnt("SELL"),"sell"],["OPEN","Open trades",srows.filter(isOpen).length,""]];
  const t=document.getElementById("tally");
  t.innerHTML=tabs.map(x=>`<button class="${x[3]}" data-f="${x[0]}" aria-pressed="${filter===x[0]}"><b>${x[2]}</b><span>${x[1]}</span></button>`).join("");
  t.onclick=e=>{const b=e.target.closest("button");if(b){filter=b.dataset.f;render()}};
  document.getElementById("meta").textContent=(data.updated?`Updated ${data.updated} · `:"")+`${tfName[data.interval]} candles · ${data.settings}`+(data.refreshing?" · scanning…":"");
- let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q)));
+ let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q))&&(sector==="ALL"||(r.sector||"Others")===sector));
  v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
   if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
  const cs=curCols();
