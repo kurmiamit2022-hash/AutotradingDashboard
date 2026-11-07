@@ -3046,6 +3046,10 @@ button,input{font:inherit;color:inherit}
 .sectors .sn{font-size:13px;color:var(--mute);line-height:1.25}
 .sectors .sc{font-size:18px;font-weight:700}
 .sectors .ss{font-size:12px;color:var(--mute)}
+.idx{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:10px}
+.idx div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px;display:flex;flex-direction:column;gap:2px}
+.idx .sn{font-size:13px;color:var(--mute);font-weight:600}.idx .sc{font-size:20px;font-weight:700}.idx .ss{font-size:13px;font-weight:600}
+.idx:empty{display:none}
 .sechead{display:flex;justify-content:space-between;align-items:baseline;margin:0 0 8px}
 .tally{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel);margin-bottom:14px}
 .tally button{background:none;border:0;border-right:1px solid var(--line);padding:12px 14px;text-align:left;cursor:pointer}
@@ -3156,6 +3160,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
 <nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="history">History</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
+<div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
 <div class="sectors" id="sectors"></div>
 <div class="tally" id="tally"></div>
@@ -3293,8 +3298,8 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <script>
 let csrf="",me=null;
 const api=async(u,o={})=>{o.credentials="same-origin";o.headers={...(o.headers||{}),"X-CSRF-Token":csrf};const r=await fetch(u,o);if(r.status===401){location.href="/login";throw new Error("signed out")}return r};
-const colsStocks=[["symbol","Symbol"],["sector","Sector"],["signal","Signal"],["close","Close"],["chg","Day %"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"],["_t",""]];
-const colsFut=[["symbol","Symbol"],["sector","Sector"],["signal","Signal"],["close","Spot"],["chg","Day %"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"],["lot","Lot"],["fexp","Expiry"],["_t",""]];
+const colsStocks=[["symbol","Symbol"],["signal","Signal"],["status","Status"],["signal_time","Signal candle"],["_t",""],["close","Close"],["chg","Day %"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"]];
+const colsFut=[["symbol","Symbol"],["signal","Signal"],["status","Status"],["signal_time","Signal candle"],["_t",""],["close","Spot"],["chg","Day %"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["lot","Lot"],["fexp","Expiry"]];
 let data=null,sector="ALL",filter="ALL",sortKey="signal",sortDir=1,q="",timer=null,tf=null,futInfo={},futLoaded=false;
 try{tf=localStorage.getItem("tf")}catch(e){}
 const tfName={"5m":"5 min","15m":"15 min","1d":"Daily"};
@@ -3348,9 +3353,12 @@ function render(){
   return `<button data-sec="${esc(key)}" aria-pressed="${sector===key}"><span class="sn" title="${esc(name)}">${esc(name)}</span><span class="sc ${m==null?"":m>=0?"up":"dn"}">${pc(m)}</span><span class="ss">${a.length} · ${up} up, ${dn} down</span>${b||se?`<span class="ss">${b} buy, ${se} sell</span>`:""}</button>`};
  const order=Object.keys(grp).sort((a,b)=>(avg(grp[b])??-1e9)-(avg(grp[a])??-1e9));
  const sc=document.getElementById("sectors");
- sc.innerHTML=tile("ALL","All sectors",rows)+order.map(k=>tile(k,k,grp[k])).join("");
- sc.onclick=e=>{const b=e.target.closest("button");if(b){sector=b.dataset.sec;render()}};
- document.getElementById("secnote").textContent="Average change since the previous session's close, best sector first";
+ sc.innerHTML=order.map(k=>tile(k,k,grp[k])).join("");
+ sc.onclick=e=>{const b=e.target.closest("button");if(b){sector=sector===b.dataset.sec?"ALL":b.dataset.sec;render()}};
+ const ix=["NIFTY","BANKNIFTY","SENSEX"].map(n=>data.rows.find(r=>r.symbol===n)).filter(Boolean);
+ document.getElementById("idxTiles").innerHTML=ix.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,px=r.ltp!=null?r.ltp:r.close;
+  return `<div><span class="sn">${esc(r.symbol)}</span><span class="sc ${c==null?"":c>=0?"up":"dn"}">${fmt(px)}</span><span class="ss ${c==null?"":c>=0?"up":"dn"}">${c==null?"–":(c>0?"+":"")+c.toFixed(2)+"%"}${r.signal&&r.signal!=="–"?` · ${esc(r.signal)}`:""}</span></div>`}).join("");
+ document.getElementById("secnote").textContent="Average change since the previous session's close, best sector first. Click a sector to filter, click again to clear.";
  const srows=sector==="ALL"?rows:grp[sector];
  const cnt=s=>srows.filter(r=>r.signal===s).length;
  const tabs=[["ALL","All symbols",srows.length,""],["BUY","Buy",cnt("BUY"),"buy"],["SELL","Sell",cnt("SELL"),"sell"],["OPEN","Open trades",srows.filter(isOpen).length,""]];
