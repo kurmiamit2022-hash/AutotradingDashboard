@@ -1459,8 +1459,6 @@ def make_order(p, u):
     else:
         right = str(p.get("right", "")).upper()
         expiry = str(p.get("expiry", ""))
-        if symbol in BSE_INDICES:
-            return fail("Option chains for Sensex and Bankex are not available here, so they cannot be traded from the chain.")
         try:
             strike = float(p.get("strike"))
             exp_key = datetime.strptime(expiry, EXPIRY_FMT).strftime("%d%b%Y").upper()
@@ -1479,7 +1477,7 @@ def make_order(p, u):
         inst = M(mname)["opt"].get((symbol, exp_key, strike, right))
         if not inst or not inst[2]:
             return fail("This contract was not found in Angel One's instrument list.")
-        chain = build_chain(symbol, expiry)
+        chain = chain_for(symbol, expiry, u)
         leg = next((r[right.lower()] for r in chain.get("rows", []) if r["strike"] == strike), None)
         if not leg or not leg.get("ltp"):
             return fail("No current price for this contract. Reload the option chain and try again.")
@@ -1897,6 +1895,89 @@ def start_engine():
     if DATA_BROKER in ("angel", "dhan"):
         FEED["source"] = DATA_BROKER
         threading.Thread(target=feed_loop, daemon=True).start()
+
+
+# ── BSE index options (Sensex, Bankex): NSE's site has no BSE contracts, so the chain is built from the broker's instrument list
+# and priced with the broker's last-traded-price call. It shows prices only: open interest and IV are not available this way.
+def chain_account(u):
+    """A broker account that can price contracts: the person's own, else the shared data feed account. Returns (broker id, account)."""
+    for b in ([u.get("default_broker")] if u and u.get("default_broker") else []) + [x for x in (u or {}).get("brokers", [])]:
+        try:
+            return b, get_account(u["id"], b)
+        except Exception:
+            continue
+    if DATA_BROKER in ("angel", "dhan"):
+        try:
+            return DATA_BROKER, feed_account()
+        except Exception:
+            pass
+    return None, None
+
+
+def broker_chain(symbol, expiry, u):
+    bid, acct = chain_account(u)
+    if not acct:
+        return {"error": f"{symbol} option prices come from your broker. Add Angel One or Dhan details under Account first (or set DATA_BROKER on the server)."}
+    if not load_master(bid):
+        return {"error": "Could not load the broker's instrument list. Try again in a minute."}
+    opt = M(bid)["opt"]
+    exps = {}
+    for (sym, ek, strike, right) in opt:
+        if sym == symbol:
+            try:
+                exps[datetime.strptime(ek, "%d%b%Y").date()] = ek
+            except ValueError:
+                pass
+    today = ist_now().date()
+    upcoming = sorted(d for d in exps if d >= today)
+    if not upcoming:
+        return {"error": f"No {symbol} option contracts were found in {BROKER_NAMES[bid]}'s instrument list."}
+    want = None
+    if expiry:
+        try:
+            want = datetime.strptime(expiry, EXPIRY_FMT).date()
+        except ValueError:
+            want = None
+    exp = want if want in upcoming else upcoming[0]
+    ek = exps[exp]
+    strikes = sorted({k for (sym, e, k, r) in opt if sym == symbol and e == ek})
+    spot = None
+    with LOCK:
+        for t_ in INTERVALS:
+            row = next((r for r in STATES[t_]["rows"] if r["symbol"] == symbol), None)
+            if row:
+                spot = apply_live([row])[0].get("ltp", row["close"])
+                break
+    if spot is None:
+        spot = strikes[len(strikes) // 2]
+    i = min(range(len(strikes)), key=lambda n: abs(strikes[n] - spot))
+    window = strikes[max(0, i - STRIKES_EACH_SIDE): i + STRIKES_EACH_SIDE + 1]
+    items, ref = [], {}
+    for k in window:
+        for right in ("CE", "PE"):
+            inst = opt.get((symbol, ek, k, right))
+            if inst:
+                items.append((inst[3], str(inst[0])))
+                ref[(k, right)] = (inst[3], str(inst[0]))
+    key = ("B", symbol, ek, bid)
+    hit = CHAIN_CACHE.get(key)
+    if hit and time.time() - hit["t"] < 5:
+        prices = hit["v"]
+    else:
+        try:
+            prices = acct.ltp(items)
+        except Exception as e:
+            return {"error": f"{BROKER_NAMES[bid]} did not return prices ({str(e)[:120]})."}
+        CHAIN_CACHE[key] = {"t": time.time(), "v": prices}
+    leg = lambda k, r: {"oi": None, "doi": None, "vol": None, "iv": None, "ltp": prices.get(ref.get((k, r)))}
+    rows = [{"strike": k, "ce": leg(k, "CE"), "pe": leg(k, "PE")} for k in window]
+    return {"underlying": round(float(spot), 2), "timestamp": None, "atm": strikes[i], "rows": rows, "pcr": None, "max_ce": None, "max_pe": None,
+            "symbol": symbol, "expiry": exp.strftime(EXPIRY_FMT), "expiries": [d.strftime(EXPIRY_FMT) for d in upcoming[:4]], "stale": False,
+            "source": "broker", "note": f"Prices from {BROKER_NAMES[bid]}. Open interest and IV are not available for {symbol}."}
+
+
+def chain_for(symbol, expiry, u):
+    return broker_chain(symbol, expiry, u) if symbol in BSE_INDICES else build_chain(symbol, expiry)
 
 
 # ── Web app ──
@@ -3213,16 +3294,13 @@ def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL):
 
 
 @app.get("/api/options/chain")
-def api_chain(symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
+def api_chain(request: Request, symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
     symbol = symbol.upper().strip()
     if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol):
         return JSONResponse({"error": "Enter a valid NSE stock symbol, for example RELIANCE."})
     if tf not in INTERVALS:
         tf = DEFAULT_INTERVAL
-    if symbol in BSE_INDICES:
-        return JSONResponse({"error": "Option chains for Sensex and Bankex are not available here. NSE's site does not carry BSE contracts. "
-                                      "Futures signals for them are on the Futures tab."})
-    chain = build_chain(symbol, expiry or None)
+    chain = chain_for(symbol, expiry or None, request.state.user)
     if "error" in chain:
         return JSONResponse(chain)
 
@@ -3247,6 +3325,32 @@ def api_chain(symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
     if row and row.get("entry") is not None:
         out["levels"] = {k: row[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")}
     return JSONResponse(out)
+
+
+IDX_OPT = ("NIFTY", "BANKNIFTY", "SENSEX")
+IDX_TFS = ("5m", "15m")
+
+
+@app.get("/api/index/overview")
+def api_index_overview():
+    """The latest signal for NIFTY and BANKNIFTY on 5 min and 15 min. Opening the tab also starts any scan that is out of date."""
+    for t_ in IDX_TFS:
+        ensure_fresh(t_)
+    out, scanning = {}, False
+    for t_ in IDX_TFS:
+        with LOCK:
+            st = STATES[t_]
+            rows = apply_live(list(st["rows"]))
+            busy = st["refreshing"] or not st["updated"]
+        scanning = scanning or busy
+        out[t_] = {}
+        for sym in IDX_OPT:
+            r = next((x for x in rows if x["symbol"] == sym), None)
+            out[t_][sym] = None if not r else {
+                "signal": r["signal"], "status": r["status"], "signal_time": r["signal_time"], "bars_ago": r["bars_ago"],
+                "price": r.get("ltp", r["close"]), "chg": r.get("ltp_chg", r.get("chg")),
+                "levels": {k: r[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")} if r.get("entry") is not None else None}
+    return {"symbols": list(IDX_OPT), "tfs": list(IDX_TFS), "data": out, "scanning": scanning}
 
 
 @app.get("/api/futures/info")
@@ -4027,6 +4131,13 @@ dialog::backdrop{background:rgba(14,10,40,.6);backdrop-filter:blur(3px)}
 .seg.tm button[data-tm=live][aria-pressed=true]{background:linear-gradient(135deg,#e0264b,#ff9f1a);color:#fff;box-shadow:0 0 14px rgba(var(--glows),.55)}
 .seg.tm button[data-tm=paper][aria-pressed=true]{background:var(--g);color:#fff}
 .seg.tm button:disabled{opacity:.5;cursor:not-allowed}
+.ixbar{margin-bottom:12px}.ixrow{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.ixmat{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px}
+.ixc{background:var(--panel);border-radius:14px;box-shadow:var(--shadow);padding:10px 14px;display:flex;flex-direction:column;gap:3px;cursor:pointer;border:2px solid transparent;text-align:left;color:var(--ink);font:inherit}
+.ixc[aria-pressed=true]{border-color:var(--acc)}.ixc .t{font-size:12.5px;color:var(--mute);font-weight:600}.ixc .px{font-size:12.5px;color:var(--mute)}
+.ixc.fresh.BUY{animation:pulseb 2.2s ease-in-out infinite}.ixc.fresh.SELL{animation:pulses 2.2s ease-in-out infinite}
+.ogrid.ix{grid-template-columns:minmax(0,1fr)}.ogrid.ix .olist{display:none}
+@media(prefers-reduced-motion:reduce){.ixc.fresh{animation:none!important}}
 /* signal flashing */
 .newb{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:999px;font-size:10.5px;font-weight:800;letter-spacing:.08em;color:#fff;background:linear-gradient(135deg,var(--hot),#ff4d6d);animation:blink 1s steps(2,start) infinite;vertical-align:middle}
 tr.fresh.buy td:first-child{box-shadow:inset 4px 0 0 var(--buy)}tr.fresh.sell td:first-child{box-shadow:inset 4px 0 0 var(--sell)}
@@ -4053,7 +4164,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="history">History</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="history">History</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -4064,7 +4175,11 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="note" id="note"></div>
 </section>
 <section id="view-options" hidden>
-<div class="ogrid">
+<div class="ixbar" id="ixbar" hidden>
+ <div class="ixrow"><div class="seg" id="ixSym" role="group" aria-label="Index"></div><div class="seg" id="ixTfs" role="group" aria-label="Timeframe"></div><span class="sub" id="ixNote"></span></div>
+ <div class="ixmat" id="ixMat"></div>
+</div>
+<div class="ogrid" id="ogrid">
  <aside class="olist" aria-label="Scripts">
   <input id="osym" placeholder="Search a stock or index" aria-label="Search scripts" autocomplete="off">
   <select id="osec" aria-label="Sector"><option value="ALL">All sectors</option></select>
@@ -4075,7 +4190,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="osum" id="osum" hidden></div>
   <label class="more"><input type="checkbox" id="omore"> Show volume and IV</label>
   <div class="wrap"><table class="otab" id="otable"></table></div>
-  <div class="note" id="onote">Pick a script on the left. Every F&amp;O stock and index has a chain. Sensex and Bankex option chains are not available here.</div>
+  <div class="note" id="onote">Pick a script on the left. Every F&amp;O stock and index has a chain. Sensex and Bankex chains are priced by your broker and show no open interest.</div>
  </div>
 </div>
 </section>
@@ -4275,16 +4390,20 @@ function render(){
  document.getElementById("note").textContent=(data.errors.length?`${data.errors.length} symbol(s) skipped: ${data.errors.slice(0,3).join("; ")}${data.errors.length>3?"…":""}. `:"")+`BUY and SELL show for ${data.fresh_bars} candles after a signal. Open trades are older signals whose stop and T4 have not been reached. Entry, SL and targets come from the latest signal for each symbol.`+(fut?" Futures signals come from the same indicator on the stock's or index's own candles (spot prices). The lot size and expiry shown are for the nearest-month contract, from Angel One's instrument list.":"");
 }
 // ── Options tab ──
-let mode="stocks",osym="",oexp="",oreq=0;
+let mode="stocks",osym="",oexp="",oreq=0,ixTf="15m";
+try{ixTf=localStorage.getItem("ixTf")==="5m"?"5m":"15m"}catch(e){}
+const optTf=()=>mode==="index"?ixTf:(tf||"");
 try{mode=localStorage.getItem("mode")||"stocks"}catch(e){}
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(a>=1e7?(a/1e7).toFixed(2)+" Cr":a>=1e5?(a/1e5).toFixed(2)+" L":a>=1e3?(a/1e3).toFixed(1)+" K":String(Math.round(a)))};
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
 function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",options:"options",history:"history",orders:"orders",account:"account",admin:"admin"};
+ const vm={stocks:"stocks",futures:"stocks",options:"options",index:"options",history:"history",orders:"orders",account:"account",admin:"admin"};
  ["stocks","options","history","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
+ $("ogrid").classList.toggle("ix",m==="index");$("ixbar").hidden=m!=="index";
+ if(m==="index"){if(!["NIFTY","BANKNIFTY","SENSEX"].includes(osym)){osym="NIFTY";oexp=""}ixPaint();ixLoad();loadChain()}
  if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
@@ -4320,7 +4439,7 @@ async function loadChain(quiet){
  if(!osym)return;const my=++oreq,box=document.getElementById("onote");
  if(!quiet){document.getElementById("otable").innerHTML="";document.getElementById("osum").hidden=true;box.textContent=`Loading the ${osym} option chain…`}
  renderChips();
- try{const u=`/api/options/chain?symbol=${encodeURIComponent(osym)}&tf=${tf||""}`+(oexp?`&expiry=${encodeURIComponent(oexp)}`:"");
+ try{const u=`/api/options/chain?symbol=${encodeURIComponent(osym)}&tf=${optTf()}`+(oexp?`&expiry=${encodeURIComponent(oexp)}`:"");
   const d=await (await api(u)).json();if(my!==oreq)return;renderChain(d)}
  catch(e){if(my===oreq)box.textContent="Cannot reach the server."}
 }
@@ -4405,7 +4524,7 @@ function renderChain(d){
  const si=d.sig_info,tn=tfName[d.tf]||d.tf;let h="";
  if(sg!=="–"){h=`<div class="osl"><span class="pill ${sg.replace(" ","_")}">${sg}</span><b>${esc(d.symbol)} on ${tn} candles</b><span>signal candle ${esc(si.signal_time)}${si.bars_ago!=null?", "+(si.bars_ago===0?"latest candle":si.bars_ago+(si.bars_ago===1?" candle ago":" candles ago")):""} · ${esc(si.status)}</span></div>`;
   if(d.suggested)h+=`<div class="osl"><span>Option idea:</span><button class="btn" id="osug" data-strike="${d.suggested.strike}" data-right="${d.suggested.side}" data-ltp="${d.suggested.ltp??""}" ${d.suggested.ltp==null?"disabled":""}>Buy ATM ${d.suggested.strike} ${d.suggested.side}${d.suggested.ltp!=null?" at ₹"+f2(d.suggested.ltp):""}</button><span class="sub">${d.suggested.side==="CE"?"Buy signal, so a call":"Sell signal, so a put"}. The shaded column is the side that matches the signal.</span></div>`;
-  if(lv)h+=`<div class="osl"><span>Stock levels:</span>${lv}</div>`}
+  if(lv)h+=`<div class="osl"><span>${["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","NIFTYNXT50","SENSEX","BANKEX"].includes(d.symbol)?"Index":"Stock"} levels:</span>${lv}</div>`}
  else{h=`<div class="osl"><span class="pill">–</span><b>No active signal on ${tn} candles</b><span>${si&&si.signal_time!=="–"?"The last signal ("+esc(si.signal_time)+") ended: "+esc(si.status)+".":"No signal in the loaded candles."}</span></div>`}
  const others=Object.entries(d.all_tf||{}).filter(([k])=>k!==d.tf).map(([k,v])=>`<span>${tfName[k]||k}: <span class="pill ${v.signal.replace(" ","_")}">${v.signal}</span></span>`).join("");
  if(others)h+=`<div class="osl"><span>Other timeframes:</span>${others}<span class="sub">(only those already scanned)</span></div>`;
@@ -4423,9 +4542,26 @@ function renderChain(d){
   return `<tr class="${atm?"atm":""}">${ch}<td class="k">${r.strike.toLocaleString("en-IN")}</td>${ph}</tr>`}).join("");
  const cH=more?["OI","Chg OI","Volume","IV","LTP"]:["OI","Chg OI","LTP"],pH=more?["LTP","IV","Volume","Chg OI","OI"]:["LTP","Chg OI","OI"];
  tb.innerHTML=`<thead><tr><th class="g" colspan="${cH.length}">Calls</th><th class="k" rowspan="2">Strike</th><th class="g" colspan="${pH.length}">Puts</th></tr><tr>${cH.map(h=>`<th>${h}</th>`).join("")}${pH.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${rows}</tbody>`;
- box.textContent=(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The indicator runs on the stock's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click B or S beside a price to buy or sell that option.";
+ box.textContent=(d.note?d.note+" ":"")+(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The signal is calculated on the underlying's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click B or S beside a price to buy or sell that option.";
 }
-setInterval(()=>{if(mode==="options"&&osym)loadChain(true)},60000);
+setInterval(()=>{if((mode==="options"||mode==="index")&&osym)loadChain(true)},60000);
+// ── Index Options tab: NIFTY and BANKNIFTY on 5 min and 15 min ──
+let ixData=null,ixTimer=null;
+function ixPaint(){$("ixSym").innerHTML=["NIFTY","BANKNIFTY","SENSEX"].map(x=>`<button data-s="${x}" aria-pressed="${x===osym}">${x}</button>`).join("");
+ $("ixTfs").innerHTML=["5m","15m"].map(x=>`<button data-t="${x}" aria-pressed="${x===ixTf}">${tfName[x]||x}</button>`).join("");ixMatrix()}
+function ixMatrix(){const box=$("ixMat");if(!ixData){box.innerHTML="";return}
+ box.innerHTML=ixData.symbols.flatMap(sy=>ixData.tfs.map(t=>{const r=(ixData.data[t]||{})[sy],sg=r?r.signal:"–",fr=sg==="BUY"||sg==="SELL";
+  const c=r&&r.chg!=null?`<span class="${r.chg>=0?"up":"dn"}">${r.chg>0?"+":""}${r.chg.toFixed(2)}%</span>`:"";
+  return `<button class="ixc ${fr?"fresh "+sg:""}" data-s="${sy}" data-t="${t}" aria-pressed="${sy===osym&&t===ixTf}"><span class="t">${sy} · ${tfName[t]||t}</span><span><span class="pill ${sg.replace(" ","_")}">${sg}</span></span><span class="px">${r?f2(r.price)+" ":""}${c}${r&&r.signal_time!=="–"?" · "+esc(r.signal_time):""}</span></button>`})).join("");
+ $("ixNote").textContent=ixData.scanning?"Scanning the latest candles…":""}
+async function ixLoad(){clearTimeout(ixTimer);if(mode!=="index")return;
+ try{ixData=await (await api("/api/index/overview")).json();ixMatrix()}catch(e){}
+ ixTimer=setTimeout(ixLoad,ixData&&ixData.scanning?3000:20000)}
+function ixPick(sym,t){if(sym)osym=sym;if(t){ixTf=t;try{localStorage.setItem("ixTf",t)}catch(e){}}oexp="";ixPaint();loadChain()}
+function initIndex(){
+ $("ixSym").onclick=e=>{const b=e.target.closest("button");if(b)ixPick(b.dataset.s,null)};
+ $("ixTfs").onclick=e=>{const b=e.target.closest("button");if(b)ixPick(null,b.dataset.t)};
+ $("ixMat").onclick=e=>{const b=e.target.closest(".ixc");if(b)ixPick(b.dataset.s,b.dataset.t)}}
 // ── Orders and order ticket ──
 let tk=null,tkToken=null,tradeInfo={mode:"paper",caps:{}},lastChain=null;
 const $=id=>document.getElementById(id);
@@ -4450,9 +4586,9 @@ function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
 ["tkSide","tkQty","tkType","tkPrice","tkProd","tkBroker","tkAuto","tkTrail"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-initChart();initFlash();initModes();
+initChart();initFlash();initModes();initIndex();
 $("tkReviewBtn").onclick=async()=>{
- const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:tf||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
+ const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.kind==="option"?optTf():tf)||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
  const d=await post("/api/orders/preview",body);
  if(d.error){$("tkMsg").textContent=d.error;return}
