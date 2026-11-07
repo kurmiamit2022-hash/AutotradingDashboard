@@ -2234,7 +2234,7 @@ def api_alert_test(request: Request):
     return {"ok": all(v == "sent" for v in out.values()), "results": out}
 
 
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
        "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
 
@@ -2440,6 +2440,87 @@ def api_refresh(tf: str = DEFAULT_INTERVAL):
         tf = DEFAULT_INTERVAL
     threading.Thread(target=refresh, args=(tf,), daemon=True).start()
     return {"ok": True}
+
+
+# ── Chart popup: candles, EMA, Chandelier line, signal markers and the latest signal's levels ──
+CHART_CACHE = {}
+CHART_BARS = {"5m": 400, "15m": 400, "1d": 500}
+
+
+def chart_data(symbol, tf):
+    import yfinance as yf
+    df = yf.download(yf_ticker(symbol), period=PERIODS[tf], interval=tf, auto_adjust=False, progress=False)
+    if df is None or df.empty:
+        return None
+    if getattr(df.columns, "nlevels", 1) > 1:
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna(subset=["Close", "High", "Low", "Open"]).copy()
+    row = analyse(symbol, df.copy(), tf)  # same rules as the signal board, so the chart always agrees with it
+    df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
+    if CONFIRMED_ONLY:
+        df = drop_forming(df, tf)
+    n = len(df)
+    if n < MIN_BARS or not row:
+        return None
+    c = df["Close"].to_numpy(float)
+    ls, ss, d, atr = chandelier(df)
+    ema = df["Close"].ewm(span=EMA_LEN, adjust=False).mean().to_numpy()
+    green, red = qqe_states(df["Close"])
+    flip_up = np.zeros(n, bool)
+    flip_dn = np.zeros(n, bool)
+    flip_up[1:] = (d[1:] == 1) & (d[:-1] == -1)
+    flip_dn[1:] = (d[1:] == -1) & (d[:-1] == 1)
+    buy = flip_up & (c > ema) & within_lookback(green)
+    sell = flip_dn & (c < ema) & within_lookback(red)
+
+    def tm(ts):
+        return ts.strftime("%Y-%m-%d") if tf == "1d" else int(ts.timestamp()) + 19800  # IST on the axis
+
+    start = max(0, n - CHART_BARS[tf])
+    t = [tm(df.index[i]) for i in range(start, n)]
+
+    def val(a, i):
+        v = a[i]
+        return None if np.isnan(v) else round(float(v), 2)
+
+    out = {"symbol": symbol, "tf": tf, "intraday": tf != "1d",
+           "candles": [{"time": t[k], "open": round(float(df["Open"].iloc[i]), 2), "high": round(float(df["High"].iloc[i]), 2),
+                        "low": round(float(df["Low"].iloc[i]), 2), "close": round(float(c[i]), 2)} for k, i in enumerate(range(start, n))],
+           "ema": [{"time": t[k], "value": val(ema, i)} for k, i in enumerate(range(start, n)) if val(ema, i) is not None],
+           "ce_long": [{"time": t[k], "value": val(ls, i)} for k, i in enumerate(range(start, n)) if d[i] == 1 and val(ls, i) is not None],
+           "ce_short": [{"time": t[k], "value": val(ss, i)} for k, i in enumerate(range(start, n)) if d[i] == -1 and val(ss, i) is not None],
+           "markers": [{"time": t[i - start], "side": "BUY" if buy[i] else "SELL"} for i in range(start, n) if buy[i] or sell[i]],
+           "ema_len": EMA_LEN, "signal": None}
+    if row.get("entry") is not None:
+        j = max((i for i in range(n) if buy[i] or sell[i]), default=None)
+        if j is not None:
+            out["signal"] = {"side": row.get("side"), "state": row["signal"], "status": row["status"], "time": row["signal_time"],
+                             "from": t[max(j, start) - start], "entry": row["entry"], "sl": row["sl"], "sl_hit": row["sl_hit"], "hits": row["hits"],
+                             "tps": [row["tp1"], row["tp2"], row["tp3"], row["tp4"]]}
+    return out
+
+
+@app.get("/api/chart")
+def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL):
+    symbol = symbol.upper().strip()
+    if tf not in INTERVALS:
+        tf = DEFAULT_INTERVAL
+    if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol) or (symbol not in UNIVERSE and symbol not in INDEX_YF):
+        return JSONResponse({"error": "Unknown symbol."}, status_code=400)
+    key = (symbol, tf)
+    hit = CHART_CACHE.get(key)
+    if hit and time.time() - hit[0] < 30:
+        return JSONResponse(hit[1])
+    try:
+        d = chart_data(symbol, tf)
+    except Exception as e:
+        return JSONResponse({"error": f"Could not load candles ({type(e).__name__})."})
+    if not d:
+        return JSONResponse({"error": "Not enough candle data for this symbol and timeframe."})
+    if len(CHART_CACHE) > 200:
+        CHART_CACHE.clear()
+    CHART_CACHE[key] = (time.time(), d)
+    return JSONResponse(d)
 
 
 @app.get("/api/options/chain")
@@ -3126,6 +3207,13 @@ td.pick-pe{box-shadow:inset 0 0 0 2px var(--sell);font-weight:700}
 .px{display:inline-block;min-width:52px}
 dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0;width:min(460px,92vw)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
+#chartDlg{width:min(1100px,96vw);max-width:96vw}
+.chbox{padding:14px 16px}.chhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}.chhead b{font-size:18px}
+.chtfs{display:flex;gap:4px;margin-left:auto}.chtfs button{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:4px 12px;cursor:pointer;font:inherit}
+.chtfs button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
+.chleg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--mute);margin-bottom:6px}.chleg i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
+#chart{height:min(62vh,560px);width:100%}
+td.act{white-space:nowrap}
 .tk{padding:20px}.tk h2{margin:0 0 4px;font-size:20px}
 .tkgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
 .tkgrid label:first-child{grid-column:1/-1}
@@ -3271,6 +3359,12 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
  <div class="tkmsg" id="limMsg" role="status"></div>
  <div class="tkbtns"><button class="btn ghost" id="limClose">Close</button><button class="btn" id="limSave">Save</button></div>
 </div></dialog>
+<dialog id="chartDlg"><div class="chbox">
+ <div class="chhead"><b id="chTitle"></b><div class="chtfs" id="chTfs"></div><button class="btn ghost" id="chClose">Close</button></div>
+ <div class="chleg" id="chLeg"></div>
+ <div id="chMsg" class="tkmsg" role="status"></div>
+ <div id="chart"></div>
+</div></dialog>
 <dialog id="ticket" aria-labelledby="tkTitle"><div class="tk">
  <h2 id="tkTitle">Order ticket</h2>
  <div class="sub" id="tkMode"></div>
@@ -3336,7 +3430,7 @@ function cellFor(r,k){
   case "signal_time":return `<td>${esc(r.signal_time)}</td>`;
   case "lot":return `<td>${r.lot??"–"}</td>`;
   case "fexp":return `<td>${r.fexp??"–"}</td>`;
-  default:return `<td>${r.entry!=null&&r.signal!=="–"?`<button class="mini" data-trade="${esc(r.symbol)}">Trade</button>`:""}</td>`}}
+  default:return `<td class="act"><button class="mini" data-chart="${esc(r.symbol)}" title="Open chart">Chart</button> ${r.entry!=null&&r.signal!=="–"?`<button class="mini" data-trade="${esc(r.symbol)}">Trade</button>`:""}</td>`}}
 function render(){
  if(!data)return;
  document.getElementById("tfs").innerHTML=data.intervals.map(x=>`<button data-tf="${x}" aria-pressed="${x===tf}">${tfName[x]||x}</button>`).join("");
@@ -3423,6 +3517,38 @@ async function loadChain(quiet){
   const d=await (await api(u)).json();if(my!==oreq)return;renderChain(d)}
  catch(e){if(my===oreq)box.textContent="Cannot reach the server."}
 }
+// ── chart popup (TradingView's open-source Lightweight Charts) ──
+let lwPromise=null,chSym="",chTf="",chObj=null;
+function loadLW(){if(window.LightweightCharts)return Promise.resolve();
+ return lwPromise||(lwPromise=new Promise((ok,no)=>{const s=document.createElement("script");s.src="https://cdnjs.cloudflare.com/ajax/libs/lightweight-charts/4.1.3/lightweight-charts.standalone.production.js";s.onload=ok;s.onerror=()=>{lwPromise=null;no()};document.head.appendChild(s)}))}
+function openChart(sym,t){chSym=sym;chTf=t||tf||"15m";$("chTitle").textContent=sym;$("chTfs").innerHTML=(data?data.intervals:["5m","15m","1d"]).map(x=>`<button data-ct="${x}" aria-pressed="${x===chTf}">${tfName[x]||x}</button>`).join("");
+ if(!$("chartDlg").open)$("chartDlg").showModal();drawChart()}
+function initChart(){
+ $("chTfs").onclick=e=>{const b=e.target.closest("button");if(b){chTf=b.dataset.ct;$("chTfs").querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.ct===chTf));drawChart()}};
+ $("chClose").onclick=()=>$("chartDlg").close();
+ $("chartDlg").addEventListener("close",()=>{if(chObj){chObj.remove();chObj=null}})}
+async function drawChart(){
+ const my=chSym+chTf;$("chMsg").textContent="Loading chart…";$("chLeg").innerHTML="";
+ if(chObj){chObj.remove();chObj=null}
+ let d;try{await loadLW();d=await (await api(`/api/chart?symbol=${encodeURIComponent(chSym)}&tf=${chTf}`)).json()}catch(e){$("chMsg").textContent="Could not load the chart. Check your connection.";return}
+ if(my!==chSym+chTf)return;
+ if(d.error){$("chMsg").textContent=d.error;return}
+ $("chMsg").textContent="";
+ const css=getComputedStyle(document.documentElement),col=(n,f)=>css.getPropertyValue(n).trim()||f;
+ const ink=col("--ink","#222"),line=col("--line","#ddd"),up=col("--buy","#0a7d5a"),dn=col("--sell","#c0392b");
+ const ch=LightweightCharts.createChart($("chart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:d.intraday,secondsVisible:false},crosshair:{mode:0}});
+ chObj=ch;
+ const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(d.candles);
+ const ln=(arr,color,w,style)=>{const s=ch.addLineSeries({color,lineWidth:w,lineStyle:style||0,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});s.setData(arr)};
+ ln(d.ema,"#2962ff",1);ln(d.ce_long,up,1,2);ln(d.ce_short,dn,1,2);
+ cs.setMarkers(d.markers.map(m=>m.side==="BUY"?{time:m.time,position:"belowBar",color:up,shape:"arrowUp",text:"BUY"}:{time:m.time,position:"aboveBar",color:dn,shape:"arrowDown",text:"SELL"}));
+ const sg=d.signal,last=d.candles[d.candles.length-1].time,leg=[`<span><i style="background:#2962ff"></i>EMA ${d.ema_len}</span>`,`<span><i style="background:${up}"></i>Chandelier long stop</span>`,`<span><i style="background:${dn}"></i>Chandelier short stop</span>`];
+ if(sg){const lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title});s.setData([{time:sg.from,value:price},{time:last,value:price}])};
+  lv(sg.entry,ink,"Entry",0);lv(sg.sl,dn,"SL"+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(sg.hits>i?" ✓":""),2));
+  leg.unshift(`<b class="${sg.side==="BUY"?"up":"dn"}">${esc(sg.state)}</b> <span>signal candle ${esc(sg.time)}, ${esc(sg.status)}</span>`)}
+ else leg.unshift("<span>No signal to show levels for on this timeframe.</span>");
+ $("chLeg").innerHTML=leg.join("");
+ ch.timeScale().fitContent();if(d.candles.length>120)ch.timeScale().setVisibleLogicalRange({from:d.candles.length-120,to:d.candles.length+4})}
 function renderChain(d){
  const box=document.getElementById("onote"),sum=document.getElementById("osum"),tb=document.getElementById("otable");
  if(d.error){sum.hidden=true;tb.innerHTML="";box.textContent=d.error;return}
@@ -3486,6 +3612,7 @@ function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
 ["tkSide","tkQty","tkType","tkPrice","tkProd","tkBroker","tkAuto","tkTrail"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
+initChart();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:tf||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
@@ -3501,7 +3628,8 @@ $("tkPlace").onclick=async()=>{const b=$("tkPlace");b.disabled=true;
   $("tkMsg").textContent=`Order sent. ID ${d.order.id}, status ${d.order.status}.`+(d.order.sl?" Place the stop-loss from the Orders tab once it is filled.":"");
   tkToken=null;$("tkPlace").hidden=true;$("tkConfirm").hidden=true;$("tkYes").value="";$("tkPin").value="";loadOrders()}
  finally{b.disabled=false}};
-$("body").onclick=e=>{const b=e.target.closest("[data-trade]");if(!b||!data)return;const r=data.rows.find(x=>x.symbol===b.dataset.trade);if(!r)return;
+$("body").onclick=e=>{const cb=e.target.closest("[data-chart]");if(cb){openChart(cb.dataset.chart);return}
+ const b=e.target.closest("[data-trade]");if(!b||!data)return;const r=data.rows.find(x=>x.symbol===b.dataset.trade);if(!r)return;
  const side=r.signal.endsWith("SELL")?"SELL":"BUY";
  openTicket(mode==="futures"?{kind:"future",symbol:r.symbol,label:r.symbol+" futures, nearest month",side,price:r.close}:{kind:"equity",symbol:r.symbol,label:r.symbol,side,price:r.close})};
 $("otable").onclick=e=>{const b=e.target.closest(".ob");if(!b||!lastChain)return;
