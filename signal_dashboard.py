@@ -2047,19 +2047,24 @@ tr:last-child td{border-bottom:0}
 .mode{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid var(--line)}
 .mode button{background:none;border:0;border-bottom:2px solid transparent;padding:8px 14px;margin-bottom:-1px;cursor:pointer;font-weight:500;color:var(--mute)}
 .mode button[aria-pressed=true]{color:var(--ink);border-bottom-color:var(--ink)}
-.obar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
-.obar input{flex:1;min-width:220px;max-width:320px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
-select{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:3px 6px}
-.chips{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
-.chip{display:inline-flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:5px 12px;cursor:pointer}
-.chip[aria-pressed=true]{border-color:var(--ink)}
-.chip .pill{min-width:0;padding:0 8px;font-size:12px}
-.osum{display:flex;flex-wrap:wrap;gap:4px 28px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;margin-bottom:12px}
+.ogrid{display:grid;grid-template-columns:230px minmax(0,1fr);gap:16px;align-items:start}
+.olist{position:sticky;top:8px;display:flex;flex-direction:column;gap:8px}
+.olist input,.olist select{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font:inherit;width:100%}
+.orows{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:10px;background:var(--panel);max-height:70vh;overflow-y:auto}
+.orow{display:flex;justify-content:space-between;align-items:center;gap:8px;background:none;border:0;border-bottom:1px solid var(--line);padding:7px 12px;cursor:pointer;color:var(--ink);font:inherit;text-align:left}
+.orow:last-child{border-bottom:0}
+.orow[aria-pressed=true]{background:var(--flat);font-weight:700}
+.orow .pill{min-width:0;padding:0 8px;font-size:12px}
+.orow .none{color:var(--mute)}
+.omain .more{display:inline-flex;gap:6px;align-items:center;margin:0 0 8px;color:var(--mute);font-size:13px}
+.olv{display:flex;flex-wrap:wrap;gap:4px 14px;margin:-4px 0 12px;font-size:13px;color:var(--mute)}
+@media(max-width:800px){.ogrid{grid-template-columns:1fr}.olist{position:static}.orows{max-height:240px}}
+.osum{display:flex;flex-wrap:wrap;gap:6px 24px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;margin-bottom:12px}
 .osum:not([hidden]){display:flex}
 .stat{display:flex;flex-direction:column;gap:2px}
 .stat span.l{color:var(--mute);font-size:13px}
 .stat .lv{margin-right:12px;font-weight:400}
-table.otab{min-width:760px}
+table.otab{min-width:0}
 table.otab th,table.otab td{text-align:right}
 table.otab td.k,table.otab th.k{text-align:center;font-weight:700}
 table.otab th.g{text-align:center;color:var(--ink);cursor:default}
@@ -2115,15 +2120,19 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <div class="note" id="note"></div>
 </section>
 <section id="view-options" hidden>
-<div class="obar">
- <input id="osym" list="fno" placeholder="Stock or index, e.g. RELIANCE or NIFTY" aria-label="Stock symbol" autocomplete="off">
- <datalist id="fno"></datalist>
- <button class="btn" id="oload">Load chain</button>
+<div class="ogrid">
+ <aside class="olist" aria-label="Scripts">
+  <input id="osym" placeholder="Search a stock or index" aria-label="Search scripts" autocomplete="off">
+  <select id="ofilt" aria-label="Show"><option value="all">All scripts</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option></select>
+  <div class="orows" id="chips"></div>
+ </aside>
+ <div class="omain">
+  <div class="osum" id="osum" hidden></div>
+  <label class="more"><input type="checkbox" id="omore"> Show volume and IV</label>
+  <div class="wrap"><table class="otab" id="otable"></table></div>
+  <div class="note" id="onote">Pick a script on the left. Every F&amp;O stock and index has a chain. Sensex and Bankex option chains are not available here.</div>
+ </div>
 </div>
-<div class="chips" id="chips"></div>
-<div class="osum" id="osum" hidden></div>
-<div class="wrap"><table class="otab" id="otable"></table></div>
-<div class="note" id="onote">Pick a symbol with a signal above, or type any F&amp;O stock or index (NIFTY, BANKNIFTY and so on). Sensex and Bankex option chains are not available here.</div>
 </section>
 <section id="view-orders" hidden>
 <div class="note" id="ordNote" style="margin:0 0 10px">Orders placed from this dashboard today.</div>
@@ -2267,14 +2276,26 @@ function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mod
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
 function renderChips(){
  if(!data)return;
- const dl=document.getElementById("fno");if(!dl.children.length&&data.symbols)dl.innerHTML=(data.symbols||[]).concat(data.indices||[]).map(s=>`<option value="${esc(s)}">`).join("");
- const sig=data.rows.filter(r=>r.signal!=="–").sort((a,b)=>rank[a.signal]-rank[b.signal]||(a.bars_ago??999)-(b.bars_ago??999));
- document.getElementById("chips").innerHTML=sig.length?sig.map(r=>`<button class="chip" data-s="${esc(r.symbol)}" aria-pressed="${r.symbol===osym}"><b>${esc(r.symbol)}</b><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></button>`).join(""):`<span class="sub">No stocks have a signal on this timeframe. Type any F&amp;O stock or index symbol to see its chain.</span>`;
+ const box=document.getElementById("chips"),keep=box.scrollTop;
+ const by={};data.rows.forEach(r=>by[r.symbol]=r);
+ const all=(data.indices||[]).concat(data.symbols||[]);
+ const text=document.getElementById("osym").value.trim().toUpperCase(),fl=document.getElementById("ofilt").value;
+ const list=all.filter(n=>{const sg=(by[n]||{}).signal||"–";
+  if(text&&!n.includes(text))return false;
+  return fl==="all"||(fl==="sig"?sg!=="–":sg.includes(fl))});
+ list.sort((a,b)=>{const ra=by[a]?rank[by[a].signal]:99,rb=by[b]?rank[by[b].signal]:99;return (ra??99)-(rb??99)||a.localeCompare(b)});
+ box.innerHTML=list.length?list.map(n=>{const sg=(by[n]||{}).signal||"–";
+  return `<button class="orow" data-s="${esc(n)}" aria-pressed="${n===osym}"><span>${esc(n)}</span>${sg==="–"?'<span class="none">–</span>':`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`}</button>`}).join(""):`<div class="sub" style="padding:12px">No scripts match.</div>`;
+ box.scrollTop=keep;
 }
-document.getElementById("chips").onclick=e=>{const b=e.target.closest(".chip");if(b){osym=b.dataset.s;document.getElementById("osym").value=osym;oexp="";loadChain()}};
-const startLoad=()=>{osym=document.getElementById("osym").value.trim().toUpperCase();oexp="";loadChain()};
-document.getElementById("oload").onclick=startLoad;
-document.getElementById("osym").onkeydown=e=>{if(e.key==="Enter")startLoad()};
+document.getElementById("chips").onclick=e=>{const b=e.target.closest(".orow");if(b){osym=b.dataset.s;oexp="";loadChain()}};
+document.getElementById("osym").oninput=renderChips;
+document.getElementById("ofilt").onchange=renderChips;
+document.getElementById("osym").onkeydown=e=>{if(e.key!=="Enter")return;
+ const t=e.target.value.trim().toUpperCase();if(!t)return;
+ const all=((data&&data.indices)||[]).concat((data&&data.symbols)||[]);
+ osym=all.includes(t)?t:(all.find(n=>n.startsWith(t))||t);oexp="";loadChain()};
+document.getElementById("omore").onchange=()=>{if(lastChain)renderChain(lastChain)};
 async function loadChain(quiet){
  if(!osym)return;const my=++oreq,box=document.getElementById("onote");
  if(!quiet){document.getElementById("otable").innerHTML="";document.getElementById("osum").hidden=true;box.textContent=`Loading the ${osym} option chain…`}
@@ -2288,24 +2309,27 @@ function renderChain(d){
  if(d.error){sum.hidden=true;tb.innerHTML="";box.textContent=d.error;return}
  oexp=d.expiry;lastChain=d;const sg=d.signal||"–";
  const stat=(l,v)=>`<div class="stat"><span class="l">${l}</span><b>${v}</b></div>`;
- const lv=d.levels?["entry","sl","tp1","tp2","tp3","tp4"].map((k,i)=>`<span class="lv">${["Entry","SL","T1","T2","T3","T4"][i]} ${f2(d.levels[k])}</span>`).join(""):"";
+ const lv=d.levels?["entry","sl","tp1","tp2","tp3","tp4"].map((k,i)=>`<span>${["Entry","SL","T1","T2","T3","T4"][i]} <b>${f2(d.levels[k])}</b></span>`).join(""):"";
  sum.hidden=false;
- sum.innerHTML=stat(esc(d.symbol)+" price",f2(d.underlying))
+ sum.innerHTML=stat(esc(d.symbol),f2(d.underlying))
   +`<div class="stat"><span class="l">Expiry</span><select id="oexp" aria-label="Expiry">${d.expiries.map(x=>`<option ${x===d.expiry?"selected":""}>${x}</option>`).join("")}</select></div>`
-  +stat("Put/call ratio (OI)",d.pcr??"–")+stat("Most call OI at",d.max_ce??"–")+stat("Most put OI at",d.max_pe??"–")
-  +stat("Stock signal",`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`)
-  +(d.suggested?stat("Option bias",`ATM ${d.suggested.strike} ${d.suggested.side}${d.suggested.ltp!=null?" at ₹"+f2(d.suggested.ltp):""}`):"")
-  +(lv?stat("Stock levels",lv):"");
+  +stat("PCR (OI)",d.pcr??"–")+stat("Max call OI",d.max_ce??"–")+stat("Max put OI",d.max_pe??"–")
+  +stat("Signal",`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`)
+  +(d.suggested?stat("Bias",`ATM ${d.suggested.strike} ${d.suggested.side}${d.suggested.ltp!=null?" ₹"+f2(d.suggested.ltp):""}`):"");
+ let ol=document.getElementById("olv");if(!ol){ol=document.createElement("div");ol.id="olv";ol.className="olv";sum.after(ol)}
+ ol.innerHTML=lv?"Stock levels: "+lv:"";ol.hidden=!lv;
  document.getElementById("oexp").onchange=e=>{oexp=e.target.value;loadChain()};
- const cls=(...a)=>a.filter(Boolean).join(" ");
- const pickCe=(atm,i)=>d.suggested&&d.suggested.side==="CE"&&atm&&i===4?"pick-ce":"";
- const pickPe=(atm,i)=>d.suggested&&d.suggested.side==="PE"&&atm&&i===0?"pick-pe":"";
+ const more=document.getElementById("omore").checked,cls=(...a)=>a.filter(Boolean).join(" ");
  const iv=l=>l.iv==null?"–":l.iv.toFixed(1);
  const rows=d.rows.map(r=>{const atm=r.strike===d.atm;
-  const ce=[fk(r.ce.oi),sgn(r.ce.doi),fk(r.ce.vol),iv(r.ce),ltpBtn(r,"CE")].map((c,i)=>`<td class="${cls(d.bias==="CE"&&"bias-ce",pickCe(atm,i))}">${c}</td>`).join("");
-  const pe=[ltpBtn(r,"PE"),iv(r.pe),fk(r.pe.vol),sgn(r.pe.doi),fk(r.pe.oi)].map((c,i)=>`<td class="${cls(d.bias==="PE"&&"bias-pe",pickPe(atm,i))}">${c}</td>`).join("");
-  return `<tr class="${atm?"atm":""}">${ce}<td class="k">${r.strike.toLocaleString("en-IN")}</td>${pe}</tr>`}).join("");
- tb.innerHTML=`<thead><tr><th class="g" colspan="5">Calls</th><th class="k" rowspan="2">Strike</th><th class="g" colspan="5">Puts</th></tr><tr><th>OI</th><th>Change in OI</th><th>Volume</th><th>IV</th><th>LTP</th><th>LTP</th><th>IV</th><th>Volume</th><th>Change in OI</th><th>OI</th></tr></thead><tbody>${rows}</tbody>`;
+  const ce=(more?[fk(r.ce.oi),sgn(r.ce.doi),fk(r.ce.vol),iv(r.ce),ltpBtn(r,"CE")]:[fk(r.ce.oi),sgn(r.ce.doi),ltpBtn(r,"CE")]);
+  const pe=(more?[ltpBtn(r,"PE"),iv(r.pe),fk(r.pe.vol),sgn(r.pe.doi),fk(r.pe.oi)]:[ltpBtn(r,"PE"),sgn(r.pe.doi),fk(r.pe.oi)]);
+  const pickC=d.suggested&&d.suggested.side==="CE"&&atm,pickP=d.suggested&&d.suggested.side==="PE"&&atm;
+  const ch=ce.map((c,i)=>`<td class="${cls(d.bias==="CE"&&"bias-ce",pickC&&i===ce.length-1&&"pick-ce")}">${c}</td>`).join("");
+  const ph=pe.map((c,i)=>`<td class="${cls(d.bias==="PE"&&"bias-pe",pickP&&i===0&&"pick-pe")}">${c}</td>`).join("");
+  return `<tr class="${atm?"atm":""}">${ch}<td class="k">${r.strike.toLocaleString("en-IN")}</td>${ph}</tr>`}).join("");
+ const cH=more?["OI","Chg OI","Volume","IV","LTP"]:["OI","Chg OI","LTP"],pH=more?["LTP","IV","Volume","Chg OI","OI"]:["LTP","Chg OI","OI"];
+ tb.innerHTML=`<thead><tr><th class="g" colspan="${cH.length}">Calls</th><th class="k" rowspan="2">Strike</th><th class="g" colspan="${pH.length}">Puts</th></tr><tr>${cH.map(h=>`<th>${h}</th>`).join("")}${pH.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${rows}</tbody>`;
  box.textContent=(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The indicator runs on the stock's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click B or S beside a price to buy or sell that option.";
 }
 setInterval(()=>{if(mode==="options"&&osym)loadChain(true)},60000);
