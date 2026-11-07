@@ -6,6 +6,7 @@ Setup:   pip install -r requirements.txt            (live trading also: pip inst
 Run:     python signal_dashboard.py
 Open:    http://127.0.0.1:8000
 First sign-in: set ADMIN_USER and ADMIN_PASSWORD, or read the one-time password printed in the console.
+Locked out: set ADMIN_RESET=1 with ADMIN_PASSWORD, restart once, sign in, then remove ADMIN_RESET.
 
 Optional env vars:  INTERVAL=5m|15m|1d  REFRESH_SECONDS=300  PORT=8000  HOST=0.0.0.0
   DB_PATH=dashboard.db  ORDER_LOG=orders_log.jsonl  SECRETS_KEY=<Fernet key>  COOKIE_SECURE=1 (when served over https)
@@ -66,11 +67,50 @@ IST = "Asia/Kolkata"
 MIN_BARS = 150
 
 DEFAULT_SYMBOLS = [
-    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "LT", "ITC", "AXISBANK", "KOTAKBANK",
-    "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATAMOTORS", "TATASTEEL", "NTPC",
-    "POWERGRID", "ONGC", "ADANIENT", "ADANIPORTS", "ASIANPAINT", "ULTRACEMCO", "TITAN", "WIPRO",
-    "HCLTECH", "TECHM", "M&M", "COALINDIA", "JSWSTEEL", "HINDALCO", "GRASIM", "CIPLA", "DRREDDY",
-    "EICHERMOT", "BAJAJ-AUTO", "HEROMOTOCO", "BRITANNIA", "NESTLEIND",
+    "360ONE", "ABB", "ABCAPITAL", "ADANIENSOL", "ADANIENT",
+    "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "ALKEM", "AMBER",
+    "AMBUJACEM", "ANANDRATHI", "ANGELONE", "APLAPOLLO", "APOLLOHOSP",
+    "ASHOKLEY", "ASIANPAINT", "ASTRAL", "ATHERENERG", "AUBANK",
+    "AUROPHARMA", "AXISBANK", "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE",
+    "BANDHANBNK", "BANKBARODA", "BANKINDIA", "BDL", "BEL",
+    "BHARATFORG", "BHARTIARTL", "BHEL", "BIOCON", "BLUESTARCO",
+    "BOSCHLTD", "BPCL", "BRITANNIA", "BSE", "CAMS",
+    "CANBK", "CDSL", "CGPOWER", "CHOLAFIN", "CIPLA",
+    "COALINDIA", "COCHINSHIP", "COFORGE", "COLPAL", "CONCOR",
+    "COROMANDEL", "CROMPTON", "CUB", "CUMMINSIND", "DABUR",
+    "DATAPATTNS", "DELHIVERY", "DIVISLAB", "DIXON", "DLF",
+    "DMART", "DRREDDY", "EICHERMOT", "ENRIN", "ETERNAL",
+    "FEDERALBNK", "FORCEMOT", "FORTIS", "GAIL", "GLENMARK",
+    "GMRAIRPORT", "GODFRYPHLP", "GODREJCP", "GODREJPROP", "GRASIM",
+    "GVT&D", "HAL", "HAVELLS", "HCLTECH", "HDFCAMC",
+    "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDPETRO",
+    "HINDUNILVR", "HINDZINC", "HYUNDAI", "ICICIBANK", "ICICIGI",
+    "ICICILIFE", "IDEA", "IDFCFIRSTB", "IEX", "INDHOTEL",
+    "INDIANB", "INDIGO", "INDUSINDBK", "INDUSTOWER", "INFY",
+    "INOXWIND", "IOC", "IREDA", "IRFC", "ITC",
+    "JINDALSTEL", "JIOFIN", "JSWENERGY", "JSWSTEEL", "JUBLFOOD",
+    "KALYANKJIL", "KARURVYSYA", "KAYNES", "KEI", "KFINTECH",
+    "KOTAKBANK", "KPITTECH", "LAURUSLABS", "LICHSGFIN", "LICI",
+    "LODHA", "LT", "LTF", "LTM", "LUPIN",
+    "M&M", "MAHABANK", "MANAPPURAM", "MANKIND", "MARICO",
+    "MARUTI", "MAXHEALTH", "MAZDOCK", "MCX", "MFSL",
+    "MOTHERSON", "MOTILALOFS", "MPHASIS", "MUTHOOTFIN", "NAM-INDIA",
+    "NATIONALUM", "NAUKRI", "NAVINFLUOR", "NBCC", "NESTLEIND",
+    "NHPC", "NMDC", "NTPC", "NYKAA", "OBEROIRLTY",
+    "OFSS", "OIL", "ONGC", "PAGEIND", "PATANJALI",
+    "PAYTM", "PERSISTENT", "PETRONET", "PFC", "PGEL",
+    "PHOENIXLTD", "PIDILITIND", "PIIND", "PNB", "PNBHOUSING",
+    "POLICYBZR", "POLYCAB", "POWERGRID", "POWERINDIA", "PREMIERENE",
+    "PRESTIGE", "RADICO", "RBLBANK", "RECLTD", "RELIANCE",
+    "RVNL", "SAGILITY", "SAIL", "SBICARD", "SBILIFE",
+    "SBIN", "SHREECEM", "SHRIRAMFIN", "SIEMENS", "SOLARINDS",
+    "SONACOMS", "SRF", "SUNPHARMA", "SUPREMEIND", "SUZLON",
+    "SWIGGY", "SYRMA", "TATACONSUM", "TATAELXSI", "TATAPOWER",
+    "TATASTEEL", "TCS", "TECHM", "TIINDIA", "TITAN",
+    "TMPV", "TORNTPHARM", "TRENT", "TVSMOTOR", "UJJIVANSFB",
+    "ULTRACEMCO", "UNIONBANK", "UNITDSPR", "UNOMINDA", "UPL",
+    "VBL", "VEDL", "VMM", "VOLTAS", "WAAREEENER",
+    "WIPRO", "YESBANK", "ZYDUSLIFE",
 ]
 
 
@@ -483,6 +523,8 @@ LIVE_REQUESTED = os.getenv("LIVE_TRADING", "0") == "1"
 BROKER_PREF = os.getenv("BROKER", "").strip().lower()               # preferred broker for people who set up both
 DB_PATH = os.getenv("DB_PATH", "dashboard.db")
 SESSION_HOURS = float(os.getenv("SESSION_HOURS", "12"))
+ALLOW_SIGNUP = os.getenv("ALLOW_SIGNUP", "1") == "1"                # anyone can create an account (paper mode only until an admin enables live)
+SIGNUP_CODE = os.getenv("SIGNUP_CODE", "").strip()                   # optional invite code required to sign up
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") == "1"              # set to 1 when the site is served over https
 ORDER_LOG = os.getenv("ORDER_LOG", "orders_log.jsonl")
 MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -501,6 +543,7 @@ BROKER_NAMES = {"angel": "Angel One", "dhan": "Dhan", "paper": "Paper"}
 BROKER_FIELDS = {"angel": [("api_key", "API key"), ("client_id", "Client ID"), ("pin", "Login PIN"), ("totp_secret", "TOTP secret")],
                  "dhan": [("client_id", "Client ID"), ("access_token", "Access token")]}
 ORDERS, PENDING, PIN_STATE, LOGIN_FAILS, SYNC, ACCOUNTS = [], {}, {}, {}, {}, {}
+SIGNUP_LOG = {}
 ORDER_LOCK = threading.Lock()
 DB_LOCK = threading.Lock()
 
@@ -583,6 +626,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, csrf TEXT NOT NULL, expires REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS creds(user_id INTEGER NOT NULL, broker TEXT NOT NULL, blob TEXT NOT NULL, hint TEXT, updated TEXT,
               PRIMARY KEY(user_id, broker));""")
+            if "recovery_hash" not in [r[1] for r in con.execute("PRAGMA table_info(users)")]:
+                con.execute("ALTER TABLE users ADD COLUMN recovery_hash TEXT")
             con.commit()
         finally:
             con.close()
@@ -596,9 +641,19 @@ def init_db():
 
 def ensure_admin():
     """The first admin comes from ADMIN_USER / ADMIN_PASSWORD. Without them a random password is printed once."""
-    if q("SELECT COUNT(*) AS c FROM users")[0]["c"]:
-        return
     name = os.getenv("ADMIN_USER", "admin")
+    if q("SELECT COUNT(*) AS c FROM users")[0]["c"]:
+        # Locked out? Set ADMIN_RESET=1 with ADMIN_PASSWORD, restart once, sign in, then remove ADMIN_RESET.
+        if os.getenv("ADMIN_RESET") == "1" and os.getenv("ADMIN_PASSWORD"):
+            row = q("SELECT id FROM users WHERE username=?", (name,))
+            if row:
+                x("UPDATE users SET pw_hash=?, role='admin', active=1 WHERE id=?", (hash_secret(os.environ["ADMIN_PASSWORD"]), row[0]["id"]))
+                x("DELETE FROM sessions WHERE user_id=?", (row[0]["id"],))
+            else:
+                x("INSERT INTO users(username, pw_hash, role, active, live_allowed, created) VALUES(?,?,?,?,?,?)",
+                  (name, hash_secret(os.environ["ADMIN_PASSWORD"]), "admin", 1, 0, ist_now().isoformat()))
+            print(f"\n  Admin password reset for '{name}'. Remove ADMIN_RESET now.\n", flush=True)
+        return
     pw = os.getenv("ADMIN_PASSWORD") or os.getenv("DASH_PASSWORD") or ""
     generated = not pw
     if generated:
@@ -649,7 +704,7 @@ def build_user(row):
     brokers = [b for b in ("angel", "dhan") if b in have]
     default = BROKER_PREF if BROKER_PREF in brokers else (brokers[0] if brokers else "angel")
     return {"id": row["id"], "username": row["username"], "role": row["role"], "active": bool(row["active"]),
-            "live_allowed": bool(row["live_allowed"]), "pin_hash": row.get("pin_hash"), "pin_set": bool(row.get("pin_hash")),
+            "live_allowed": bool(row["live_allowed"]), "pin_hash": row.get("pin_hash"), "recovery_set": bool(row.get("recovery_hash")), "pin_set": bool(row.get("pin_hash")),
             "caps": caps, "brokers": brokers, "default_broker": default, "csrf": row.get("csrf")}
 
 
@@ -668,7 +723,7 @@ def session_user(request):
 
 
 def public_user(u):
-    return {k: u[k] for k in ("id", "username", "role", "active", "live_allowed", "pin_set", "brokers", "caps")}
+    return {k: u[k] for k in ("id", "username", "role", "active", "live_allowed", "pin_set", "recovery_set", "brokers", "caps")}
 
 
 def user_mode(u):
@@ -681,6 +736,41 @@ def user_mode(u):
     if not u["brokers"]:
         return "paper", "Paper mode: add your broker details under Account to enable live trading."
     return "live", ""
+
+
+RECOVERY_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def new_recovery_key():
+    k = "".join(secrets.choice(RECOVERY_CHARS) for _ in range(16))
+    return "-".join(k[i:i + 4] for i in range(0, 16, 4))
+
+
+def norm_key(k):
+    return re.sub(r"[^A-Z0-9]", "", str(k).upper())
+
+
+def set_recovery(uid):
+    key = new_recovery_key()
+    x("UPDATE users SET recovery_hash=? WHERE id=?", (hash_secret(norm_key(key)), uid))
+    return key
+
+
+def valid_new_password(name, pw):
+    if len(pw) < 10:
+        return "Use at least 10 characters."
+    if pw.lower() == name.lower():
+        return "The password cannot be the same as the username."
+    return None
+
+
+def client_ip(request):
+    return request.client.host if request.client else "?"
+
+
+def session_cookie(resp, request, uid):
+    resp.set_cookie("sid", new_session(uid), httponly=True, samesite="lax", path="/",
+                    secure=COOKIE_SECURE or request.url.scheme == "https", max_age=int(SESSION_HOURS * 3600))
 
 
 _FERNET = {}
@@ -1235,7 +1325,7 @@ def sync_status(u):
 app = FastAPI(title="Signal dashboard")
 
 
-PUBLIC_PATHS = {"/login", "/api/login"}
+PUBLIC_PATHS = {"/login", "/api/login", "/signup", "/api/signup", "/forgot", "/api/forgot"}
 
 
 @app.middleware("http")
@@ -1299,7 +1389,80 @@ def api_logout(request: Request):
 def login_page(request: Request):
     if request.state.user:
         return RedirectResponse("/")
-    return LOGIN_PAGE
+    return auth_page("login")
+
+
+@app.get("/signup", response_class=HTMLResponse)
+def signup_page(request: Request):
+    if request.state.user:
+        return RedirectResponse("/")
+    return auth_page("signup")
+
+
+@app.get("/forgot", response_class=HTMLResponse)
+def forgot_page(request: Request):
+    if request.state.user:
+        return RedirectResponse("/")
+    return auth_page("forgot")
+
+
+@app.post("/api/signup")
+def api_signup(request: Request, payload: dict = Body(...)):
+    if not ALLOW_SIGNUP:
+        return JSONResponse({"error": "Sign-up is closed. Ask the admin for an account."}, status_code=403)
+    ip = client_ip(request)
+    now = time.time()
+    recent = [t for t in SIGNUP_LOG.get(ip, []) if now - t < 3600]
+    if len(recent) >= 5:
+        return JSONResponse({"error": "Too many sign-ups from this address. Try again later."}, status_code=429)
+    SIGNUP_LOG[ip] = recent + [now]
+    if SIGNUP_CODE and not hmac.compare_digest(str(payload.get("code", "")), SIGNUP_CODE):
+        return JSONResponse({"error": "The invite code is wrong."}, status_code=400)
+    name = str(payload.get("username", "")).strip()
+    pw = str(payload.get("password", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", name):
+        return JSONResponse({"error": "Username: 3 to 32 letters, digits, dots, dashes or underscores."}, status_code=400)
+    bad = valid_new_password(name, pw)
+    if bad:
+        return JSONResponse({"error": bad}, status_code=400)
+    if q("SELECT 1 FROM users WHERE username=?", (name,)):
+        return JSONResponse({"error": "That username is taken."}, status_code=400)
+    uid = x("INSERT INTO users(username, pw_hash, role, active, live_allowed, created) VALUES(?,?,?,?,?,?)",
+            (name, hash_secret(pw), "user", 1, 0, ist_now().isoformat()))
+    resp = JSONResponse({"ok": True, "recovery_key": set_recovery(uid)})
+    session_cookie(resp, request, uid)
+    return resp
+
+
+@app.post("/api/forgot")
+def api_forgot(request: Request, payload: dict = Body(...)):
+    name = str(payload.get("username", "")).strip()
+    key = norm_key(payload.get("key", ""))
+    pw = str(payload.get("password", ""))
+    fk = ("forgot", name.lower(), client_ip(request))
+    st = LOGIN_FAILS.get(fk, {"n": 0, "until": 0.0})
+    if time.time() < st["until"]:
+        return JSONResponse({"error": "Too many attempts. Try again in a few minutes."}, status_code=429)
+    rows = q("SELECT * FROM users WHERE username=?", (name,))
+    stored = rows[0].get("recovery_hash") if rows else None
+    ok = bool(rows) and bool(rows[0]["active"]) and bool(stored) and check_secret(key, stored)
+    if not stored:
+        check_secret(key, DUMMY_HASH)  # same work whether or not the name or key exists
+    if not ok:
+        st["n"] += 1
+        if st["n"] >= 5:
+            st = {"n": 0, "until": time.time() + 900}
+        LOGIN_FAILS[fk] = st
+        return JSONResponse({"error": "The username or recovery key is wrong. If you have no recovery key, ask the admin to reset your password."}, status_code=400)
+    bad = valid_new_password(name, pw)
+    if bad:
+        return JSONResponse({"error": bad}, status_code=400)
+    LOGIN_FAILS.pop(fk, None)
+    uid = rows[0]["id"]
+    x("UPDATE users SET pw_hash=? WHERE id=?", (hash_secret(pw), uid))
+    x("DELETE FROM sessions WHERE user_id=?", (uid,))
+    PIN_STATE.pop(uid, None)
+    return {"ok": True, "recovery_key": set_recovery(uid)}  # a recovery key works once; here is the next one
 
 
 @app.get("/api/signals")
@@ -1550,8 +1713,9 @@ def api_password(request: Request, payload: dict = Body(...)):
     if not check_secret(str(payload.get("current", "")), row["pw_hash"]):
         return {"error": "Your current password is wrong."}
     new = str(payload.get("new", ""))
-    if len(new) < 10:
-        return {"error": "Use at least 10 characters."}
+    bad = valid_new_password(u["username"], new)
+    if bad:
+        return {"error": bad}
     x("UPDATE users SET pw_hash=? WHERE id=?", (hash_secret(new), u["id"]))
     x("DELETE FROM sessions WHERE user_id=? AND token_hash!=?", (u["id"], sha(request.cookies.get("sid", ""))))
     return {"ok": True}
@@ -1569,6 +1733,15 @@ def api_pin(request: Request, payload: dict = Body(...)):
     x("UPDATE users SET pin_hash=? WHERE id=?", (hash_secret(pin), u["id"]))
     PIN_STATE.pop(u["id"], None)
     return {"ok": True}
+
+
+@app.post("/api/account/recovery")
+def api_recovery(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    row = q("SELECT pw_hash FROM users WHERE id=?", (u["id"],))[0]
+    if not check_secret(str(payload.get("password", "")), row["pw_hash"]):
+        return {"error": "Your account password is wrong."}
+    return {"ok": True, "recovery_key": set_recovery(u["id"])}
 
 
 @app.put("/api/account/broker")
@@ -1714,7 +1887,87 @@ def index():
     return PAGE
 
 
-LOGIN_PAGE = r"""<!doctype html>
+AUTH_CSS = """
+:root{--bg:#eef1f4;--panel:#fff;--ink:#16202a;--mute:#6a7783;--line:#d9dfe5;--sell:#b3261e;--buy:#0b7a63}
+@media(prefers-color-scheme:dark){:root{--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;--sell:#ff8a80;--buy:#4cc9a8}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif;padding:16px}
+form,.box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:26px;width:min(380px,100%)}
+h1{margin:0 0 4px;font-size:24px}p{margin:0 0 16px;color:var(--mute);font-size:14px}
+label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute);margin-bottom:12px}
+input{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+button{width:100%;font:inherit;font-weight:500;background:var(--ink);color:var(--bg);border:0;border-radius:8px;padding:10px;cursor:pointer}
+button:disabled{opacity:.5}
+#msg{min-height:20px;margin:10px 0 0;color:var(--sell);font-size:14px}
+.alt{margin:14px 0 0;font-size:14px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+a{color:var(--ink)}
+.key{font:700 20px/1.3 ui-monospace,Menlo,monospace;letter-spacing:.05em;text-align:center;border:2px dashed var(--ink);border-radius:8px;padding:14px;margin:12px 0;user-select:all;word-break:break-all}
+.warn{color:var(--sell);font-size:14px}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+"""
+
+AUTH_BODIES = {
+ "login": """<form id="f"><h1>Signal board</h1><p>Sign in to continue.</p>
+<label>Username<input id="u" autocomplete="username" required autofocus></label>
+<label>Password<input id="p" type="password" autocomplete="current-password" required></label>
+<button id="go">Sign in</button><div id="msg" role="alert"></div>
+<div class="alt"><a href="/forgot">Forgot password?</a><!--SIGNUP--></div></form>""",
+ "signup": """<form id="f"><h1>Create your account</h1><p>You start in paper mode. Live trading is switched on later by an admin.</p>
+<label>Username<input id="u" autocomplete="username" required autofocus></label>
+<label>Password (at least 10 characters)<input id="p" type="password" autocomplete="new-password" minlength="10" required></label>
+<!--CODE-->
+<button id="go">Create account</button><div id="msg" role="alert"></div>
+<div class="alt"><a href="/login">I already have an account</a></div></form>
+<div class="box" id="done" hidden><h1>Save your recovery key</h1>
+<p>This key is the only way to reset your own password if you forget it. It is shown once. Write it down or store it in a password manager.</p>
+<div class="key" id="key"></div><p class="warn">Anyone with this key and your username can reset your password.</p>
+<button id="cont">I have saved it, continue</button></div>""",
+ "forgot": """<form id="f"><h1>Reset your password</h1><p>Enter your username and the recovery key you saved when you signed up.</p>
+<label>Username<input id="u" autocomplete="username" required autofocus></label>
+<label>Recovery key<input id="k" autocomplete="off" placeholder="XXXX-XXXX-XXXX-XXXX" required></label>
+<label>New password (at least 10 characters)<input id="p" type="password" autocomplete="new-password" minlength="10" required></label>
+<button id="go">Reset password</button><div id="msg" role="alert"></div>
+<div class="alt"><a href="/login">Back to sign in</a></div></form>
+<div class="box" id="done" hidden><h1>Password changed</h1>
+<p>Your old recovery key has been used up. Here is your new one. It is shown once.</p>
+<div class="key" id="key"></div><button id="cont">I have saved it, sign in</button></div>""",
+}
+
+AUTH_JS = {
+ "login": """const post=async(u,b)=>{const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});return [r.ok,await r.json()]};
+f.onsubmit=async e=>{e.preventDefault();go.disabled=true;msg.textContent="";
+ try{const [ok,d]=await post("/api/login",{username:u.value,password:p.value});if(ok)location.href="/";else msg.textContent=d.error||"Could not sign in."}
+ catch(x){msg.textContent="Cannot reach the server."}finally{go.disabled=false}};""",
+ "signup": """const post=async(u,b)=>{const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});return [r.ok,await r.json()]};
+f.onsubmit=async e=>{e.preventDefault();go.disabled=true;msg.textContent="";
+ try{const c=document.getElementById("c");const [ok,d]=await post("/api/signup",{username:u.value,password:p.value,code:c?c.value:""});
+  if(ok){f.hidden=true;key.textContent=d.recovery_key;done.hidden=false}else msg.textContent=d.error||"Could not sign up."}
+ catch(x){msg.textContent="Cannot reach the server."}finally{go.disabled=false}};
+cont.onclick=()=>{location.href="/"};""",
+ "forgot": """const post=async(u,b)=>{const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});return [r.ok,await r.json()]};
+f.onsubmit=async e=>{e.preventDefault();go.disabled=true;msg.textContent="";
+ try{const [ok,d]=await post("/api/forgot",{username:u.value,key:k.value,password:p.value});
+  if(ok){f.hidden=true;key.textContent=d.recovery_key;done.hidden=false}else msg.textContent=d.error||"Could not reset."}
+ catch(x){msg.textContent="Cannot reach the server."}finally{go.disabled=false}};
+cont.onclick=()=>{location.href="/login"};""",
+}
+
+
+def auth_page(kind):
+    body = AUTH_BODIES[kind]
+    if kind == "login":
+        body = body.replace("<!--SIGNUP-->", '<a href="/signup">Create an account</a>' if ALLOW_SIGNUP else "")
+    if kind == "signup":
+        if not ALLOW_SIGNUP:
+            body = '<div class="box"><h1>Sign-up is closed</h1><p>Ask the admin to create an account for you.</p><a href="/login">Back to sign in</a></div>'
+        else:
+            body = body.replace("<!--CODE-->", '<label>Invite code<input id="c" autocomplete="off" required></label>' if SIGNUP_CODE else "")
+    title = {"login": "Sign in", "signup": "Create account", "forgot": "Reset password"}[kind]
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{title}</title><style>{AUTH_CSS}</style></head><body>{body}<script>{AUTH_JS[kind]}</script></body></html>')
+
+
+PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sign in</title>
 <style>
@@ -1890,6 +2143,10 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
    <label>New order PIN<input id="pinNew" type="password" autocomplete="off"></label>
    <div class="tkbtns"><span class="sub" id="pinMsg"></span><button class="btn" id="pinBtn">Save PIN</button></div></div>
  </div>
+ <div class="card"><h3>Recovery key</h3>
+  <div class="sub" style="margin-bottom:8px" id="recInfo"></div>
+  <label>Your account password<input id="recPw" type="password" autocomplete="current-password"></label>
+  <div class="tkbtns"><span class="sub" id="recMsg"></span><button class="btn" id="recBtn">Create a new recovery key</button></div></div>
  <div class="card"><h3>Broker accounts</h3>
   <div class="note" style="margin:0 0 6px">Your broker details are stored encrypted on this server and are never shown again. Brokers accept API orders only from a static IP registered to your own client account, so register this server's IP with your broker. Sharing one IP between different clients is restricted: check your broker's rules.</div>
   <div id="brokerCards"></div></div>
@@ -1899,7 +2156,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <div class="grid2" style="margin-bottom:0"><label>Username<input id="nuName" autocomplete="off"></label><label>Temporary password (at least 10 characters)<input id="nuPw" type="password" autocomplete="new-password"></label></div>
   <div class="tkbtns"><select id="nuRole" aria-label="Role"><option value="user">User</option><option value="admin">Admin</option></select><button class="btn" id="addUser">Add user</button></div></div>
  <div class="wrap"><table id="usrTable"></table></div>
- <div class="note" id="admNote">Live trading is off for every new user until you enable it here, and it also needs LIVE_TRADING=1 on the server. Brokers allow one static IP per client, and sharing it is limited to family members. A platform that trades for unrelated clients has to be an exchange-empanelled algo provider. Enable live trading only where that is allowed, and check with your brokers.</div>
+ <div class="note" id="admNote">Anyone can create their own account unless you set ALLOW_SIGNUP=0 (or require an invite code with SIGNUP_CODE). New accounts start in paper mode. Live trading is off for every new user until you enable it here, and it also needs LIVE_TRADING=1 on the server. Brokers allow one static IP per client, and sharing it is limited to family members. A platform that trades for unrelated clients has to be an exchange-empanelled algo provider. Enable live trading only where that is allowed, and check with your brokers.</div>
 </section>
 </main>
 <dialog id="limDlg"><div class="tk">
@@ -2121,6 +2378,7 @@ async function loadMe(){const d=await (await api("/api/me")).json();me=d;csrf=d.
  $("who").textContent=d.user.username+(d.user.role==="admin"?" (admin)":"");$("navAdmin").hidden=d.user.role!=="admin";renderAccount(d)}
 function renderAccount(d){
  $("acctInfo").textContent=d.mode==="live"?"Live trading is enabled for your account.":d.note;
+ $("recInfo").textContent=d.user.recovery_set?"You have a recovery key. If you forget your password, the Forgot password page accepts it once. Creating a new key cancels the old one.":"You have no recovery key yet, so you could not reset your own password. Create one and keep it somewhere safe.";
  $("brokerCards").innerHTML=Object.keys(d.broker_fields).map(b=>{const f=d.broker_fields[b],hint=d.hints[b];
   return `<div class="bcard" data-b="${b}"><h4>${esc(d.broker_names[b])} <span class="tag">${hint?"Saved "+esc(hint):"Not set up"}</span></h4><div class="tkgrid">${f.map(x=>`<label>${esc(x[1])}<input data-f="${x[0]}" type="${x[0]==="client_id"?"text":"password"}" autocomplete="off" placeholder="${hint?"Enter again to replace":""}"></label>`).join("")}</div><div class="tkbtns"><span class="sub" data-msg></span>${hint?'<button class="mini" data-rm>Remove</button>':""}<button class="btn" data-save>Save</button></div></div>`}).join("")}
 $("brokerCards").onclick=async e=>{const card=e.target.closest(".bcard");if(!card)return;const b=card.dataset.b,msg=card.querySelector("[data-msg]");
@@ -2147,6 +2405,8 @@ $("limClose").onclick=()=>$("limDlg").close();
 $("limSave").onclick=async()=>{const d=await send("PATCH","/api/admin/users/"+limUser.id,{caps:{max_order_value:$("limValue").value,max_qty:$("limQty").value,max_orders:$("limOrders").value,max_fut_lots:$("limLots").value,max_fut_value:$("limFut").value,allow_option_selling:$("limSell").value==="1"}});
  if(d.error){$("limMsg").textContent=d.error;return}$("limDlg").close();loadUsers()};
 $("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{username:$("nuName").value,password:$("nuPw").value,role:$("nuRole").value});$("admNote").textContent=d.error||"User added. Live trading is off for them until you enable it.";if(!d.error){$("nuName").value="";$("nuPw").value=""}loadUsers()};
+$("recBtn").onclick=async()=>{const d=await send("POST","/api/account/recovery",{password:$("recPw").value});
+ if(d.error){$("recMsg").textContent=d.error;return}$("recPw").value="";$("recMsg").innerHTML="Your new key (shown once, it replaces the old one): <b>"+esc(d.recovery_key)+"</b>";loadMe()};
 loadMe().then(()=>{if(mode==="admin")setMode("admin")}).catch(()=>{});
 setMode(mode);
 load();
