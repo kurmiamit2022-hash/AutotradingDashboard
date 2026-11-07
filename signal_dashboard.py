@@ -273,6 +273,36 @@ def fmt_time(ts, interval):
     return ts.strftime("%d %b %H:%M") if interval != "1d" else ts.strftime("%d %b")
 
 
+def eval_signals(symbol, df, interval, idxs, buy, c, hi, lo, atr, ls, ss):
+    """Every signal in the loaded candles with what happened next: which targets were reached before the stop-loss.
+    Same rules as the live trade tracking: entry at the signal candle's close, stop-loss checked before targets in a candle."""
+    out = []
+    sector = sector_of(symbol)
+    for j in idxs:
+        j = int(j)
+        side = 1 if buy[j] else -1
+        entry = float(c[j])
+        raw = ls[j] if side == 1 else ss[j]
+        risk = max(MIN_RISK_ATR * atr[j], min(abs(entry - raw), MAX_RISK_ATR * atr[j]))
+        sl = entry - side * risk
+        tps = [entry + side * risk * r for r in R_MULTIPLES]
+        h, l = hi[j + 1:], lo[j + 1:]
+        slm = (l <= sl) if side == 1 else (h >= sl)
+        sl_i = int(slm.argmax()) if slm.size and slm.any() else None
+        hits = 0
+        for t in tps:
+            m = (h >= t) if side == 1 else (l <= t)
+            if m.size and m.any():
+                ti = int(m.argmax())
+                if sl_i is None or ti < sl_i:
+                    hits += 1
+        ts = df.index[j]
+        out.append({"symbol": symbol, "sector": sector, "side": "BUY" if side == 1 else "SELL", "t": int(ts.timestamp()),
+                    "time": fmt_time(ts, interval), "hour": int(ts.hour) if interval != "1d" else None,
+                    "entry": round(entry, 2), "sl": round(float(sl), 2), "hits": hits, "sl_hit": sl_i is not None})
+    return out
+
+
 def analyse(symbol, df, interval):
     df = df.dropna(subset=["Close", "High", "Low"]).copy()
     if df.empty:
@@ -313,7 +343,9 @@ def analyse(symbol, df, interval):
     sell = flip_dn & (c < ema) & red_ok
     sig_idx = np.nonzero(buy | sell)[0]
 
-    base = {"symbol": symbol, "type": "index" if symbol in INDEX_YF else "stock", "close": round(float(c[-1]), 2), "signal": "–", "entry": None, "sl": None,
+    hist = eval_signals(symbol, df, interval, sig_idx, buy, c, hi, lo, atr, ls, ss)
+
+    base = {"symbol": symbol, "hist": hist, "type": "index" if symbol in INDEX_YF else "stock", "close": round(float(c[-1]), 2), "signal": "–", "entry": None, "sl": None,
             "sector": sector_of(symbol), "chg": None if chg is None else round(float(chg), 2),
             "tp1": None, "tp2": None, "tp3": None, "tp4": None, "hits": 0, "sl_hit": False,
             "status": "No signal yet", "bars_ago": None, "signal_time": "–"}
@@ -367,6 +399,7 @@ def analyse(symbol, df, interval):
 
 
 # ── Data + cache (one cache per timeframe) ──
+HIST = {tf: [] for tf in INTERVALS}   # every past signal per timeframe, with its outcome
 STATES = {tf: {"rows": [], "updated": None, "errors": [], "refreshing": False, "checked": 0.0, "progress": None} for tf in INTERVALS}
 LOCK = threading.Lock()
 
@@ -386,7 +419,7 @@ def fetch_all(interval, progress=None):
     """Download in small batches, retry a failed batch once, and report partial results as they arrive."""
     import yfinance as yf  # imported lazily so the module loads without it
 
-    rows, errors = [], []
+    rows, errors, hist = [], [], []
     for i in range(0, len(UNIVERSE), YF_BATCH):
         names = UNIVERSE[i:i + YF_BATCH]
         tickers = [yf_ticker(n) for n in names]
@@ -409,6 +442,7 @@ def fetch_all(interval, progress=None):
                     df = _one(data, t, len(tickers))
                     row = analyse(sname, df.dropna(how="all"), interval) if df is not None else None
                     if row:
+                        hist.extend(row.pop("hist", []))
                         rows.append(row)
                     else:
                         errors.append(f"{sname}: not enough data")
@@ -417,7 +451,7 @@ def fetch_all(interval, progress=None):
         if progress:
             progress(list(rows), list(errors), min(i + YF_BATCH, len(UNIVERSE)))
         time.sleep(0.5)
-    return rows, errors
+    return rows, errors, hist
 
 
 def refresh(interval):
@@ -435,10 +469,11 @@ def refresh(interval):
                 st.update(rows=rows, errors=errors)
 
     try:
-        rows, errors = fetch_all(interval, partial)
+        rows, errors, hist = fetch_all(interval, partial)
         with LOCK:
             if rows:  # never replace good data with an empty result
                 st.update(rows=rows, errors=errors, updated=datetime.now().strftime("%d %b %H:%M:%S"))
+                HIST[interval] = hist
             else:
                 st["errors"] = errors or ["Yahoo returned no data."]
         if rows:
@@ -1539,6 +1574,75 @@ app = FastAPI(title="Signal dashboard", docs_url=None, redoc_url=None, openapi_u
 PUBLIC_PATHS = {"/login", "/api/login", "/signup", "/api/signup", "/forgot", "/api/forgot", "/admin"}
 
 
+# ── Signal history and win rates ──
+def hist_stats(recs):
+    """Hit rates per target. A signal counts for target k once it reached that target (win) or hit the stop first (loss);
+    signals that have done neither yet are still open and are left out of that target's rate."""
+    n = len(recs)
+    out = {"n": n, "open": sum(1 for r in recs if not r["sl_hit"] and r["hits"] < 4),
+           "sl_first": sum(1 for r in recs if r["sl_hit"] and r["hits"] == 0), "t": []}
+    for k in range(1, 5):
+        wins = sum(1 for r in recs if r["hits"] >= k)
+        losses = sum(1 for r in recs if r["sl_hit"] and r["hits"] < k)
+        done = wins + losses
+        out["t"].append({"k": k, "wins": wins, "losses": losses, "done": done,
+                         "rate": round(100 * wins / done, 1) if done else None,
+                         "exp": round((wins * k - losses) / done, 2) if done else None})
+    out["sl_rate"] = round(100 * out["sl_first"] / n, 1) if n else None
+    return out
+
+
+def hist_groups(recs, key, min_n=1):
+    g = {}
+    for r in recs:
+        g.setdefault(r[key], []).append(r)
+    rows = []
+    for k, v in g.items():
+        if len(v) >= min_n:
+            st = hist_stats(v)
+            rows.append({"key": k, "n": st["n"], "t1": st["t"][0]["rate"], "t2": st["t"][1]["rate"], "t3": st["t"][2]["rate"],
+                         "sl_rate": st["sl_rate"], "exp1": st["t"][0]["exp"], "exp2": st["t"][1]["exp"], "open": st["open"]})
+    return rows
+
+
+def hist_status(r):
+    if r["sl_hit"]:
+        return f"T{r['hits']} then SL" if r["hits"] else "SL hit"
+    return "T4 hit" if r["hits"] == 4 else (f"T{r['hits']} hit, open" if r["hits"] else "Open")
+
+
+@app.get("/api/history")
+def api_history(tf: str = DEFAULT_INTERVAL, symbol: str = "", sector: str = "", side: str = "", days: int = 0):
+    if tf not in INTERVALS:
+        tf = DEFAULT_INTERVAL
+    ensure_fresh(tf)
+    with LOCK:
+        recs = list(HIST[tf])
+        scanned = STATES[tf]["updated"]
+        progress = STATES[tf]["progress"]
+    symbol = symbol.upper().strip()
+    if symbol:
+        recs = [r for r in recs if symbol in r["symbol"]]
+    if sector and sector != "ALL":
+        recs = [r for r in recs if r["sector"] == sector]
+    if side in ("BUY", "SELL"):
+        recs = [r for r in recs if r["side"] == side]
+    if days and days > 0:
+        cut = time.time() - days * 86400
+        recs = [r for r in recs if r["t"] >= cut]
+    recs.sort(key=lambda r: r["t"], reverse=True)
+    oldest = min((r["t"] for r in recs), default=None)
+    sym_rows = hist_groups(recs, "symbol", 3)
+    by_rate = sorted([r for r in sym_rows if r["exp1"] is not None], key=lambda r: (r["exp1"], r["n"]), reverse=True)
+    return {"tf": tf, "scanned": scanned, "progress": progress, "stats": hist_stats(recs),
+            "by_side": hist_groups(recs, "side"), "by_sector": sorted(hist_groups(recs, "sector"), key=lambda r: -r["n"]),
+            "best": by_rate[:8], "worst": list(reversed(by_rate[-8:])) if len(by_rate) > 8 else [],
+            "by_hour": sorted(hist_groups([r for r in recs if r["hour"] is not None], "hour"), key=lambda r: r["key"]) if tf != "1d" else [],
+            "recent": [{**r, "status": hist_status(r)} for r in recs[:300]],
+            "since": pd.Timestamp(oldest, unit="s", tz="UTC").tz_convert(IST).strftime("%d %b %Y") if oldest else None,
+            "sector_names": sector_names()}
+
+
 # ── Signal alerts: Telegram and ntfy push ──
 # Each person chooses where to be told about new signals. One server-wide Telegram bot (TELEGRAM_BOT_TOKEN) serves everyone;
 # ntfy.sh needs no account: the person installs the ntfy app and subscribes to a private topic name.
@@ -2632,6 +2736,16 @@ tr:last-child td{border-bottom:0}
 .orow[aria-pressed=true]{background:var(--flat);font-weight:700}
 .orow .pill{min-width:0;padding:0 8px;font-size:12px}
 .orow .none{color:var(--mute)}
+.hgrid{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,4fr);gap:14px;margin-bottom:14px}.hgrid.even{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.hgrid .card{margin:0;min-width:0}
+@media(max-width:900px){.hgrid,.hgrid.even{grid-template-columns:minmax(0,1fr)}}
+table.gt{min-width:0;width:100%;font-size:13px}table.gt th,table.gt td{padding:7px 8px;white-space:nowrap}
+.hbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.hbar input,.hbar select{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font:inherit}
+.hbar input{flex:1;min-width:160px;max-width:260px}
+.hkpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px}
+.hkpi div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;display:flex;flex-direction:column;gap:2px}
+.hkpi .l{font-size:13px;color:var(--mute)}.hkpi .v{font-size:24px;font-weight:700}.hkpi .s{font-size:12px;color:var(--mute)}
+.hkpi .bar2{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:4px}.hkpi .bar2 i{display:block;height:100%;background:var(--buy)}
 .chks{display:flex;flex-wrap:wrap;gap:4px 14px;margin:4px 0 10px}.chks.sec{max-height:150px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:6px 10px}
 label.chk{display:inline-flex!important;flex-direction:row!important;gap:6px;align-items:center;font-size:14px;color:var(--ink);margin:0}
 label.chk input{width:auto;margin:0}
@@ -2695,7 +2809,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 </header>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="history">History</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
 <div class="sectors" id="sectors"></div>
@@ -2719,6 +2833,26 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <div class="note" id="onote">Pick a script on the left. Every F&amp;O stock and index has a chain. Sensex and Bankex option chains are not available here.</div>
  </div>
 </div>
+</section>
+<section id="view-history" hidden>
+<div class="hbar">
+ <input id="hSym" placeholder="Search symbol" aria-label="Search symbol">
+ <select id="hSec" aria-label="Sector"><option value="ALL">All sectors</option></select>
+ <select id="hSide" aria-label="Side"><option value="">Buy and sell</option><option value="BUY">Buy only</option><option value="SELL">Sell only</option></select>
+ <select id="hDays" aria-label="Period"><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="0" selected>All loaded candles</option></select>
+</div>
+<div class="note" id="hNote" style="margin:0 0 10px"></div>
+<div class="hkpi" id="hKpi"></div>
+<div class="hgrid">
+ <div class="card"><h3>By sector</h3><div class="wrap"><table id="hSector"></table></div></div>
+ <div class="card"><h3>By side</h3><div class="wrap"><table id="hSideT"></table></div><h3 style="margin-top:14px" id="hHourH">By hour of day</h3><div class="wrap"><table id="hHour"></table></div></div>
+</div>
+<div class="hgrid even">
+ <div class="card"><h3>Best symbols <span class="sub">(3 or more signals)</span></h3><div class="wrap"><table id="hBest"></table></div></div>
+ <div class="card"><h3>Weakest symbols</h3><div class="wrap"><table id="hWorst"></table></div></div>
+</div>
+<div class="card"><h3>Every signal</h3><div class="wrap"><table id="hList"></table></div></div>
+<div class="note" id="hFoot">How to read this: each signal is followed from its candle's close. It counts as a win for a target if price reached that target before the stop-loss. If the stop and a target are touched in the same candle, the stop is counted first. Signals that have reached neither yet are open and left out of that target's rate. "R per trade" is the average result if you always exited at that target: a win is worth that many R, a loss is minus 1R. Slippage, brokerage and gaps are not included, signals that overlap are each counted on their own, and the history only goes as far back as Yahoo's candles (about 30 days on 5 min, 60 days on 15 min, 2 years on Daily). Past results do not promise future ones.</div>
 </section>
 <section id="view-orders" hidden>
 <div class="note" id="ordNote" style="margin:0 0 10px">Orders placed from this dashboard today.</div>
@@ -2825,7 +2959,7 @@ document.getElementById("refresh").onclick=async()=>{const b=document.getElement
 document.getElementById("tfs").onclick=e=>{const b=e.target.closest("button");if(!b||b.dataset.tf===tf)return;
  tf=b.dataset.tf;try{localStorage.setItem("tf",tf)}catch(x){}
  data=null;document.getElementById("body").innerHTML=`<tr><td colspan="14" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;
- document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(osym)loadChain()};
+ document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(osym)loadChain();if(mode==="history")loadHistory()};
 async function load(){clearTimeout(timer);const asked=tf;
  try{const d=await (await api("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;render();
   timer=setTimeout(load,(d.refreshing||!d.updated)?3000:20000)}
@@ -2889,10 +3023,10 @@ const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
 function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",options:"options",orders:"orders",account:"account",admin:"admin"};
- ["stocks","options","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ const vm={stocks:"stocks",futures:"stocks",options:"options",history:"history",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","options","history","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
- if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
+ if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
 function renderChips(){
@@ -3076,6 +3210,31 @@ $("limClose").onclick=()=>$("limDlg").close();
 $("limSave").onclick=async()=>{const d=await send("PATCH","/api/admin/users/"+limUser.id,{caps:{max_order_value:$("limValue").value,max_qty:$("limQty").value,max_orders:$("limOrders").value,max_fut_lots:$("limLots").value,max_fut_value:$("limFut").value,allow_option_selling:$("limSell").value==="1"}});
  if(d.error){$("limMsg").textContent=d.error;return}$("limDlg").close();loadUsers()};
 $("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{username:$("nuName").value,password:$("nuPw").value,role:$("nuRole").value});$("admNote").textContent=d.error||"User added. Live trading is off for them until you enable it.";if(!d.error){$("nuName").value="";$("nuPw").value=""}loadUsers()};
+let hReq=0,hTimer=null,hDeb=null;
+const pct=n=>n==null?"–":n.toFixed(1)+"%";
+const rr=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${n.toFixed(2)}R</span>`;
+async function loadHistory(){clearTimeout(hTimer);const my=++hReq;
+ const p=new URLSearchParams({tf:tf||"",symbol:$("hSym").value.trim(),sector:$("hSec").value,side:$("hSide").value,days:$("hDays").value});
+ try{const d=await (await api("/api/history?"+p)).json();if(my!==hReq)return;renderHistory(d);
+  if(mode==="history"&&(!d.scanned||d.progress))hTimer=setTimeout(loadHistory,3000)}
+ catch(e){$("hNote").textContent="Cannot reach the server."}}
+["hSec","hSide","hDays"].forEach(i=>$(i).onchange=loadHistory);$("hSym").oninput=()=>{clearTimeout(hDeb);hDeb=setTimeout(loadHistory,300)};
+function grpTable(id,rows,label,fmt){const t=$(id);t.className="gt";
+ if(!rows.length){t.innerHTML=`<tbody><tr><td class="empty" style="text-align:left">Nothing to show yet.</td></tr></tbody>`;return}
+ t.innerHTML=`<thead><tr><th>${label}</th><th>Signals</th><th>T1</th><th>T2</th><th>T3</th><th>Stop first</th><th>R at T2</th></tr></thead><tbody>`+rows.map(r=>`<tr><td><b>${fmt?fmt(r.key):esc(r.key)}</b></td><td>${r.n}</td><td>${pct(r.t1)}</td><td>${pct(r.t2)}</td><td>${pct(r.t3)}</td><td>${pct(r.sl_rate)}</td><td>${rr(r.exp2)}</td></tr>`).join("")+"</tbody>"}
+function renderHistory(d){
+ const ss=$("hSec");if(ss.options.length!==d.sector_names.length+1){const v=ss.value;ss.innerHTML='<option value="ALL">All sectors</option>'+d.sector_names.map(n=>`<option>${esc(n)}</option>`).join("");ss.value=v}
+ const st=d.stats;
+ $("hNote").textContent=!d.scanned?(d.progress?`Scanning ${d.progress[0]} of ${d.progress[1]} symbols…`:"The first scan is running. This page updates on its own."):
+  st.n?`${tfName[d.tf]||d.tf} candles · ${st.n} signals${d.since?" since "+d.since:""} · ${st.open} still open`:"No signals match these filters.";
+ const tile=(l,v,s,w)=>`<div><span class="l">${l}</span><span class="v">${v}</span><span class="s">${s}</span>${w!=null?`<span class="bar2"><i style="width:${w}%"></i></span>`:""}</div>`;
+ $("hKpi").innerHTML=st.n?tile("Signals",st.n,`${st.open} open`)+st.t.map(t=>tile(`Reached T${t.k}`,pct(t.rate),`${t.wins} of ${t.done} closed · ${t.exp==null?"–":(t.exp>0?"+":"")+t.exp.toFixed(2)+"R"} per trade`,t.rate)).join("")+tile("Stopped out first",pct(st.sl_rate),`${st.sl_first} of ${st.n}`):"";
+ grpTable("hSector",d.by_sector,"Sector");grpTable("hSideT",d.by_side,"Side");
+ $("hHourH").hidden=$("hHour").hidden=!d.by_hour.length;if(d.by_hour.length)grpTable("hHour",d.by_hour,"Hour",k=>String(k).padStart(2,"0")+":00");
+ grpTable("hBest",d.best,"Symbol");grpTable("hWorst",d.worst,"Symbol");
+ const t=$("hList");
+ t.innerHTML=d.recent.length?`<thead><tr><th>Signal candle</th><th>Symbol</th><th>Side</th><th>Sector</th><th>Entry</th><th>SL</th><th>Result</th></tr></thead><tbody>`+d.recent.map(r=>`<tr><td>${esc(r.time)}</td><td><b>${esc(r.symbol)}</b></td><td><span class="pill ${r.side}">${r.side}</span></td><td class="sub">${esc(r.sector)}</td><td>${f2(r.entry)}</td><td>${f2(r.sl)}</td><td class="${r.sl_hit&&!r.hits?"dn":r.hits?"up":""}">${esc(r.status)}</td></tr>`).join("")+"</tbody>":"";
+ if(st.n>d.recent.length)$("hNote").textContent+=` · showing the latest ${d.recent.length}`}
 let alTimer=null;
 async function loadAlerts(){const d=await (await api("/api/alerts")).json();if(d.error)return;
  $("alOn").checked=d.enabled;
