@@ -310,6 +310,15 @@ def analyse(symbol, df, interval):
     df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
     chg = None  # change since the previous session's close, using the latest price (even a candle that is still forming)
     prev_close = None
+    vol = val_cr = None
+    try:
+        if interval != "1d" and "Volume" in df:
+            day = np.array([t.date() for t in df.index]) == df.index[-1].date()
+            v = df["Volume"].to_numpy(float)[day]
+            vol = int(np.nansum(v))
+            val_cr = round(float(np.nansum(v * df["Close"].to_numpy(float)[day])) / 1e7, 2)
+    except Exception:
+        vol = val_cr = None
     try:
         cl = df["Close"].to_numpy(float)
         if interval == "1d":
@@ -350,7 +359,7 @@ def analyse(symbol, df, interval):
 
     base = {"symbol": symbol, "hist": hist, "type": "index" if symbol in INDEX_YF else "stock", "close": round(float(c[-1]), 2), "signal": "–", "entry": None, "sl": None,
             "sector": sector_of(symbol), "chg": None if chg is None else round(float(chg), 2),
-            "prev_close": None if prev_close is None else round(prev_close, 2),
+            "prev_close": None if prev_close is None else round(prev_close, 2), "vol": vol, "val_cr": val_cr,
             "tp1": None, "tp2": None, "tp3": None, "tp4": None, "hits": 0, "sl_hit": False,
             "status": "No signal yet", "bars_ago": None, "signal_time": "–"}
     if len(sig_idx) == 0:
@@ -3381,6 +3390,69 @@ def api_index_signals(symbol: str, tf: str = "15m", n: int = 10):
     return {"symbol": symbol, "tf": tf, "signals": out, "scanned": bool(scanned)}
 
 
+# ── Intraday scanner: NSE's most active stocks, with the signal on 5 min / 15 min ──
+ACTIVE_CACHE = {}
+SCANNER_TOP = 10   # the scanner follows the day's ten most active F&O stocks by volume
+
+
+def nse_most_active(by):
+    """Symbols in NSE's most-active list (by value or volume), most active first. None if NSE does not answer."""
+    hit = ACTIVE_CACHE.get(by)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    raw = nse.get_json("/api/live-analysis-most-active-securities", {"index": by})
+    items = None
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        for v in [raw.get("data")] + list(raw.values()):
+            if isinstance(v, list) and v and isinstance(v[0], dict) and "symbol" in v[0]:
+                items = v
+                break
+    if not items:
+        return hit[1] if hit else None
+    names = [str(i.get("symbol", "")).upper() for i in items if i.get("symbol")]
+    ACTIVE_CACHE[by] = (time.time(), names)
+    return names
+
+
+@app.get("/api/scanner")
+def api_scanner(tf: str = "15m", only: int = 0):
+    """Today's ten most active stocks by traded volume, with their signal on 5 min or 15 min."""
+    if tf not in ("5m", "15m"):
+        return JSONResponse({"error": "Choose 5 min or 15 min."}, status_code=400)
+    by, n = "volume", SCANNER_TOP
+    ensure_fresh(tf)
+    with LOCK:
+        rows = [r for r in apply_live(list(STATES[tf]["rows"])) if r.get("type") != "index"]
+        upd, busy = STATES[tf]["updated"], STATES[tf]["refreshing"] or not STATES[tf]["updated"]
+    by_sym = {r["symbol"]: r for r in rows}
+    names = nse_most_active(by)
+    source, skipped = "nse", 0
+    if names:
+        ranked = [x for x in names if x in by_sym]
+        skipped = len([x for x in names if x not in by_sym])
+    else:
+        source = "computed"
+        ranked = [r["symbol"] for r in sorted((r for r in rows if r.get("vol")), key=lambda r: -r["vol"])]
+    out = []
+    for sym in ranked:
+        r = by_sym[sym]
+        sg = r["signal"]
+        if only and sg == "–":
+            continue
+        out.append({"rank": len(out) + 1, "symbol": sym, "sector": r.get("sector"), "price": r.get("ltp", r["close"]),
+                    "chg": r.get("ltp_chg", r.get("chg")), "vol": r.get("vol"), "val_cr": r.get("val_cr"), "signal": sg, "status": r["status"],
+                    "signal_time": r["signal_time"], "bars_ago": r["bars_ago"], "side": r.get("side"),
+                    "levels": {k: r[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")} if r.get("entry") is not None else None})
+        if len(out) >= n:
+            break
+    return {"tf": tf, "by": by, "source": source, "rows": out, "skipped": skipped, "scanning": busy, "updated": upd,
+            "note": ("Today's ten most active F&O stocks by volume, from NSE's most active list. Only F&O stocks are shown, because those are the ones that can be traded as futures or options."
+                     if source == "nse" else
+                     "NSE's list did not load, so today's ten highest-volume F&O stocks are taken from the candle data instead. Open this page again later to use NSE's own list.")}
+
+
 @app.get("/api/futures/info")
 def api_fut_info():
     mn = master_name("paper")
@@ -4166,6 +4238,8 @@ dialog::backdrop{background:rgba(14,10,40,.6);backdrop-filter:blur(3px)}
 .ixc.fresh.BUY{animation:pulseb 2.2s ease-in-out infinite}.ixc.fresh.SELL{animation:pulses 2.2s ease-in-out infinite}
 .ixhist{margin-top:12px;padding:10px 14px;background:var(--panel)}.ixhh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .ixhist table.gt td,.ixhist table.gt th{text-align:right}.ixhist table.gt td:first-child,.ixhist table.gt th:first-child,.ixhist table.gt td:nth-child(2),.ixhist table.gt th:nth-child(2){text-align:left}
+.scttl{font-size:16px}
+#scTable td,#scTable th{text-align:left}#scTable td:nth-child(n+7),#scTable th:nth-child(n+7){text-align:right}
 .ogrid.ix{grid-template-columns:minmax(0,1fr)}.ogrid.ix .olist{display:none}
 @media(prefers-reduced-motion:reduce){.ixc.fresh{animation:none!important}}
 /* signal flashing */
@@ -4194,7 +4268,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="history">History</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="history">History</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -4225,6 +4299,13 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="note" id="onote">Pick a script on the left. Every F&amp;O stock and index has a chain. Sensex and Bankex chains are priced by your broker and show no open interest.</div>
  </div>
 </div>
+</section>
+<section id="view-scanner" hidden>
+<div class="ixrow"><div class="seg" id="scTfs" role="group" aria-label="Timeframe"></div>
+ <b class="scttl">Top 10 by volume today</b>
+ <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label><span class="sub" id="scMeta"></span></div>
+<div class="wrap"><table id="scTable"></table></div>
+<div class="note" id="scNote"></div>
 </section>
 <section id="view-history" hidden>
 <div class="hbar">
@@ -4361,7 +4442,7 @@ document.getElementById("refresh").onclick=async()=>{const b=document.getElement
 document.getElementById("tfs").onclick=e=>{const b=e.target.closest("button");if(!b||b.dataset.tf===tf)return;
  tf=b.dataset.tf;try{localStorage.setItem("tf",tf)}catch(x){}
  data=null;document.getElementById("body").innerHTML=`<tr><td colspan="14" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;
- document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(osym)loadChain();if(mode==="history")loadHistory()};
+ optOverride="";document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(osym)loadChain();if(mode==="history")loadHistory()};
 async function load(){clearTimeout(timer);const asked=tf;
  try{const d=await (await api("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;detectNew(d);render();
   timer=setTimeout(load,(d.refreshing||!d.updated)?3000:20000)}
@@ -4424,18 +4505,20 @@ function render(){
 // ── Options tab ──
 let mode="stocks",osym="",oexp="",oreq=0,ixTf="15m";
 try{ixTf=localStorage.getItem("ixTf")==="5m"?"5m":"15m"}catch(e){}
-const optTf=()=>mode==="index"?ixTf:(tf||"");
+let optOverride="";
+const optTf=()=>mode==="index"?ixTf:(optOverride||tf||"");
 try{mode=localStorage.getItem("mode")||"stocks"}catch(e){}
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(a>=1e7?(a/1e7).toFixed(2)+" Cr":a>=1e5?(a/1e5).toFixed(2)+" L":a>=1e3?(a/1e3).toFixed(1)+" K":String(Math.round(a)))};
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
 function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",options:"options",index:"options",history:"history",orders:"orders",account:"account",admin:"admin"};
- ["stocks","options","history","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ const vm={stocks:"stocks",futures:"stocks",options:"options",index:"options",scanner:"scanner",history:"history",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","options","scanner","history","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
  $("ogrid").classList.toggle("ix",m==="index");$("ixbar").hidden=m!=="index";
  if(m==="index"){if(!["NIFTY","BANKNIFTY","SENSEX"].includes(osym)){osym="NIFTY";oexp=""}ixPaint();ixLoad();loadChain()}
+ if(m==="scanner"){scPaint();scLoad()}else clearTimeout(scTimer);
  if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
@@ -4458,7 +4541,7 @@ function renderChips(){
   return `<button class="orow" data-s="${esc(n)}" aria-pressed="${n===osym}"><span>${esc(n)}</span><span class="ochg ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span>${sg==="–"?'<span class="none">–</span>':`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`}</button>`}).join(""):`<div class="sub" style="padding:12px">No scripts match.</div>`;
  box.scrollTop=keep;
 }
-document.getElementById("chips").onclick=e=>{const b=e.target.closest(".orow");if(b){osym=b.dataset.s;oexp="";loadChain()}};
+document.getElementById("chips").onclick=e=>{const b=e.target.closest(".orow");if(b){optOverride="";osym=b.dataset.s;oexp="";loadChain()}};
 document.getElementById("osym").oninput=renderChips;
 document.getElementById("ofilt").onchange=renderChips;
 document.getElementById("osec").onchange=renderChips;
@@ -4507,6 +4590,35 @@ function initModes(){paintTheme();
    const d=await post("/api/trading/mode",{mode:"live",pin});if(d.error){alert(d.error);return}}
   else{const d=await post("/api/trading/mode",{mode:"paper"});if(d.error){alert(d.error);return}}
   await loadTrading();if(typeof loadOrders==="function")try{loadOrders()}catch(x){}}}
+// ── Intraday Scanner tab ──
+let scTf="15m",scTimer=null,scData=null;
+try{scTf=localStorage.getItem("scTf")==="5m"?"5m":"15m"}catch(e){}
+function scPaint(){$("scTfs").innerHTML=["5m","15m"].map(x=>`<button data-t="${x}" aria-pressed="${x===scTf}">${tfName[x]||x}</button>`).join("");
+}
+async function scLoad(){clearTimeout(scTimer);if(mode!=="scanner")return;const my=scTf;
+ try{const d=await (await api(`/api/scanner?tf=${scTf}&only=${$("scOnly").checked?1:0}`)).json();if(my!==scTf)return;scData=d;scRender()}
+ catch(e){$("scMeta").textContent="Cannot reach the server."}
+ scTimer=setTimeout(scLoad,scData&&scData.scanning?3000:20000)}
+function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=`<tbody><tr><td class="empty">${d?esc(d.error):""}</td></tr></tbody>`;return}
+ $("scMeta").textContent=(d.source==="nse"?"NSE most active by volume":"Highest volume from candle data")+(d.updated?` · candles updated ${d.updated}`:"")+(d.scanning?" · scanning…":"");
+ $("scNote").textContent=d.note+(d.skipped?` ${d.skipped} active stocks outside F&O were left out.`:"");
+ const cols=["#","Symbol","Signal","Status","Signal candle","","Price","Day %","Volume","Entry","SL","T1","T2","T3","T4"];
+ const head="<thead><tr>"+cols.map(c=>`<th>${c}</th>`).join("")+"</tr></thead>";
+ if(!d.rows.length){tb.innerHTML=head+`<tbody><tr><td colspan="${cols.length}" class="empty">${d.scanning?"First scan is running. This page updates on its own.":"Nothing matches."}</td></tr></tbody>`;return}
+ tb.innerHTML=head+"<tbody>"+d.rows.map(r=>{const L=r.levels,fr=r.signal==="BUY"||r.signal==="SELL",lv=(k,i)=>L?`<td class="${r.status&&r.status.startsWith("T")&&+r.status[1]>i?"up":""}">${f2(L[k])}</td>`:"<td>–</td>";
+  const c=r.chg==null?"<td>–</td>":`<td class="${r.chg>=0?"up":"dn"}">${r.chg>0?"+":""}${r.chg.toFixed(2)}%</td>`;
+  const side=r.signal.endsWith("SELL")?"SELL":"BUY",has=r.signal!=="–"&&L;
+  return `<tr${fr?` class="fresh ${r.signal==="BUY"?"buy":"sell"}"`:""}><td>${r.rank}</td><td><b>${esc(r.symbol)}</b>${fr?'<span class="newb">NEW</span>':""}</td>
+   <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
+   <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
+   <td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
+function initScanner(){
+ $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
+ $("scOnly").onchange=()=>{scLoad()};
+ $("scTable").onclick=e=>{const b=e.target.closest("[data-sc]");if(!b)return;const sy=b.dataset.s;
+  if(b.dataset.sc==="chart")openChart(sy,scTf);
+  else if(b.dataset.sc==="fut")openTicket({kind:"future",symbol:sy,label:sy+" futures, nearest month",side:b.dataset.side,price:+b.dataset.p,tf:scTf});
+  else{optOverride=scTf;osym=sy;oexp="";setMode("options");loadChain()}}}
 // ── chart popup (TradingView's open-source Lightweight Charts) ──
 let lwPromise=null,chSym="",chTf="",chAt=0,chObj=null;
 function loadLW(){if(window.LightweightCharts)return Promise.resolve();
@@ -4626,9 +4738,9 @@ function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
 ["tkSide","tkQty","tkType","tkPrice","tkProd","tkBroker","tkAuto","tkTrail"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-initChart();initFlash();initModes();initIndex();
+initChart();initFlash();initModes();initIndex();initScanner();
 $("tkReviewBtn").onclick=async()=>{
- const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.kind==="option"?optTf():tf)||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
+ const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
  const d=await post("/api/orders/preview",body);
  if(d.error){$("tkMsg").textContent=d.error;return}
