@@ -1416,7 +1416,7 @@ def sync_status(u):
 app = FastAPI(title="Signal dashboard")
 
 
-PUBLIC_PATHS = {"/login", "/api/login", "/signup", "/api/signup", "/forgot", "/api/forgot"}
+PUBLIC_PATHS = {"/login", "/api/login", "/signup", "/api/signup", "/forgot", "/api/forgot", "/admin"}
 
 
 @app.middleware("http")
@@ -1459,6 +1459,10 @@ def api_login(request: Request, payload: dict = Body(...)):
             st = {"n": 0, "until": time.time() + 300}
         LOGIN_FAILS[key] = st
         return JSONResponse({"error": "Wrong username or password."}, status_code=401)
+    if payload.get("admin") and rows[0]["role"] != "admin":
+        st["n"] += 1
+        LOGIN_FAILS[key] = st
+        return JSONResponse({"error": "This sign-in is for admins only. Regular users sign in on the main page."}, status_code=403)
     LOGIN_FAILS.pop(key, None)
     if pw == DEFAULT_ADMIN_PW:
         if LIVE_REQUESTED:
@@ -1487,6 +1491,14 @@ def login_page(request: Request):
     if request.state.user:
         return RedirectResponse("/")
     return auth_page("login")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(request: Request):
+    u = request.state.user
+    if u and u["role"] == "admin":
+        return RedirectResponse("/?m=admin")
+    return auth_page("admin")
 
 
 @app.get("/signup", response_class=HTMLResponse)
@@ -2049,7 +2061,13 @@ AUTH_BODIES = {
 <label>Username<input id="u" autocomplete="username" required autofocus></label>
 <label>Password<input id="p" type="password" autocomplete="current-password" required></label>
 <button id="go">Sign in</button><div id="msg" role="alert"></div>
-<div class="alt"><a href="/forgot">Forgot password?</a><!--SIGNUP--></div></form>""",
+<div class="alt"><a href="/forgot">Forgot password?</a><!--SIGNUP--></div>
+<div class="alt"><a href="/admin">Admin sign-in</a></div></form>""",
+ "admin": """<form id="f"><h1>Admin console</h1><p>Sign in with an admin account.</p>
+<label>Admin username<input id="u" autocomplete="username" required autofocus></label>
+<label>Password<input id="p" type="password" autocomplete="current-password" required></label>
+<button id="go">Sign in to the console</button><div id="msg" role="alert"></div>
+<div class="alt"><a href="/login">Regular sign-in</a></div></form>""",
  "signup": """<form id="f"><h1>Create your account</h1><p>You start in paper mode. Live trading is switched on later by an admin.</p>
 <label>Username<input id="u" autocomplete="username" required autofocus></label>
 <label>Password (at least 10 characters)<input id="p" type="password" autocomplete="new-password" minlength="10" required></label>
@@ -2076,6 +2094,10 @@ AUTH_JS = {
 f.onsubmit=async e=>{e.preventDefault();go.disabled=true;msg.textContent="";
  try{const [ok,d]=await post("/api/login",{username:u.value,password:p.value});if(ok)location.href="/";else msg.textContent=d.error||"Could not sign in."}
  catch(x){msg.textContent="Cannot reach the server."}finally{go.disabled=false}};""",
+ "admin": """const post=async(u,b)=>{const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});return [r.ok,await r.json()]};
+f.onsubmit=async e=>{e.preventDefault();go.disabled=true;msg.textContent="";
+ try{const [ok,d]=await post("/api/login",{username:u.value,password:p.value,admin:true});if(ok)location.href="/?m=admin";else msg.textContent=d.error||"Could not sign in."}
+ catch(x){msg.textContent="Cannot reach the server."}finally{go.disabled=false}};""",
  "signup": """const post=async(u,b)=>{const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});return [r.ok,await r.json()]};
 f.onsubmit=async e=>{e.preventDefault();go.disabled=true;msg.textContent="";
  try{const c=document.getElementById("c");const [ok,d]=await post("/api/signup",{username:u.value,password:p.value,code:c?c.value:""});
@@ -2100,7 +2122,7 @@ def auth_page(kind):
             body = '<div class="box"><h1>Sign-up is closed</h1><p>Ask the admin to create an account for you.</p><a href="/login">Back to sign in</a></div>'
         else:
             body = body.replace("<!--CODE-->", '<label>Invite code<input id="c" autocomplete="off" required></label>' if SIGNUP_CODE else "")
-    title = {"login": "Sign in", "signup": "Create account", "forgot": "Reset password"}[kind]
+    title = {"login": "Sign in", "admin": "Admin console", "signup": "Create account", "forgot": "Reset password"}[kind]
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{title}</title><style>{AUTH_CSS}</style></head><body>{body}<script>{AUTH_JS[kind]}</script></body></html>')
 
@@ -2592,7 +2614,7 @@ $("limSave").onclick=async()=>{const d=await send("PATCH","/api/admin/users/"+li
 $("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{username:$("nuName").value,password:$("nuPw").value,role:$("nuRole").value});$("admNote").textContent=d.error||"User added. Live trading is off for them until you enable it.";if(!d.error){$("nuName").value="";$("nuPw").value=""}loadUsers()};
 $("recBtn").onclick=async()=>{const d=await send("POST","/api/account/recovery",{password:$("recPw").value});
  if(d.error){$("recMsg").textContent=d.error;return}$("recPw").value="";$("recMsg").innerHTML="Your new key (shown once, it replaces the old one): <b>"+esc(d.recovery_key)+"</b>";loadMe()};
-loadMe().then(()=>{if(mode==="admin")setMode("admin")}).catch(()=>{});
+loadMe().then(()=>{if(new URLSearchParams(location.search).get("m")==="admin"){history.replaceState(null,"","/");setMode("admin")}else if(mode==="admin")setMode("admin")}).catch(()=>{});
 setMode(mode);
 load();
 </script></body></html>
