@@ -309,16 +309,19 @@ def analyse(symbol, df, interval):
         return None
     df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
     chg = None  # change since the previous session's close, using the latest price (even a candle that is still forming)
+    prev_close = None
     try:
         cl = df["Close"].to_numpy(float)
         if interval == "1d":
             if len(cl) >= 2 and cl[-2] > 0:
                 chg = (cl[-1] / cl[-2] - 1) * 100
+                prev_close = float(cl[-2])
         else:
             days = np.array([t.date() for t in df.index])
             before = np.nonzero(days != days[-1])[0]
             if len(before) and cl[before[-1]] > 0:
                 chg = (cl[-1] / cl[before[-1]] - 1) * 100
+                prev_close = float(cl[before[-1]])
     except Exception:
         chg = None
     if CONFIRMED_ONLY:
@@ -347,6 +350,7 @@ def analyse(symbol, df, interval):
 
     base = {"symbol": symbol, "hist": hist, "type": "index" if symbol in INDEX_YF else "stock", "close": round(float(c[-1]), 2), "signal": "–", "entry": None, "sl": None,
             "sector": sector_of(symbol), "chg": None if chg is None else round(float(chg), 2),
+            "prev_close": None if prev_close is None else round(prev_close, 2),
             "tp1": None, "tp2": None, "tp3": None, "tp4": None, "hits": 0, "sl_hit": False,
             "status": "No signal yet", "bars_ago": None, "signal_time": "–"}
     if len(sig_idx) == 0:
@@ -1141,6 +1145,32 @@ class AngelAccount:
     def cancel(self, o):
         self._write(("cancelOrder",), o["id"], o.get("variety", "NORMAL"))
 
+    def ltp(self, items):
+        """Last traded prices for [(exchange, token)]. Returns {(exchange, token): price}."""
+        by = {}
+        for ex, tok in items:
+            by.setdefault(ex, []).append(str(tok))
+        out = {}
+        for ex, toks in by.items():
+            for i in range(0, len(toks), 50):
+                res = self._read("getMarketData", "LTP", {ex: toks[i:i + 50]}) or {}
+                for it in (res.get("data") or {}).get("fetched") or []:
+                    price = _num(it.get("ltp"))
+                    if price:
+                        out[(str(it.get("exchange") or ex), str(it.get("symbolToken")))] = price
+                if len(toks) > 50:
+                    time.sleep(1.1)  # Angel One limits market data calls to about one a second
+        return out
+
+    def modify_stop(self, o, rec, trigger):
+        """Move the trigger of a stop-loss order that is already placed. Safe to repeat: it sets the trigger, it does not add to it."""
+        params = {"variety": rec.get("variety", "STOPLOSS"), "orderid": str(rec["id"]), "ordertype": "STOPLOSS_MARKET", "producttype": o["product"],
+                  "duration": "DAY", "price": "0", "quantity": str(rec["qty"]), "triggerprice": f"{trigger:.2f}",
+                  "tradingsymbol": o["tradingsymbol"], "symboltoken": o["token"], "exchange": o["exchange"]}
+        res = self._write(("modifyOrder",), params)
+        if isinstance(res, dict) and not res.get("status"):
+            raise OrderRejected(str(res.get("message") or "The change was not accepted."))
+
 
 class DhanAccount:
     """One person's Dhan account."""
@@ -1148,9 +1178,9 @@ class DhanAccount:
     def __init__(self, creds):
         self.c = creds
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, extra=None):
         r = requests.request(method, DHAN_BASE + path, json=body, timeout=15,
-                             headers={"access-token": self.c["access_token"], "Content-Type": "application/json", "Accept": "application/json"})
+                             headers={"access-token": self.c["access_token"], "Content-Type": "application/json", "Accept": "application/json", **(extra or {})})
         try:
             data = r.json()
         except ValueError:
@@ -1190,6 +1220,27 @@ class DhanAccount:
 
     def cancel(self, o):
         self.request("DELETE", f"/orders/{o['id']}")
+
+    def ltp(self, items):
+        """Last traded prices for [(exchange segment, security id)]. Returns {(segment, id): price}."""
+        by = {}
+        for seg, sid in items:
+            by.setdefault(seg, []).append(int(sid))
+        if not by:
+            return {}
+        res = self.request("POST", "/marketfeed/ltp", by, extra={"client-id": str(self.c["client_id"])})
+        out = {}
+        for seg, d in ((res or {}).get("data") or {}).items():
+            for sid, v in (d or {}).items():
+                price = _num((v or {}).get("last_price"))
+                if price:
+                    out[(seg, str(sid))] = price
+        return out
+
+    def modify_stop(self, o, rec, trigger):
+        body = {"dhanClientId": self.c["client_id"], "orderId": str(rec["id"]), "orderType": "STOP_LOSS_MARKET", "legName": "",
+                "quantity": int(rec["qty"]), "price": "", "disclosedQuantity": "", "triggerPrice": float(trigger), "validity": "DAY"}
+        self.request("PUT", f"/orders/{rec['id']}", body)
 
 
 MASTERS = {n: {"day": None, "eq": {}, "opt": {}, "fut": {}} for n in ("angel", "dhan")}
@@ -1375,7 +1426,7 @@ def make_order(p, u):
         inst = M(mname)["eq"].get(symbol)
         if not inst:
             return fail("This stock was not found in Angel One's instrument list.")
-        ref, units, lot, band = row["close"], qty, 1, EQ_PRICE_BAND
+        ref, units, lot, band = live_price(row), qty, 1, EQ_PRICE_BAND
         token, tsym, exch, label = inst[0], inst[1], ("NSE_EQ" if mname == "dhan" else "NSE"), symbol
     elif kind == "future":
         if product not in ("INTRADAY", "CARRYFORWARD"):
@@ -1387,7 +1438,7 @@ def make_order(p, u):
         near = near_future(symbol, mname)
         if not near or not near[3]:
             return fail("No futures contract was found for this symbol in Angel One's instrument list.")
-        ref, lot, band = row["close"], near[3], EQ_PRICE_BAND
+        ref, lot, band = live_price(row), near[3], EQ_PRICE_BAND
         units = qty * lot
         token, tsym, exch = near[1], near[2], near[4]
         expiry = near[0].strftime(EXPIRY_FMT)
@@ -1473,7 +1524,12 @@ def make_order(p, u):
             warnings.append(f"Target T{signal_row['hits']} has already been reached, so the signal entry price is behind the market.")
     elif signal_row is not None or kind in ("equity", "future"):
         warnings.append("This symbol has no active signal on this timeframe.")
-    if kind == "future":
+    auto_sl = bool(p.get("auto_sl")) and kind in ("equity", "future")
+    if auto_sl and not (sl if kind == "equity" else risk):
+        warnings.append("No signal stop-loss is available for this order, so no automatic stop-loss will be placed.")
+        auto_sl = False
+    trail = bool(p.get("trail")) and auto_sl
+    if kind == "future" and not auto_sl:
         warnings.append("Futures are leveraged and the stop-loss is not automatic. Place it from the Orders tab once the entry fills.")
     if selling_opt:
         warnings.append("Selling an option can lose far more than the premium you receive. It needs margin, and no stop-loss is placed for you. "
@@ -1483,15 +1539,20 @@ def make_order(p, u):
              ["Quantity", f"{qty} lot{'s' if qty > 1 else ''} x {lot} = {units} units" if kind != "equity" else f"{qty} shares"],
              ["Order type", otype.title()], ["Price", inr(price) if otype == "LIMIT" else f"Market (last price {inr(ref)})"],
              ["Product", product.title()], ["Estimated value", inr(est)], ["Mode", "LIVE, real money" if mode == "live" else "Paper, simulated"]]
-    if kind == "equity" and sl:
+    if auto_sl:
+        lines.append(["Automatic stop-loss", "ON: placed for you as soon as the entry fills" + (", and trailed as targets are reached" if trail else "")])
+        if mode == "live":
+            warnings.append("Automatic stop-loss is switched on. The dashboard server places it for you after the fill, so it must be running. Check the Orders tab and your broker app.")
+    if kind == "equity" and sl and not auto_sl:
         lines.append(["Stop-loss from the signal", inr(sl) + " (placed from the Orders tab once filled)"])
     if selling_opt:
         lines.append(["Exposure (strike x units)", inr(exposure)])
     if kind == "future" and risk:
-        lines.append(["Stop-loss distance", f"{risk:.2f} points from your fill price (placed from the Orders tab)"])
+        lines.append(["Stop-loss distance", f"{risk:.2f} points from your fill price" + ("" if auto_sl else " (placed from the Orders tab)")])
     order = {"kind": kind, "symbol": symbol, "label": label, "tradingsymbol": tsym, "token": token, "exchange": exch,
              "side": side, "qty": units, "lots": qty, "order_type": otype, "price": price, "ref": ref, "product": product,
-             "expiry": expiry, "strike": strike, "right": right, "sl": sl, "risk": risk, "key": key, "broker": broker_id, "mode": mode, "user": u["id"]}
+             "expiry": expiry, "strike": strike, "right": right, "sl": sl, "risk": risk, "key": key, "broker": broker_id, "mode": mode, "user": u["id"],
+             "auto_sl": auto_sl, "trail": trail}
     return order, None, warnings, lines
 
 
@@ -1502,6 +1563,8 @@ def new_record(o, oid, status, variety="NORMAL", is_exit=False, note=""):
            "token": o["token"], "exchange": o["exchange"], "side": o["side"], "qty": o["qty"], "order_type": o["order_type"],
            "price": o["price"], "product": o["product"], "status": status, "avg_price": None, "sl": o.get("sl"),
            "sl_order_id": None, "risk": o.get("risk"), "variety": variety, "broker": o.get("broker", "paper"),
+           "auto_sl": bool(o.get("auto_sl")) and not is_exit, "trail": bool(o.get("trail")) and not is_exit,
+           "sl_state": None, "trail_level": 0, "trail_fail": 0, "trail_done": False,
            "is_exit": is_exit, "key": o.get("key"), "note": note}
     with ORDER_LOCK:
         ORDERS.append(rec)
@@ -1565,6 +1628,262 @@ def sync_status(u):
                 o["filled"] = info["filled"]
                 if info["note"]:
                     o["note"] = info["note"]
+
+
+# ── Live prices from a broker, automatic stop-loss and trailing ──
+# DATA_BROKER=angel|dhan with that broker's credentials in the environment turns on a live price feed for the dashboard.
+# Without it the dashboard uses Yahoo's candle closes, which can lag. Automatic stop-loss and trailing work either way.
+DATA_BROKER = os.getenv("DATA_BROKER", "").strip().lower()
+FEED_SECONDS = max(5, int(os.getenv("FEED_SECONDS", "10")))
+AUTOPILOT_SECONDS = max(5, int(os.getenv("AUTOPILOT_SECONDS", "10")))
+LTP_MAX_AGE = 60            # seconds a live price stays usable
+LTP_MAX_JUMP = 0.25         # a live price more than 25% from the candle close is treated as bad data
+TRAIL_MAX_STEP = 3          # trailing moves the stop to breakeven at 1R, then +1R at 2R, then +2R at 3R
+LTP = {}                    # symbol -> {"p": price, "t": epoch seconds}
+FEED = {"source": None, "error": None, "count": 0, "t": None, "acct": None}
+AUTO = {"last": None, "error": None}
+INDEX_FEED = {
+    "angel": {"NIFTY": ("NSE", "99926000"), "BANKNIFTY": ("NSE", "99926009"), "FINNIFTY": ("NSE", "99926037"),
+              "MIDCPNIFTY": ("NSE", "99926074"), "NIFTYNXT50": ("NSE", "99926013"), "SENSEX": ("BSE", "99919000"), "BANKEX": ("BSE", "99919012")},
+    "dhan": {"NIFTY": ("IDX_I", "13"), "BANKNIFTY": ("IDX_I", "25"), "FINNIFTY": ("IDX_I", "27"), "MIDCPNIFTY": ("IDX_I", "442"), "SENSEX": ("IDX_I", "51")},
+}
+
+
+def fresh_ltp(symbol):
+    v = LTP.get(symbol)
+    return v["p"] if v and time.time() - v["t"] < LTP_MAX_AGE else None
+
+
+def candle_close(symbol):
+    best = None
+    for t in INTERVALS:
+        with LOCK:
+            row = next((r for r in STATES[t]["rows"] if r["symbol"] == symbol), None)
+            upd = STATES[t]["updated"]
+        if row and (best is None or str(upd) > str(best[1])):
+            best = (row["close"], upd)
+    return best[0] if best else None
+
+
+def live_price(row):
+    """The live broker price when there is a fresh one, otherwise the candle close."""
+    p = fresh_ltp(row["symbol"])
+    return p if p else row["close"]
+
+
+def feed_items(broker):
+    """[(symbol, exchange, token)] for every dashboard symbol the broker's instrument list knows."""
+    out = []
+    eq = M(broker)["eq"]
+    seg = "NSE" if broker == "angel" else "NSE_EQ"
+    for name in SYMBOLS:
+        if name in eq:
+            out.append((name, seg, str(eq[name][0])))
+    for name, (ex, tok) in INDEX_FEED.get(broker, {}).items():
+        out.append((name, ex, tok))
+    return out
+
+
+def feed_account():
+    if FEED["acct"] is None:
+        if DATA_BROKER == "angel":
+            keys = {"api_key": "ANGEL_API_KEY", "client_id": "ANGEL_CLIENT_ID", "pin": "ANGEL_PIN", "totp_secret": "ANGEL_TOTP_SECRET"}
+            creds = {k: os.getenv(v, "").strip() for k, v in keys.items()}
+            FEED["acct"] = AngelAccount(creds)
+        else:
+            creds = {"client_id": os.getenv("DHAN_CLIENT_ID", "").strip(), "access_token": os.getenv("DHAN_ACCESS_TOKEN", "").strip()}
+            FEED["acct"] = DhanAccount(creds)
+        if not all(creds.values()):
+            FEED["acct"] = None
+            raise RuntimeError("The data feed credentials are not all set in the environment.")
+    return FEED["acct"]
+
+
+def feed_once():
+    """One pass over every symbol. Prices far from the last candle close are dropped as bad data."""
+    if not load_master(DATA_BROKER):
+        raise RuntimeError("The instrument list could not be loaded.")
+    items = feed_items(DATA_BROKER)
+    prices = feed_account().ltp([(ex, tok) for _, ex, tok in items])
+    now, n = time.time(), 0
+    for sym, ex, tok in items:
+        p = prices.get((ex, tok))
+        if not p:
+            continue
+        ref = candle_close(sym)
+        if ref and abs(p / ref - 1) > LTP_MAX_JUMP:
+            continue
+        LTP[sym] = {"p": float(p), "t": now}
+        n += 1
+    FEED.update(count=n, t=now, error=None)
+    return n
+
+
+def market_window():
+    n = ist_now()
+    return n.weekday() < 5 and dtime(9, 0) <= n.time() <= dtime(15, 45)
+
+
+def feed_loop():
+    while True:
+        try:
+            if market_window():
+                feed_once()
+            else:
+                time.sleep(30)
+        except Exception as e:
+            FEED["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+            if hasattr(FEED["acct"], "obj"):
+                FEED["acct"].obj = None
+            time.sleep(30)
+        time.sleep(FEED_SECONDS)
+
+
+def apply_live(rows):
+    """Copies of the rows with the live price and the change since the previous close, when a fresh price exists."""
+    out = []
+    for r in rows:
+        p = fresh_ltp(r["symbol"])
+        if p:
+            r = {**r, "ltp": round(p, 2)}
+            if r.get("prev_close"):
+                r["ltp_chg"] = round((p / r["prev_close"] - 1) * 100, 2)
+        out.append(r)
+    return out
+
+
+def user_by_id(uid):
+    rows = q("SELECT * FROM users WHERE id=?", (uid,))
+    return build_user(rows[0]) if rows and rows[0]["active"] else None
+
+
+def stop_price_now(u, o):
+    """Current price of the instrument the order trades: from the owner's broker for live orders, else the best price we have."""
+    if o["mode"] == "live":
+        try:
+            got = get_account(u["id"], o["broker"]).ltp([(o["exchange"], o["token"])])
+            p = got.get((o["exchange"], str(o["token"])))
+            if p:
+                return p
+        except Exception:
+            pass
+        return None
+    return fresh_ltp(o["symbol"]) or candle_close(o["symbol"])
+
+
+def trail_target(o, rec, price):
+    """The stop trigger the trailing rule asks for at this price, or None if the stop should stay where it is."""
+    fill = o.get("avg_price") or o.get("price") or o.get("ref")
+    risk = o.get("risk")
+    if not fill or not risk or not price or abs(price / fill - 1) > LTP_MAX_JUMP:
+        return None
+    buy = o["side"] == "BUY"
+    steps = int(((price - fill) if buy else (fill - price)) // risk)
+    if steps < 1:
+        return None
+    steps = min(steps, TRAIL_MAX_STEP)
+    trig = fill + (steps - 1) * risk if buy else fill - (steps - 1) * risk
+    trig = round(round(trig / 0.05) * 0.05, 2)
+    cur = rec.get("sl")
+    if cur is not None and ((buy and trig <= cur) or (not buy and trig >= cur)):
+        return None
+    if (buy and trig >= price) or (not buy and trig <= price):
+        return None  # a stop at or beyond the market would fire at once
+    return trig, steps
+
+
+def autopilot_once():
+    """Place stop-losses for filled entry orders that asked for one, and trail them. Never retries a broker order."""
+    if not market_open_now():
+        return 0
+    with ORDER_LOCK:
+        pend = [o for o in ORDERS if o.get("auto_sl") and not o.get("is_exit") and o.get("kind") in ("equity", "future")
+                and o.get("sl_state") in (None, "placed") and not o.get("trail_done")]
+    acts = 0
+    for uid in {o["user"] for o in pend}:
+        u = user_by_id(uid)
+        mine = [o for o in pend if o["user"] == uid]
+        if not u:
+            continue
+        if any(o["mode"] == "live" for o in mine):
+            sync_status(u)
+        for o in mine:
+            try:
+                acts += _auto_one(u, o)
+            except Exception as e:
+                AUTO["error"] = f"{type(e).__name__}: {str(e)[:100]}"
+    AUTO["last"] = time.time()
+    return acts
+
+
+def _auto_one(u, o):
+    live = o["mode"] == "live"
+    if o["sl_state"] is None:
+        if o["status"] in ("rejected", "cancelled", "expired", "unknown"):
+            o["sl_state"] = "skipped"
+            append_log(o)
+            return 0
+        if o["status"] != "complete":
+            return 0
+        o["sl_state"] = "placing"  # recorded first, so a crash mid-call is never followed by a second order
+        append_log(o)
+        rec, err = place_stop(u, o, live)
+        if err:
+            o["sl_state"] = "failed"
+            o["sl_note"] = err
+            append_log(o)
+            notify_user(u["id"], f"STOP-LOSS NOT PLACED: {o['symbol']}", f"{err}\nYour {o['side']} position in {o['label']} has no automatic stop-loss. Place one yourself now.")
+            return 1
+        notify_user(u["id"], f"Stop-loss placed: {o['symbol']}", f"Trigger {rec['sl']:.2f} for {rec['qty']} ({'live' if live else 'paper'}).")
+        return 1
+    if not o.get("trail") or o["sl_state"] != "placed":
+        return 0
+    rec = find_order(o["sl_order_id"], u["id"])
+    if not rec:
+        return 0
+    if rec["status"] in ("complete", "cancelled", "rejected", "expired"):
+        o["trail_done"] = True
+        append_log(o)
+        if rec["status"] == "complete":
+            notify_user(u["id"], f"Stop-loss hit: {o['symbol']}", f"Your stop-loss for {o['label']} was triggered.")
+        return 0
+    price = stop_price_now(u, o)
+    got = trail_target(o, rec, price)
+    if not got:
+        return 0
+    trig, steps = got
+    try:
+        if live:
+            get_account(u["id"], o["broker"]).modify_stop(o, rec, trig)
+        rec["sl"] = trig
+        rec["note"] = f"Trigger {trig:.2f} (trailed)"
+        o["trail_level"] = steps
+        o["trail_fail"] = 0
+        append_log(rec)
+        append_log(o)
+        notify_user(u["id"], f"Stop-loss moved: {o['symbol']}", f"Trigger is now {trig:.2f} (price {price:.2f}).")
+        return 1
+    except Exception as e:
+        o["trail_fail"] = o.get("trail_fail", 0) + 1
+        if o["trail_fail"] == 3:
+            notify_user(u["id"], f"Could not move stop-loss: {o['symbol']}", f"{str(e)[:120]}\nYour existing stop-loss is still in place at {rec.get('sl')}.")
+        return 0
+
+
+def autopilot_loop():
+    while True:
+        try:
+            autopilot_once()
+        except Exception as e:
+            AUTO["error"] = f"{type(e).__name__}: {str(e)[:100]}"
+        time.sleep(AUTOPILOT_SECONDS)
+
+
+def start_engine():
+    threading.Thread(target=autopilot_loop, daemon=True).start()
+    if DATA_BROKER in ("angel", "dhan"):
+        FEED["source"] = DATA_BROKER
+        threading.Thread(target=feed_loop, daemon=True).start()
 
 
 # ── Web app ──
@@ -1633,10 +1952,11 @@ def api_history(tf: str = DEFAULT_INTERVAL, symbol: str = "", sector: str = "", 
     recs.sort(key=lambda r: r["t"], reverse=True)
     oldest = min((r["t"] for r in recs), default=None)
     sym_rows = hist_groups(recs, "symbol", 3)
-    by_rate = sorted([r for r in sym_rows if r["exp1"] is not None], key=lambda r: (r["exp1"], r["n"]), reverse=True)
+    by_rate = sorted([r for r in sym_rows if r["exp2"] is not None], key=lambda r: (r["exp2"], r["t2"] or 0, r["n"]), reverse=True)
+    half = len(by_rate) // 2  # the two lists never share a symbol
     return {"tf": tf, "scanned": scanned, "progress": progress, "stats": hist_stats(recs),
             "by_side": hist_groups(recs, "side"), "by_sector": sorted(hist_groups(recs, "sector"), key=lambda r: -r["n"]),
-            "best": by_rate[:8], "worst": list(reversed(by_rate[-8:])) if len(by_rate) > 8 else [],
+            "best": [r for r in by_rate[:min(8, half)] if r["exp2"] > 0], "worst": [r for r in reversed(by_rate[len(by_rate) - min(8, half):]) if r["exp2"] < 0] if half else [],
             "by_hour": sorted(hist_groups([r for r in recs if r["hour"] is not None], "hour"), key=lambda r: r["key"]) if tf != "1d" else [],
             "recent": [{**r, "status": hist_status(r)} for r in recs[:300]],
             "since": pd.Timestamp(oldest, unit="s", tz="UTC").tz_convert(IST).strftime("%d %b %Y") if oldest else None,
@@ -1727,6 +2047,15 @@ def alert_worker():
             deliver(*item)
         except Exception as e:
             print("alert delivery failed:", e, flush=True)
+
+
+def notify_user(uid, title, text):
+    """Important messages (a stop-loss that was not placed) bypass the hourly limit."""
+    item = (uid, title, text, "warning", True)
+    if ALERT_SYNC:
+        deliver(*item)
+    else:
+        ALERT_Q.put(item)
 
 
 def queue_alert(uid, title, text, tag):
@@ -1943,6 +2272,7 @@ async def auth_mw(request: Request, call_next):
 def start_worker():
     init_db()
     start_alerts()
+    start_engine()
     threading.Thread(target=refresh, args=(DEFAULT_INTERVAL,), daemon=True).start()
 
 
@@ -2090,8 +2420,11 @@ def api_signals(tf: str = DEFAULT_INTERVAL):
         tf = DEFAULT_INTERVAL
     ensure_fresh(tf)  # scans on demand, so a timeframe nobody is viewing costs nothing
     with LOCK:
+        snap = dict(STATES[tf])
+        snap["rows"] = apply_live(snap["rows"])
         return JSONResponse({
-            **STATES[tf],
+            **snap,
+            "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"]},
             "interval": tf,
             "intervals": INTERVALS,
             "settings": f"Chandelier {ATR_LEN}x{ATR_MULT} + EMA {EMA_LEN} + QQE MOD",
@@ -2136,7 +2469,7 @@ def api_chain(symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
                 all_tf[t_] = {"signal": r_["signal"], "status": r_["status"], "signal_time": r_["signal_time"]}
     out = {**chain, "signal": signal, "bias": side, "suggested": None, "levels": None,
            "tf": tf, "sig_info": sig_info, "all_tf": all_tf,
-           "chg": row.get("chg") if row else None, "sector": row.get("sector") if row else sector_of(symbol)}
+           "chg": (apply_live([row])[0].get("ltp_chg", row.get("chg"))) if row else None, "sector": row.get("sector") if row else sector_of(symbol)}
     if side:
         atm_row = next((r for r in chain["rows"] if r["strike"] == chain["atm"]), None)
         if atm_row:
@@ -2279,6 +2612,36 @@ def api_cancel(request: Request, payload: dict = Body(...)):
     return {"ok": True}
 
 
+def place_stop(u, o, live):
+    """Place the stop-loss for a filled entry order. Used by the Orders tab button and by automatic stop-loss.
+    Returns (record, error). The broker call is made once and never retried."""
+    qty = int(o.get("filled") or o["qty"])
+    exit_side = "SELL" if o["side"] == "BUY" else "BUY"
+    fill = o.get("avg_price") or o["price"]
+    if o["kind"] == "future":
+        # futures trade at a different price from the index, so the stop is measured from the actual fill
+        if not fill:
+            return None, "The fill price is not known yet. Try again in a few seconds."
+        sl = round(round((fill - o["risk"] if o["side"] == "BUY" else fill + o["risk"]) / 0.05) * 0.05, 2)
+    else:
+        sl = o["sl"]
+        if fill and ((o["side"] == "BUY" and sl >= fill) or (o["side"] == "SELL" and sl <= fill)):
+            return None, "The stop-loss level is on the wrong side of the entry price, so it was not placed."
+    exit_o = {**o, "side": exit_side, "qty": qty, "order_type": "STOPLOSS_MARKET", "price": 0.0, "key": None, "sl": sl}
+    if not live:
+        rec = new_record(exit_o, paper_id(), "open", variety="STOPLOSS", is_exit=True, note=f"Trigger {sl:.2f}")
+    else:
+        try:
+            oid = get_account(u["id"], o["broker"]).place(o, variety="STOPLOSS", ordertype="STOPLOSS_MARKET", trigger=sl, side=exit_side, qty=qty)
+        except Exception as e:
+            return None, f"The broker did not confirm the stop-loss ({e}). Check your {BROKER_NAMES.get(o.get('broker'), 'broker')} app."
+        rec = new_record(exit_o, oid, "open", variety="STOPLOSS", is_exit=True, note=f"Trigger {sl:.2f}")
+    o["sl_order_id"] = rec["id"]
+    o["sl_state"] = "placed"
+    append_log(o)
+    return rec, None
+
+
 @app.post("/api/orders/protect")
 def api_protect(request: Request, payload: dict = Body(...)):
     """Place the stop-loss as a stop-market order, only after the entry order is complete."""
@@ -2298,29 +2661,9 @@ def api_protect(request: Request, payload: dict = Body(...)):
     err = pin_error(u, payload.get("pin"), live)
     if err:
         return {"error": err}
-    qty = int(o.get("filled") or o["qty"])
-    exit_side = "SELL" if o["side"] == "BUY" else "BUY"
-    fill = o.get("avg_price") or o["price"]
-    if o["kind"] == "future":
-        # futures trade at a different price from the index, so the stop is measured from the actual fill
-        if not fill:
-            return {"error": "The fill price is not known yet. Try again in a few seconds."}
-        sl = round(round((fill - o["risk"] if o["side"] == "BUY" else fill + o["risk"]) / 0.05) * 0.05, 2)
-    else:
-        sl = o["sl"]
-        if fill and ((o["side"] == "BUY" and sl >= fill) or (o["side"] == "SELL" and sl <= fill)):
-            return {"error": "The stop-loss level is on the wrong side of the entry price, so it was not placed."}
-    exit_o = {**o, "side": exit_side, "qty": qty, "order_type": "STOPLOSS_MARKET", "price": 0.0, "key": None, "sl": sl}
-    if not live:
-        rec = new_record(exit_o, paper_id(), "open", variety="STOPLOSS", is_exit=True, note=f"Trigger {sl:.2f}")
-    else:
-        try:
-            oid = get_account(u["id"], o["broker"]).place(o, variety="STOPLOSS", ordertype="STOPLOSS_MARKET", trigger=sl, side=exit_side, qty=qty)
-        except Exception as e:
-            return {"error": f"The broker did not confirm the stop-loss ({e}). Check your {BROKER_NAMES.get(o.get('broker'), 'broker')} app."}
-        rec = new_record(exit_o, oid, "open", variety="STOPLOSS", is_exit=True, note=f"Trigger {sl:.2f}")
-    o["sl_order_id"] = rec["id"]
-    append_log(o)
+    rec, err = place_stop(u, o, live)
+    if err:
+        return {"error": err}
     return {"ok": True, "order": public(rec)}
 
 
@@ -2436,7 +2779,9 @@ def api_admin_overview(request: Request):
     return {"users": len(users), "active": sum(1 for r in users if r["active"]), "admins": sum(1 for r in users if r["role"] == "admin"),
             "live_enabled": sum(1 for r in users if r["live_allowed"]), "orders": orders,
             "live_server": LIVE_REQUESTED, "signup": ALLOW_SIGNUP, "invite": bool(SIGNUP_CODE),
-            "storage": "postgres" if USE_PG else DB_PATH, "signals": sig}
+            "storage": "postgres" if USE_PG else DB_PATH, "signals": sig,
+            "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"]},
+            "auto": {"last_age": None if not AUTO["last"] else int(time.time() - AUTO["last"]), "error": AUTO["error"]}}
 
 
 @app.get("/api/admin/users")
@@ -2848,7 +3193,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
  <div class="card"><h3>By side</h3><div class="wrap"><table id="hSideT"></table></div><h3 style="margin-top:14px" id="hHourH">By hour of day</h3><div class="wrap"><table id="hHour"></table></div></div>
 </div>
 <div class="hgrid even">
- <div class="card"><h3>Best symbols <span class="sub">(3 or more signals)</span></h3><div class="wrap"><table id="hBest"></table></div></div>
+ <div class="card"><h3>Best symbols <span class="sub">(3 or more signals, ranked by R at T2)</span></h3><div class="wrap"><table id="hBest"></table></div></div>
  <div class="card"><h3>Weakest symbols</h3><div class="wrap"><table id="hWorst"></table></div></div>
 </div>
 <div class="card"><h3>Every signal</h3><div class="wrap"><table id="hList"></table></div></div>
@@ -2933,6 +3278,10 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <label>Product<select id="tkProd"></select></label>
   <label id="tkBrokerL" hidden>Broker<select id="tkBroker"></select></label>
  </div>
+ <div class="tkgrid" id="tkAutoBox" hidden>
+  <label class="chk"><input type="checkbox" id="tkAuto"> Place the stop-loss automatically after the fill</label>
+  <label class="chk" id="tkTrailL"><input type="checkbox" id="tkTrail"> Trail it up as targets are reached</label>
+ </div>
  <div class="tkreview" id="tkReview" hidden></div>
  <div class="tkgrid" id="tkConfirm" hidden>
   <label>Type YES to confirm<input id="tkYes" autocomplete="off"></label>
@@ -2972,9 +3321,10 @@ function cellFor(r,k){
  switch(k){
   case "symbol":return `<td><b>${esc(r.symbol)}</b>${r.type==="index"?'<span class="tag">Index</span>':""}</td>`;
   case "sector":return `<td class="sub">${esc(r.sector||"")}</td>`;
-  case "chg":return r.chg==null?"<td>–</td>":`<td class="${r.chg>=0?"up":"dn"}">${r.chg>0?"+":""}${r.chg.toFixed(2)}%</td>`;
+  case "chg":{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?"<td>–</td>":`<td class="${c>=0?"up":"dn"}">${c>0?"+":""}${c.toFixed(2)}%</td>`}
   case "signal":return `<td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td>`;
-  case "close":case "entry":return `<td>${fmt(r[k])}</td>`;
+  case "close":return `<td>${r.ltp!=null?`<b title="Live broker price. Candle close ${fmt(r.close)}">${fmt(r.ltp)}</b>`:fmt(r.close)}</td>`;
+  case "entry":return `<td>${fmt(r[k])}</td>`;
   case "sl":return `<td class="${r.sl_hit?"dn":""}">${fmt(r.sl)}${r.sl_hit?" ✖":""}</td>`;
   case "tp1":return tp(1);case "tp2":return tp(2);case "tp3":return tp(3);case "tp4":return tp(4);
   case "status":return `<td>${esc(r.status)}</td>`;
@@ -3123,12 +3473,13 @@ function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
  $("tkMode").textContent=tradeInfo.mode==="live"?"LIVE: this sends a real order to your broker.":"Paper mode: this order is only simulated.";
  const bl=tradeInfo.brokers||[];$("tkBroker").innerHTML=bl.map(x=>`<option value="${x}">${tradeInfo.broker_names[x]}</option>`).join("");
  $("tkBrokerL").hidden=bl.length<2;if(tradeInfo.default_broker&&bl.length)$("tkBroker").value=tradeInfo.default_broker;
+ $("tkAutoBox").hidden=opt;$("tkAuto").checked=!opt;$("tkTrail").checked=false;$("tkTrailL").hidden=false;
  $("tkYes").value="";$("tkPin").value="";resetReview();$("ticket").showModal()}
-["tkSide","tkQty","tkType","tkPrice","tkProd","tkBroker"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
+["tkSide","tkQty","tkType","tkPrice","tkProd","tkBroker","tkAuto","tkTrail"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
 $("tkReviewBtn").onclick=async()=>{
- const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:tf||"",expiry:tk.expiry,strike:tk.strike,right:tk.right};
+ const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:tf||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
  const d=await post("/api/orders/preview",body);
  if(d.error){$("tkMsg").textContent=d.error;return}
@@ -3159,7 +3510,7 @@ function renderOrders(d){const t=$("ordTable");
   if(cancelable.has(o.status))act.push(`<button class="mini" data-cancel="${esc(o.id)}">Cancel</button>`);
   if(!o.is_exit&&(o.kind==="equity"||o.kind==="future")&&(o.sl||o.risk)&&!o.sl_order_id&&o.status==="complete")act.push(`<button class="mini" data-protect="${esc(o.id)}">Place stop-loss${o.kind==="future"?"":" "+f2(o.sl)}</button>`);
   const price=o.order_type==="LIMIT"?f2(o.price):o.is_exit?(o.note||""):o.avg_price?f2(o.avg_price):"Market";
-  return `<tr><td>${o.time}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}${o.broker&&o.broker!=="paper"?`<span class="tag">${esc((tradeInfo.broker_names||{})[o.broker]||o.broker)}</span>`:""}</td><td>${o.side}</td><td>${o.qty}</td><td>${o.order_type.replace("_"," ").toLowerCase()}</td><td>${price}</td><td title="${esc(o.note||"")}">${esc(o.status)}${o.sl_order_id?", SL placed":""}</td><td>${esc(o.id)}</td><td>${act.join(" ")}</td></tr>`}).join("")+"</tbody>"}
+  return `<tr><td>${o.time}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}${o.broker&&o.broker!=="paper"?`<span class="tag">${esc((tradeInfo.broker_names||{})[o.broker]||o.broker)}</span>`:""}</td><td>${o.side}</td><td>${o.qty}</td><td>${o.order_type.replace("_"," ").toLowerCase()}</td><td>${price}</td><td title="${esc(o.note||"")}">${esc(o.status)}${o.sl_order_id?", SL placed":""}${o.auto_sl&&!o.sl_order_id?(o.sl_state==="failed"?", <b class=\"dn\">auto SL FAILED</b>":o.sl_state==="skipped"?"":", auto SL waiting"):""}${o.trail_level?", trailed x"+o.trail_level:""}</td><td>${esc(o.id)}</td><td>${act.join(" ")}</td></tr>`}).join("")+"</tbody>"}
 $("ordTable").onclick=async e=>{const c=e.target.closest("[data-cancel]"),p=e.target.closest("[data-protect]");if(!c&&!p)return;
  if(!confirm(c?"Cancel this order?":"Place the stop-loss order now?"))return;
  const live=tradeInfo.mode==="live",pin=live?prompt("Order PIN"):"";if(live&&pin===null)return;
@@ -3190,7 +3541,7 @@ async function loadOverview(){const d=await (await api("/api/admin/overview")).j
  const live=d.orders.filter(o=>o.mode==="live").length;
  $("admOv").innerHTML=st("Users",`${d.active} active of ${d.users}`)+st("Admins",d.admins)+st("Live enabled for",d.live_enabled)
   +st("Orders today",`${d.orders.length} (${live} live)`)+st("Live trading on server",d.live_server?"On":"Off")
-  +st("Sign-up",d.signup?(d.invite?"Open, invite code":"Open"):"Closed")+st("User storage",d.storage==="postgres"?"Postgres":esc(d.storage)+" (needs a persistent disk or users vanish on redeploy)")
+  +st("Live price feed",d.feed&&d.feed.source?(d.feed.error?"Error: "+esc(d.feed.error):d.feed.age==null?"Waiting for the market":esc(d.feed.source)+", "+d.feed.count+" prices, "+d.feed.age+"s old"):"Off (using Yahoo closes)")+st("Auto stop-loss",d.auto&&d.auto.error?"Error: "+esc(d.auto.error):"Running")+st("Sign-up",d.signup?(d.invite?"Open, invite code":"Open"):"Closed")+st("User storage",d.storage==="postgres"?"Postgres":esc(d.storage)+" (needs a persistent disk or users vanish on redeploy)")
   +st("Signals now",sg);
  const t=$("admOrd");if(!d.orders.length){t.innerHTML=`<tbody><tr><td class="empty" style="text-align:left">No orders have been placed today.</td></tr></tbody>`;return}
  t.innerHTML=`<thead><tr><th>Time</th><th>User</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th><th>Broker</th></tr></thead><tbody>`+d.orders.map(o=>`<tr><td>${esc(o.time)}</td><td>${esc(o.username)}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}</td><td>${esc(o.side)}</td><td>${o.qty}</td><td>${o.order_type==="LIMIT"?f2(o.price):o.avg_price?f2(o.avg_price):"Market"}</td><td>${esc(o.status)}</td><td>${esc(o.broker||"paper")}</td></tr>`).join("")+"</tbody>"}
