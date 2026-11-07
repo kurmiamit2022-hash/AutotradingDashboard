@@ -3224,7 +3224,7 @@ CHART_CACHE = {}
 CHART_BARS = {"5m": 400, "15m": 400, "1d": 500}
 
 
-def chart_data(symbol, tf):
+def chart_data(symbol, tf, at=0):
     import yfinance as yf
     df = yf.download(yf_ticker(symbol), period=PERIODS[tf], interval=tf, auto_adjust=False, progress=False)
     if df is None or df.empty:
@@ -3261,7 +3261,15 @@ def chart_data(symbol, tf):
                         "low": round(float(df["Low"].iloc[i]), 2), "close": round(float(c[i]), 2)} for k, i in enumerate(range(start, n))],
            "markers": [{"time": t[i - start], "side": "BUY" if buy[i] else "SELL"} for i in range(start, n) if buy[i] or sell[i]],
            "signal": None}
-    if row.get("entry") is not None:
+    past = next((i for i in range(n) if at and int(df.index[i].timestamp()) == at and (buy[i] or sell[i])), None) if at else None
+    if past is not None:
+        rec = eval_signals(symbol, df, tf, [past], buy, c, df["High"].to_numpy(float), df["Low"].to_numpy(float), atr, ls, ss)[0]
+        sgn = 1 if rec["side"] == "BUY" else -1
+        risk = abs(rec["entry"] - rec["sl"])
+        out["signal"] = {"side": rec["side"], "state": rec["side"] + " (past signal)", "status": hist_status(rec), "time": rec["time"],
+                         "from": t[max(past, start) - start], "entry": rec["entry"], "sl": rec["sl"], "sl_hit": rec["sl_hit"], "hits": rec["hits"],
+                         "tps": [round(rec["entry"] + sgn * risk * r, 2) for r in R_MULTIPLES]}
+    elif row.get("entry") is not None:
         j = max((i for i in range(n) if buy[i] or sell[i]), default=None)
         if j is not None:
             out["signal"] = {"side": row.get("side"), "state": row["signal"], "status": row["status"], "time": row["signal_time"],
@@ -3271,18 +3279,18 @@ def chart_data(symbol, tf):
 
 
 @app.get("/api/chart")
-def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL):
+def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0):
     symbol = symbol.upper().strip()
     if tf not in INTERVALS:
         tf = DEFAULT_INTERVAL
     if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol) or (symbol not in UNIVERSE and symbol not in INDEX_YF):
         return JSONResponse({"error": "Unknown symbol."}, status_code=400)
-    key = (symbol, tf)
+    key = (symbol, tf, at)
     hit = CHART_CACHE.get(key)
     if hit and time.time() - hit[0] < 30:
         return JSONResponse(hit[1])
     try:
-        d = chart_data(symbol, tf)
+        d = chart_data(symbol, tf, at)
     except Exception as e:
         return JSONResponse({"error": f"Could not load candles ({type(e).__name__})."})
     if not d:
@@ -3351,6 +3359,26 @@ def api_index_overview():
                 "price": r.get("ltp", r["close"]), "chg": r.get("ltp_chg", r.get("chg")),
                 "levels": {k: r[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")} if r.get("entry") is not None else None}
     return {"symbols": list(IDX_OPT), "tfs": list(IDX_TFS), "data": out, "scanning": scanning}
+
+
+@app.get("/api/index/signals")
+def api_index_signals(symbol: str, tf: str = "15m", n: int = 10):
+    """The most recent signals of one index on one timeframe, newest first, with what each one did."""
+    symbol = symbol.upper().strip()
+    if symbol not in IDX_OPT or tf not in IDX_TFS:
+        return JSONResponse({"error": "Unknown index or timeframe."}, status_code=400)
+    ensure_fresh(tf)
+    with LOCK:
+        recs = [r for r in HIST[tf] if r["symbol"] == symbol]
+        scanned = STATES[tf]["updated"]
+    recs.sort(key=lambda r: r["t"], reverse=True)
+    out = []
+    for r in recs[:max(1, min(n, 30))]:
+        sg = 1 if r["side"] == "BUY" else -1
+        risk = abs(r["entry"] - r["sl"])
+        out.append({"t": r["t"], "time": r["time"], "side": r["side"], "entry": r["entry"], "sl": r["sl"],
+                    "tps": [round(r["entry"] + sg * risk * m, 2) for m in R_MULTIPLES], "hits": r["hits"], "sl_hit": r["sl_hit"], "status": hist_status(r)})
+    return {"symbol": symbol, "tf": tf, "signals": out, "scanned": bool(scanned)}
 
 
 @app.get("/api/futures/info")
@@ -4136,6 +4164,8 @@ dialog::backdrop{background:rgba(14,10,40,.6);backdrop-filter:blur(3px)}
 .ixc{background:var(--panel);border-radius:14px;box-shadow:var(--shadow);padding:10px 14px;display:flex;flex-direction:column;gap:3px;cursor:pointer;border:2px solid transparent;text-align:left;color:var(--ink);font:inherit}
 .ixc[aria-pressed=true]{border-color:var(--acc)}.ixc .t{font-size:12.5px;color:var(--mute);font-weight:600}.ixc .px{font-size:12.5px;color:var(--mute)}
 .ixc.fresh.BUY{animation:pulseb 2.2s ease-in-out infinite}.ixc.fresh.SELL{animation:pulses 2.2s ease-in-out infinite}
+.ixhist{margin-top:12px;padding:10px 14px;background:var(--panel)}.ixhh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.ixhist table.gt td,.ixhist table.gt th{text-align:right}.ixhist table.gt td:first-child,.ixhist table.gt th:first-child,.ixhist table.gt td:nth-child(2),.ixhist table.gt th:nth-child(2){text-align:left}
 .ogrid.ix{grid-template-columns:minmax(0,1fr)}.ogrid.ix .olist{display:none}
 @media(prefers-reduced-motion:reduce){.ixc.fresh{animation:none!important}}
 /* signal flashing */
@@ -4178,6 +4208,8 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="ixbar" id="ixbar" hidden>
  <div class="ixrow"><div class="seg" id="ixSym" role="group" aria-label="Index"></div><div class="seg" id="ixTfs" role="group" aria-label="Timeframe"></div><span class="sub" id="ixNote"></span></div>
  <div class="ixmat" id="ixMat"></div>
+ <div class="card ixhist"><div class="ixhh"><b id="ixHTitle">Last 10 signals</b><button class="btn ghost" id="ixChart">Chart</button></div>
+  <div class="wrap"><table class="gt" id="ixHist"></table></div></div>
 </div>
 <div class="ogrid" id="ogrid">
  <aside class="olist" aria-label="Scripts">
@@ -4476,21 +4508,21 @@ function initModes(){paintTheme();
   else{const d=await post("/api/trading/mode",{mode:"paper"});if(d.error){alert(d.error);return}}
   await loadTrading();if(typeof loadOrders==="function")try{loadOrders()}catch(x){}}}
 // ── chart popup (TradingView's open-source Lightweight Charts) ──
-let lwPromise=null,chSym="",chTf="",chObj=null;
+let lwPromise=null,chSym="",chTf="",chAt=0,chObj=null;
 function loadLW(){if(window.LightweightCharts)return Promise.resolve();
  return lwPromise||(lwPromise=new Promise((ok,no)=>{const s=document.createElement("script");s.src="/lw.js";s.onload=ok;s.onerror=()=>{lwPromise=null;no()};document.head.appendChild(s)}))}
-function openChart(sym,t){chSym=sym;chTf=t||tf||"15m";$("chTitle").textContent=sym;$("chTfs").innerHTML=(data?data.intervals:["5m","15m","1d"]).map(x=>`<button data-ct="${x}" aria-pressed="${x===chTf}">${tfName[x]||x}</button>`).join("");
+function openChart(sym,t,at){chSym=sym;chTf=t||tf||"15m";chAt=at||0;$("chTitle").textContent=sym;$("chTfs").innerHTML=(data?data.intervals:["5m","15m","1d"]).map(x=>`<button data-ct="${x}" aria-pressed="${x===chTf}">${tfName[x]||x}</button>`).join("");
  if(!$("chartDlg").open)$("chartDlg").showModal();drawChart()}
 function initChart(){
- $("chTfs").onclick=e=>{const b=e.target.closest("button");if(b){chTf=b.dataset.ct;$("chTfs").querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.ct===chTf));drawChart()}};
+ $("chTfs").onclick=e=>{const b=e.target.closest("button");if(b){chTf=b.dataset.ct;chAt=0;$("chTfs").querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.ct===chTf));drawChart()}};
  $("chClose").onclick=()=>$("chartDlg").close();
  $("chartDlg").addEventListener("close",()=>{if(chObj){chObj.remove();chObj=null}})}
 async function drawChart(){
- const my=chSym+chTf;$("chMsg").textContent="Loading chart…";$("chLeg").innerHTML="";
+ const my=chSym+chTf+chAt;$("chMsg").textContent="Loading chart…";$("chLeg").innerHTML="";
  if(chObj){chObj.remove();chObj=null}
  try{await loadLW()}catch(e){$("chMsg").textContent="The chart library did not load. Reload the page and try again.";return}
- let d;try{const r=await api(`/api/chart?symbol=${encodeURIComponent(chSym)}&tf=${chTf}`);d=await r.json()}catch(e){$("chMsg").textContent="The server did not return chart data. Try again in a moment.";return}
- if(my!==chSym+chTf)return;
+ let d;try{const r=await api(`/api/chart?symbol=${encodeURIComponent(chSym)}&tf=${chTf}${chAt?'&at='+chAt:''}`);d=await r.json()}catch(e){$("chMsg").textContent="The server did not return chart data. Try again in a moment.";return}
+ if(my!==chSym+chTf+chAt)return;
  if(d.error){$("chMsg").textContent=d.error;return}
  $("chMsg").textContent="";
  const css=getComputedStyle(document.documentElement),col=(n,f)=>css.getPropertyValue(n).trim()||f;
@@ -4556,12 +4588,20 @@ function ixMatrix(){const box=$("ixMat");if(!ixData){box.innerHTML="";return}
  $("ixNote").textContent=ixData.scanning?"Scanning the latest candles…":""}
 async function ixLoad(){clearTimeout(ixTimer);if(mode!=="index")return;
  try{ixData=await (await api("/api/index/overview")).json();ixMatrix()}catch(e){}
+ ixSignals();
  ixTimer=setTimeout(ixLoad,ixData&&ixData.scanning?3000:20000)}
-function ixPick(sym,t){if(sym)osym=sym;if(t){ixTf=t;try{localStorage.setItem("ixTf",t)}catch(e){}}oexp="";ixPaint();loadChain()}
+async function ixSignals(){const sy=osym,t=ixTf;$("ixHTitle").textContent=`Last 10 signals · ${sy} · ${tfName[t]||t}`;
+ try{const d=await (await api(`/api/index/signals?symbol=${sy}&tf=${t}`)).json();if(sy!==osym||t!==ixTf)return;
+  const tb=$("ixHist");if(d.error||!d.signals.length){tb.innerHTML=`<tbody><tr><td class="empty">${d.error?esc(d.error):d.scanned?"No signals in the candles loaded for this timeframe.":"Scanning the latest candles…"}</td></tr></tbody>`;return}
+  tb.innerHTML="<thead><tr><th>Signal candle</th><th>Side</th><th>Entry</th><th>SL</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Result</th><th></th></tr></thead><tbody>"+d.signals.map(r=>{const tp=(p,i)=>`<td class="${r.hits>i?"up":""}">${f2(p)}${r.hits>i?" ✓":""}</td>`;
+   return `<tr><td>${esc(r.time)}</td><td><span class="pill ${r.side}">${r.side}</span></td><td>${f2(r.entry)}</td><td class="${r.sl_hit?"dn":""}">${f2(r.sl)}${r.sl_hit?" ✖":""}</td>${r.tps.map(tp).join("")}<td>${esc(r.status)}</td><td><button class="mini" data-at="${r.t}">Chart</button></td></tr>`}).join("")+"</tbody>"}catch(e){}}
+function ixPick(sym,t){if(sym)osym=sym;if(t){ixTf=t;try{localStorage.setItem("ixTf",t)}catch(e){}}oexp="";ixPaint();loadChain();ixSignals()}
 function initIndex(){
  $("ixSym").onclick=e=>{const b=e.target.closest("button");if(b)ixPick(b.dataset.s,null)};
  $("ixTfs").onclick=e=>{const b=e.target.closest("button");if(b)ixPick(null,b.dataset.t)};
- $("ixMat").onclick=e=>{const b=e.target.closest(".ixc");if(b)ixPick(b.dataset.s,b.dataset.t)}}
+ $("ixMat").onclick=e=>{const b=e.target.closest(".ixc");if(b)ixPick(b.dataset.s,b.dataset.t)};
+ $("ixChart").onclick=()=>openChart(osym,ixTf);
+ $("ixHist").onclick=e=>{const b=e.target.closest("[data-at]");if(b)openChart(osym,ixTf,+b.dataset.at)}}
 // ── Orders and order ticket ──
 let tk=null,tkToken=null,tradeInfo={mode:"paper",caps:{}},lastChain=null;
 const $=id=>document.getElementById(id);
