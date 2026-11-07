@@ -3392,6 +3392,31 @@ def api_index_signals(symbol: str, tf: str = "15m", n: int = 10):
 
 # ── Intraday scanner: NSE's most active stocks, with the signal on 5 min / 15 min ──
 ACTIVE_CACHE = {}
+# Large and mid caps only. Large = NIFTY 100, mid = NIFTY MIDCAP 150, read from NSE and kept for 12 hours.
+# If NSE does not answer, the scanner drops the F&O stocks listed here, which are my best guess of the smaller ones, and says so.
+SMALLCAP_FALLBACK = set("AMBER ANANDRATHI ANGELONE CAMS CDSL CROMPTON CUB DATAPATTNS FORCEMOT IEX INOXWIND KARURVYSYA KFINTECH MANAPPURAM NAVINFLUOR PGEL RBLBANK SAGILITY SYRMA UJJIVANSFB".split())
+SCANNER_EXCLUDE = {x.strip().upper() for x in os.getenv("SCANNER_EXCLUDE", "").split(",") if x.strip()}   # always leave these out
+SCANNER_INCLUDE = {x.strip().upper() for x in os.getenv("SCANNER_INCLUDE", "").split(",") if x.strip()}   # always keep these
+CAP_CACHE = {"t": 0.0, "map": None}
+
+
+def cap_classes():
+    """{symbol: "Large" | "Mid"} from NSE's NIFTY 100 and NIFTY MIDCAP 150 lists, or None when NSE does not answer for both."""
+    if CAP_CACHE["map"] is not None and time.time() - CAP_CACHE["t"] < 12 * 3600:
+        return CAP_CACHE["map"]
+    out = {}
+    for idx, label in (("NIFTY 100", "Large"), ("NIFTY MIDCAP 150", "Mid")):
+        raw = nse.get_json("/api/equity-stockIndices", {"index": idx})
+        names = [str(r.get("symbol", "")).upper() for r in ((raw or {}).get("data") or []) if isinstance(r, dict)]
+        names = [x for x in names if x and x != idx]
+        if len(names) < 30:   # an answer that small is not a real index list
+            return CAP_CACHE["map"]
+        for x in names:
+            out.setdefault(x, label)
+    CAP_CACHE.update(t=time.time(), map=out)
+    return out
+
+
 SCANNER_TOP = 10   # the scanner follows the day's ten most active F&O stocks by volume
 
 
@@ -3427,30 +3452,38 @@ def api_scanner(tf: str = "15m", only: int = 0):
         rows = [r for r in apply_live(list(STATES[tf]["rows"])) if r.get("type") != "index"]
         upd, busy = STATES[tf]["updated"], STATES[tf]["refreshing"] or not STATES[tf]["updated"]
     by_sym = {r["symbol"]: r for r in rows}
+    caps = cap_classes()
+    def allowed(sym):
+        if sym in SCANNER_EXCLUDE:
+            return False
+        if sym in SCANNER_INCLUDE:
+            return True
+        return sym in caps if caps is not None else sym not in SMALLCAP_FALLBACK
     names = nse_most_active(by)
     source, skipped = "nse", 0
     if names:
-        ranked = [x for x in names if x in by_sym]
+        ranked = [x for x in names if x in by_sym and allowed(x)]
         skipped = len([x for x in names if x not in by_sym])
     else:
         source = "computed"
-        ranked = [r["symbol"] for r in sorted((r for r in rows if r.get("vol")), key=lambda r: -r["vol"])]
+        ranked = [r["symbol"] for r in sorted((r for r in rows if r.get("vol") and allowed(r["symbol"])), key=lambda r: -r["vol"])]
     out = []
     for sym in ranked:
         r = by_sym[sym]
         sg = r["signal"]
         if only and sg == "–":
             continue
-        out.append({"rank": len(out) + 1, "symbol": sym, "sector": r.get("sector"), "price": r.get("ltp", r["close"]),
+        out.append({"rank": len(out) + 1, "symbol": sym, "cap": (caps or {}).get(sym), "sector": r.get("sector"), "price": r.get("ltp", r["close"]),
                     "chg": r.get("ltp_chg", r.get("chg")), "vol": r.get("vol"), "val_cr": r.get("val_cr"), "signal": sg, "status": r["status"],
                     "signal_time": r["signal_time"], "bars_ago": r["bars_ago"], "side": r.get("side"),
                     "levels": {k: r[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")} if r.get("entry") is not None else None})
         if len(out) >= n:
             break
-    return {"tf": tf, "by": by, "source": source, "rows": out, "skipped": skipped, "scanning": busy, "updated": upd,
-            "note": ("Today's ten most active F&O stocks by volume, from NSE's most active list. Only F&O stocks are shown, because those are the ones that can be traded as futures or options."
+    return {"tf": tf, "by": by, "source": source, "cap_source": "nse" if caps is not None else "approx", "rows": out, "skipped": skipped, "scanning": busy, "updated": upd,
+            "note": ("Today's ten most active large-cap and mid-cap F&O stocks by volume, from NSE's most active list. Large cap = NIFTY 100, mid cap = NIFTY MIDCAP 150. Only F&O stocks are shown, because those are the ones that can be traded as futures or options."
                      if source == "nse" else
-                     "NSE's list did not load, so today's ten highest-volume F&O stocks are taken from the candle data instead. Open this page again later to use NSE's own list.")}
+                     "NSE's list did not load, so today's ten highest-volume large-cap and mid-cap F&O stocks are taken from the candle data instead. Open this page again later to use NSE's own list.") +
+                    ("" if caps is not None else " NSE's NIFTY 100 / MIDCAP 150 lists did not load either, so the smaller F&O stocks are dropped using a built-in list that may be a little out of date.")}
 
 
 @app.get("/api/futures/info")
@@ -4302,7 +4335,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </section>
 <section id="view-scanner" hidden>
 <div class="ixrow"><div class="seg" id="scTfs" role="group" aria-label="Timeframe"></div>
- <b class="scttl">Top 10 by volume today</b>
+ <b class="scttl">Top 10 by volume today · large and mid caps</b>
  <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label><span class="sub" id="scMeta"></span></div>
 <div class="wrap"><table id="scTable"></table></div>
 <div class="note" id="scNote"></div>
@@ -4608,7 +4641,7 @@ function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=
  tb.innerHTML=head+"<tbody>"+d.rows.map(r=>{const L=r.levels,fr=r.signal==="BUY"||r.signal==="SELL",lv=(k,i)=>L?`<td class="${r.status&&r.status.startsWith("T")&&+r.status[1]>i?"up":""}">${f2(L[k])}</td>`:"<td>–</td>";
   const c=r.chg==null?"<td>–</td>":`<td class="${r.chg>=0?"up":"dn"}">${r.chg>0?"+":""}${r.chg.toFixed(2)}%</td>`;
   const side=r.signal.endsWith("SELL")?"SELL":"BUY",has=r.signal!=="–"&&L;
-  return `<tr${fr?` class="fresh ${r.signal==="BUY"?"buy":"sell"}"`:""}><td>${r.rank}</td><td><b>${esc(r.symbol)}</b>${fr?'<span class="newb">NEW</span>':""}</td>
+  return `<tr${fr?` class="fresh ${r.signal==="BUY"?"buy":"sell"}"`:""}><td>${r.rank}</td><td><b>${esc(r.symbol)}</b>${r.cap?`<span class="tag">${r.cap}</span>`:""}${fr?'<span class="newb">NEW</span>':""}</td>
    <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
    <td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
