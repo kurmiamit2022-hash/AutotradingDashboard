@@ -18,14 +18,13 @@ Optional file:      symbols.txt  (one NSE symbol per line, e.g. RELIANCE) overri
 Orders are simulated ("paper") unless live trading is on for the server and enabled for that person.
 Back up the database and the secret.key file together. Without the key, saved broker details cannot be read.
 """
-import base64
 import csv
 import hashlib
 import hmac
-import io
 import json
 import sqlite3
 import os
+import queue
 import re
 import secrets
 import threading
@@ -442,6 +441,11 @@ def refresh(interval):
                 st.update(rows=rows, errors=errors, updated=datetime.now().strftime("%d %b %H:%M:%S"))
             else:
                 st["errors"] = errors or ["Yahoo returned no data."]
+        if rows:
+            try:
+                check_alerts(interval, rows)
+            except Exception as e:
+                print("alert check failed:", e, flush=True)
     except Exception as e:
         with LOCK:
             st["errors"] = [f"Data fetch failed: {e}"]
@@ -735,6 +739,17 @@ def _pg_run(sql, args, fetch):
     raise last
 
 
+ALERT_DDL = [
+    "CREATE TABLE IF NOT EXISTS alerts(user_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, telegram_chat TEXT, ntfy_topic TEXT, "
+    "tfs TEXT NOT NULL DEFAULT '15m', sides TEXT NOT NULL DEFAULT 'BUY,SELL', sectors TEXT NOT NULL DEFAULT '', updated TEXT)",
+    "CREATE TABLE IF NOT EXISTS alert_seen(k TEXT PRIMARY KEY, ts TEXT NOT NULL)",
+]
+
+
+class DuplicateUser(Exception):
+    pass
+
+
 def q(sql, args=()):
     with DB_LOCK:
         if USE_PG:
@@ -749,14 +764,20 @@ def q(sql, args=()):
 def x(sql, args=()):
     with DB_LOCK:
         if USE_PG:
-            if sql.lstrip().upper().startswith("INSERT INTO USERS"):
-                return _pg_run(sql + " RETURNING id", args, "id")
-            return _pg_run(sql, args, None)
+            import psycopg2
+            try:
+                if sql.lstrip().upper().startswith("INSERT INTO USERS"):
+                    return _pg_run(sql + " RETURNING id", args, "id")
+                return _pg_run(sql, args, None)
+            except psycopg2.errors.UniqueViolation:
+                raise DuplicateUser()
         con = _con()
         try:
             cur = con.execute(sql, args)
             con.commit()
             return cur.lastrowid
+        except sqlite3.IntegrityError:
+            raise DuplicateUser()
         finally:
             con.close()
 
@@ -772,6 +793,9 @@ def init_db():
             c.execute("CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, csrf TEXT NOT NULL, expires DOUBLE PRECISION NOT NULL)")
             c.execute("""CREATE TABLE IF NOT EXISTS creds(user_id INTEGER NOT NULL, broker TEXT NOT NULL, blob TEXT NOT NULL, hint TEXT, updated TEXT,
               PRIMARY KEY(user_id, broker))""")
+            for ddl in ALERT_DDL:
+                c.execute(ddl)
+            c.execute("DELETE FROM alert_seen WHERE ts < %s", ((ist_now() - timedelta(days=7)).isoformat(),))
             c.execute("CREATE TABLE IF NOT EXISTS order_log(n SERIAL PRIMARY KEY, day TEXT NOT NULL, rec TEXT NOT NULL)")
             c.execute("CREATE INDEX IF NOT EXISTS order_log_day ON order_log(day)")
             c.execute("DELETE FROM order_log WHERE day < %s", ((ist_now() - timedelta(days=14)).strftime("%Y-%m-%d"),))
@@ -790,6 +814,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, csrf TEXT NOT NULL, expires REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS creds(user_id INTEGER NOT NULL, broker TEXT NOT NULL, blob TEXT NOT NULL, hint TEXT, updated TEXT,
               PRIMARY KEY(user_id, broker));""")
+            for ddl in ALERT_DDL:
+                con.execute(ddl)
+            con.execute("DELETE FROM alert_seen WHERE ts < ?", ((ist_now() - timedelta(days=7)).isoformat(),))
             if "recovery_hash" not in [r[1] for r in con.execute("PRAGMA table_info(users)")]:
                 con.execute("ALTER TABLE users ADD COLUMN recovery_hash TEXT")
             con.commit()
@@ -928,6 +955,8 @@ def set_recovery(uid):
 def valid_new_password(name, pw):
     if len(pw) < 10:
         return "Use at least 10 characters."
+    if len(pw) > 200:
+        return "Use at most 200 characters."
     if pw.lower() == name.lower():
         return "The password cannot be the same as the username."
     if pw == DEFAULT_ADMIN_PW:
@@ -1280,8 +1309,13 @@ def make_order(p, u):
     if side not in ("BUY", "SELL") or otype not in ("MARKET", "LIMIT"):
         return fail("Side must be BUY or SELL and the order type Market or Limit.")
     try:
-        qty = int(p.get("qty"))
-    except (TypeError, ValueError):
+        raw_qty = p.get("qty")
+        if isinstance(raw_qty, bool):
+            raise ValueError
+        qty = int(float(raw_qty))
+        if qty != float(raw_qty):  # 1.5 is not a quantity
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
         return fail("Quantity must be a whole number.")
     cap = caps["max_fut_lots"] if (kind == "future" or (kind == "option" and side == "SELL")) else caps["max_qty"]
     if qty < 1 or qty > cap:
@@ -1358,8 +1392,11 @@ def make_order(p, u):
     price = 0.0
     if otype == "LIMIT":
         try:
-            price = round(round(float(p.get("price")) / 0.05) * 0.05, 2)
-        except (TypeError, ValueError):
+            raw_price = float(p.get("price"))
+            if raw_price != raw_price or raw_price in (float("inf"), float("-inf")):
+                raise ValueError
+            price = round(round(raw_price / 0.05) * 0.05, 2)
+        except (TypeError, ValueError, OverflowError):
             return fail("Enter a limit price.")
         if price <= 0:
             return fail("Enter a limit price.")
@@ -1496,10 +1533,290 @@ def sync_status(u):
 
 
 # ── Web app ──
-app = FastAPI(title="Signal dashboard")
+app = FastAPI(title="Signal dashboard", docs_url=None, redoc_url=None, openapi_url=None)
 
 
 PUBLIC_PATHS = {"/login", "/api/login", "/signup", "/api/signup", "/forgot", "/api/forgot", "/admin"}
+
+
+# ── Signal alerts: Telegram and ntfy push ──
+# Each person chooses where to be told about new signals. One server-wide Telegram bot (TELEGRAM_BOT_TOKEN) serves everyone;
+# ntfy.sh needs no account: the person installs the ntfy app and subscribes to a private topic name.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+ALERT_MAX_AGE_BARS = 1      # only candles this fresh are announced
+ALERT_DIGEST_AT = 5         # more new signals than this at once are sent as one summary
+ALERT_HOURLY_CAP = 80       # most messages one person can receive per hour
+ALERT_SYNC = False          # tests set this so messages are sent immediately
+TF_NAMES = {"5m": "5 min", "15m": "15 min", "1d": "Daily"}
+TG = {"name": None}
+LINK_CODES = {}             # code -> (user id, expires)
+ALERT_STATE = {"baseline": set(), "sent": {}, "last": {}, "test": {}}
+ALERT_Q = queue.Queue()
+NTFY_TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{6,64}")
+
+
+def sector_names():
+    return sorted(set(SECTOR_OF.values()) | {"Indices"})
+
+
+def alert_row(uid):
+    rows = q("SELECT * FROM alerts WHERE user_id=?", (uid,))
+    r = rows[0] if rows else {"enabled": 0, "telegram_chat": None, "ntfy_topic": None, "tfs": "15m", "sides": "BUY,SELL", "sectors": ""}
+    return {"enabled": bool(r["enabled"]), "telegram_chat": r["telegram_chat"], "ntfy_topic": r["ntfy_topic"],
+            "tfs": [t for t in str(r["tfs"] or "").split(",") if t in INTERVALS],
+            "sides": [t for t in str(r["sides"] or "").split(",") if t in ("BUY", "SELL")],
+            "sectors": [t for t in str(r["sectors"] or "").split(",") if t]}
+
+
+def ensure_alert_row(uid):
+    x("INSERT INTO alerts(user_id, updated) VALUES(?,?) ON CONFLICT(user_id) DO NOTHING", (uid, ist_now().isoformat()))
+
+
+def _tg(method, **params):
+    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}", json=params, timeout=35)
+    return r.json() if r.content else {}
+
+
+def send_telegram(chat, text):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                          json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=10)
+        return (True, "sent") if r.status_code == 200 else (False, f"Telegram refused it (HTTP {r.status_code}). Link Telegram again.")
+    except Exception as e:
+        return False, f"Telegram could not be reached: {type(e).__name__}"
+
+
+def send_ntfy(topic, title, text, tag):
+    try:
+        r = requests.post(f"{NTFY_SERVER}/{topic}", data=text.encode("utf-8"), timeout=10,
+                          headers={"Title": title.encode("ascii", "ignore").decode(), "Tags": tag, "Priority": "high"})
+        return (True, "sent") if r.status_code == 200 else (False, f"ntfy refused it (HTTP {r.status_code}).")
+    except Exception as e:
+        return False, f"ntfy could not be reached: {type(e).__name__}"
+
+
+def deliver(uid, title, text, tag, force=False):
+    """Send one message to every channel the person set up. Returns {channel: result text}."""
+    now = time.time()
+    sent = [t for t in ALERT_STATE["sent"].get(uid, []) if now - t < 3600]
+    ALERT_STATE["sent"][uid] = sent
+    if len(sent) >= ALERT_HOURLY_CAP and not force:
+        return {"limit": "hourly limit reached"}
+    pr = alert_row(uid)
+    out = {}
+    if pr["telegram_chat"] and TELEGRAM_BOT_TOKEN:
+        out["telegram"] = send_telegram(pr["telegram_chat"], title + "\n" + text)[1]
+    if pr["ntfy_topic"]:
+        out["ntfy"] = send_ntfy(pr["ntfy_topic"], title, text, tag)[1]
+    if out:
+        sent.append(now)
+        bad = [v for v in out.values() if v != "sent"]
+        ALERT_STATE["last"][uid] = (ist_now().strftime("%d %b %H:%M") + (" sent" if not bad else " problem: " + "; ".join(bad)))
+    return out
+
+
+def alert_worker():
+    while True:
+        item = ALERT_Q.get()
+        try:
+            deliver(*item)
+        except Exception as e:
+            print("alert delivery failed:", e, flush=True)
+
+
+def queue_alert(uid, title, text, tag):
+    if ALERT_SYNC:
+        deliver(uid, title, text, tag)
+    else:
+        ALERT_Q.put((uid, title, text, tag))
+
+
+def _n(v):
+    return "–" if v is None else f"{v:,.2f}"
+
+
+def fmt_alert(tf, r):
+    chg = r.get("chg")
+    lines = [f"Entry {_n(r['entry'])}   SL {_n(r['sl'])}",
+             f"T1 {_n(r['tp1'])}   T2 {_n(r['tp2'])}   T3 {_n(r['tp3'])}   T4 {_n(r['tp4'])}",
+             f"{r.get('sector', '')}" + (f" · today {chg:+.2f}%" if chg is not None else ""),
+             f"Signal candle {r['signal_time']}", "Review it on the dashboard before placing any order."]
+    return f"{r['signal']} {r['symbol']} ({TF_NAMES.get(tf, tf)})", "\n".join(lines)
+
+
+def check_alerts(interval, rows):
+    """Called after every scan. Tells people about signals that appeared since the last scan, each only once."""
+    fresh = [r for r in rows if r["signal"] in ("BUY", "SELL") and r.get("bars_ago") is not None and r["bars_ago"] <= ALERT_MAX_AGE_BARS]
+    new = []
+    for r in fresh:
+        k = f"{interval}|{r['symbol']}|{r['signal_time']}|{r['signal']}"
+        if not q("SELECT 1 FROM alert_seen WHERE k=?", (k,)):
+            x("INSERT INTO alert_seen(k, ts) VALUES(?,?) ON CONFLICT(k) DO NOTHING", (k, ist_now().isoformat()))
+            new.append(r)
+    if interval not in ALERT_STATE["baseline"]:  # first scan after a restart: note what exists, announce nothing
+        ALERT_STATE["baseline"].add(interval)
+        return 0
+    if not new:
+        return 0
+    users = q("SELECT a.user_id FROM alerts a JOIN users u ON u.id = a.user_id WHERE a.enabled=1 AND u.active=1")
+    count = 0
+    for u in users:
+        pr = alert_row(u["user_id"])
+        if interval not in pr["tfs"] or not (pr["telegram_chat"] or pr["ntfy_topic"]):
+            continue
+        mine = [r for r in new if r["signal"] in pr["sides"] and (not pr["sectors"] or r.get("sector") in pr["sectors"])]
+        if not mine:
+            continue
+        if len(mine) > ALERT_DIGEST_AT:
+            b = [r["symbol"] for r in mine if r["signal"] == "BUY"]
+            sl = [r["symbol"] for r in mine if r["signal"] == "SELL"]
+            text = (f"BUY ({len(b)}): " + ", ".join(b[:25]) if b else "") + ("\n" if b and sl else "") + (f"SELL ({len(sl)}): " + ", ".join(sl[:25]) if sl else "")
+            queue_alert(u["user_id"], f"{len(mine)} new signals ({TF_NAMES.get(interval, interval)})", text, "chart_with_upwards_trend")
+            count += 1
+        else:
+            for r in mine:
+                title, text = fmt_alert(interval, r)
+                queue_alert(u["user_id"], title, text, "green_circle" if r["signal"] == "BUY" else "red_circle")
+                count += 1
+    return count
+
+
+def handle_tg_update(upd):
+    msg = upd.get("message") or {}
+    chat = msg.get("chat") or {}
+    if chat.get("type") != "private":
+        return
+    text = (msg.get("text") or "").strip()
+    m = re.fullmatch(r"/start(?:@\w+)?\s+([0-9A-Fa-f]{8})", text)
+    reply = None
+    if m:
+        ent = LINK_CODES.pop(m.group(1).upper(), None)
+        if ent and ent[1] > time.time():
+            ensure_alert_row(ent[0])
+            x("UPDATE alerts SET telegram_chat=? WHERE user_id=?", (str(chat["id"]), ent[0]))
+            reply = "Linked. New signal alerts will arrive in this chat. You can change what you receive in the dashboard under Account."
+        else:
+            reply = "That link code is wrong or has expired. Create a new one in the dashboard under Account, Signal alerts."
+    elif text.startswith("/start"):
+        reply = "Open the dashboard, go to Account, Signal alerts, and press Link Telegram. It gives you a link that connects this chat."
+    if reply:
+        send_telegram(chat["id"], reply)
+
+
+def telegram_poll():
+    offset = None
+    while True:
+        try:
+            if not TG["name"]:
+                TG["name"] = (_tg("getMe").get("result") or {}).get("username")
+            for c in [c for c, v in LINK_CODES.items() if v[1] < time.time()]:
+                LINK_CODES.pop(c, None)
+            if not LINK_CODES:  # only listen while someone is waiting to link
+                time.sleep(3)
+                continue
+            params = {"timeout": 20, "allowed_updates": ["message"]}
+            if offset:
+                params["offset"] = offset
+            for upd in _tg("getUpdates", **params).get("result", []):
+                offset = upd["update_id"] + 1
+                handle_tg_update(upd)
+        except Exception as e:
+            print("telegram poll:", type(e).__name__, flush=True)
+            time.sleep(10)
+
+
+def start_alerts():
+    threading.Thread(target=alert_worker, daemon=True).start()
+    if TELEGRAM_BOT_TOKEN:
+        threading.Thread(target=telegram_poll, daemon=True).start()
+
+
+@app.get("/api/alerts")
+def api_alerts(request: Request):
+    u = request.state.user
+    pr = alert_row(u["id"])
+    chat = pr.pop("telegram_chat")
+    return {**pr, "telegram_linked": bool(chat), "telegram_configured": bool(TELEGRAM_BOT_TOKEN), "bot": TG["name"],
+            "ntfy_server": NTFY_SERVER, "sector_names": sector_names(), "tf_names": TF_NAMES, "last": ALERT_STATE["last"].get(u["id"])}
+
+
+@app.put("/api/alerts")
+def api_alerts_save(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    tfs = [t for t in INTERVALS if t in (payload.get("tfs") or [])]
+    sides = [t for t in ("BUY", "SELL") if t in (payload.get("sides") or [])]
+    names = set(sector_names())
+    sectors = [t for t in (payload.get("sectors") or []) if t in names]
+    topic = str(payload.get("ntfy_topic") or "").strip()
+    if topic and not NTFY_TOPIC_RE.fullmatch(topic):
+        return {"error": "The ntfy topic must be 6 to 64 letters, digits, dashes or underscores."}
+    enabled = bool(payload.get("enabled"))
+    if enabled and not tfs:
+        return {"error": "Pick at least one timeframe."}
+    if enabled and not sides:
+        return {"error": "Pick BUY, SELL or both."}
+    ensure_alert_row(u["id"])
+    x("UPDATE alerts SET enabled=?, ntfy_topic=?, tfs=?, sides=?, sectors=?, updated=? WHERE user_id=?",
+      (int(enabled), topic or None, ",".join(tfs), ",".join(sides), ",".join(sectors), ist_now().isoformat(), u["id"]))
+    return {"ok": True}
+
+
+@app.post("/api/alerts/telegram/link")
+def api_tg_link(request: Request):
+    u = request.state.user
+    if not TELEGRAM_BOT_TOKEN:
+        return {"error": "Telegram alerts are not set up on this server. The admin must set TELEGRAM_BOT_TOKEN."}
+    if not TG["name"]:
+        try:
+            TG["name"] = (_tg("getMe").get("result") or {}).get("username")
+        except Exception:
+            pass
+    if not TG["name"]:
+        return {"error": "Could not reach Telegram just now. Try again in a minute."}
+    for c in [c for c, v in LINK_CODES.items() if v[0] == u["id"]]:
+        LINK_CODES.pop(c, None)
+    code = secrets.token_hex(4).upper()
+    LINK_CODES[code] = (u["id"], time.time() + 600)
+    return {"code": code, "bot": TG["name"], "url": f"https://t.me/{TG['name']}?start={code}", "minutes": 10}
+
+
+@app.post("/api/alerts/telegram/unlink")
+def api_tg_unlink(request: Request):
+    u = request.state.user
+    ensure_alert_row(u["id"])
+    x("UPDATE alerts SET telegram_chat=NULL WHERE user_id=?", (u["id"],))
+    return {"ok": True}
+
+
+@app.post("/api/alerts/test")
+def api_alert_test(request: Request):
+    u = request.state.user
+    if time.time() - ALERT_STATE["test"].get(u["id"], 0) < 10:
+        return {"error": "Wait a few seconds before sending another test."}
+    ALERT_STATE["test"][u["id"]] = time.time()
+    out = deliver(u["id"], "Test alert", "If you can read this, signal alerts will reach you here.", "white_check_mark", force=True)
+    if not out:
+        return {"error": "Nothing is set up yet. Link Telegram or enter an ntfy topic, save, then test again."}
+    return {"ok": all(v == "sent" for v in out.values()), "results": out}
+
+
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+       "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    h = resp.headers
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("Referrer-Policy", "same-origin")
+    h.setdefault("Content-Security-Policy", CSP)
+    h.setdefault("Cache-Control", "no-store")
+    if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
+        h.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return resp
 
 
 @app.middleware("http")
@@ -1521,6 +1838,7 @@ async def auth_mw(request: Request, call_next):
 @app.on_event("startup")
 def start_worker():
     init_db()
+    start_alerts()
     threading.Thread(target=refresh, args=(DEFAULT_INTERVAL,), daemon=True).start()
 
 
@@ -1532,6 +1850,7 @@ def api_login(request: Request, payload: dict = Body(...)):
     st = LOGIN_FAILS.get(key, {"n": 0, "until": 0.0})
     if time.time() < st["until"]:
         return JSONResponse({"error": "Too many attempts. Try again in a few minutes."}, status_code=429)
+    pw = pw[:300]  # never spend time hashing a huge input
     rows = q("SELECT * FROM users WHERE username=?", (name,))
     ok = bool(rows) and bool(rows[0]["active"]) and check_secret(pw, rows[0]["pw_hash"])
     if not rows:
@@ -1619,8 +1938,11 @@ def api_signup(request: Request, payload: dict = Body(...)):
         return JSONResponse({"error": bad}, status_code=400)
     if q("SELECT 1 FROM users WHERE username=?", (name,)):
         return JSONResponse({"error": "That username is taken."}, status_code=400)
-    uid = x("INSERT INTO users(username, pw_hash, role, active, live_allowed, created) VALUES(?,?,?,?,?,?)",
-            (name, hash_secret(pw), "user", 1, 0, ist_now().isoformat()))
+    try:
+        uid = x("INSERT INTO users(username, pw_hash, role, active, live_allowed, created) VALUES(?,?,?,?,?,?)",
+                (name, hash_secret(pw), "user", 1, 0, ist_now().isoformat()))
+    except DuplicateUser:
+        return JSONResponse({"error": "That username is taken."}, status_code=400)
     resp = JSONResponse({"ok": True, "recovery_key": set_recovery(uid)})
     session_cookie(resp, request, uid)
     return resp
@@ -2042,8 +2364,11 @@ def api_admin_create(request: Request, payload: dict = Body(...)):
         return {"error": "Role must be user or admin."}
     if q("SELECT 1 FROM users WHERE username=?", (name,)):
         return {"error": "That username is taken."}
-    x("INSERT INTO users(username, pw_hash, role, active, live_allowed, created) VALUES(?,?,?,?,?,?)",
-      (name, hash_secret(pw), role, 1, 0, ist_now().isoformat()))
+    try:
+        x("INSERT INTO users(username, pw_hash, role, active, live_allowed, created) VALUES(?,?,?,?,?,?)",
+          (name, hash_secret(pw), role, 1, 0, ist_now().isoformat()))
+    except DuplicateUser:
+        return {"error": "That username is taken."}
     return {"ok": True}
 
 
@@ -2108,7 +2433,7 @@ def api_admin_delete(request: Request, uid: int):
         return {"error": "User not found."}
     if rows[0]["role"] == "admin" and rows[0]["active"] and active_admins() <= 1:
         return {"error": "There must be at least one active admin."}
-    for t in ("sessions", "creds"):
+    for t in ("sessions", "creds", "alerts"):
         x(f"DELETE FROM {t} WHERE user_id=?", (uid,))
     x("DELETE FROM users WHERE id=?", (uid,))
     for k in [k for k in ACCOUNTS if k[0] == uid]:
@@ -2307,6 +2632,9 @@ tr:last-child td{border-bottom:0}
 .orow[aria-pressed=true]{background:var(--flat);font-weight:700}
 .orow .pill{min-width:0;padding:0 8px;font-size:12px}
 .orow .none{color:var(--mute)}
+.chks{display:flex;flex-wrap:wrap;gap:4px 14px;margin:4px 0 10px}.chks.sec{max-height:150px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:6px 10px}
+label.chk{display:inline-flex!important;flex-direction:row!important;gap:6px;align-items:center;font-size:14px;color:var(--ink);margin:0}
+label.chk input{width:auto;margin:0}
 .orow .ochg{margin-left:auto;font-size:12px}
 .omain .more{display:inline-flex;gap:6px;align-items:center;margin:0 0 8px;color:var(--mute);font-size:13px}
 .osig{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 16px;margin-bottom:12px;display:flex;flex-direction:column;gap:6px}
@@ -2414,6 +2742,24 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <div class="sub" style="margin-bottom:8px" id="recInfo"></div>
   <label>Your account password<input id="recPw" type="password" autocomplete="current-password"></label>
   <div class="tkbtns"><span class="sub" id="recMsg"></span><button class="btn" id="recBtn">Create a new recovery key</button></div></div>
+ <div class="card" id="alertCard"><h3>Signal alerts</h3>
+  <div class="sub" style="margin-bottom:10px">Get a message on your phone when a new BUY or SELL signal appears, so you do not have to watch the screen. Messages say what the indicator saw. They are not advice, so review each one before trading.</div>
+  <label class="chk"><input type="checkbox" id="alOn"> Send me alerts</label>
+  <div class="grid2">
+   <div><b class="sub">Timeframes</b><div id="alTf" class="chks"></div>
+    <b class="sub">Signals</b><div id="alSide" class="chks"><label class="chk"><input type="checkbox" value="BUY"> Buy</label><label class="chk"><input type="checkbox" value="SELL"> Sell</label></div></div>
+   <div><b class="sub">Sectors <span style="font-weight:400">(none ticked means all)</span></b><div id="alSec" class="chks sec"></div></div>
+  </div>
+  <div class="grid2">
+   <div class="bcard"><h4>Telegram <span class="tag" id="alTgTag"></span></h4>
+    <div class="sub" id="alTgInfo"></div>
+    <div class="tkbtns"><button class="mini" id="alTgUnlink" hidden>Unlink</button><button class="btn" id="alTgLink">Link Telegram</button></div></div>
+   <div class="bcard"><h4>ntfy app <span class="tag">No account needed</span></h4>
+    <div class="sub">Install the free ntfy app, subscribe to a topic name only you know, and type it here. Use a long, hard-to-guess name: anyone who knows it can read your alerts.</div>
+    <label>Topic<input id="alNtfy" autocomplete="off" placeholder="e.g. amit-signals-7f3k9x"></label>
+    <div class="tkbtns"><button class="mini" id="alRand">Make a random topic</button></div></div>
+  </div>
+  <div class="tkbtns"><span class="sub" id="alMsg"></span><button class="btn ghost" id="alTest">Send a test</button><button class="btn" id="alSave">Save alerts</button></div></div>
  <div class="card"><h3>Broker accounts</h3>
   <div class="note" style="margin:0 0 6px">Your broker details are stored encrypted on this server and are never shown again. Brokers accept API orders only from a static IP registered to your own client account, so register this server's IP with your broker. Sharing one IP between different clients is restricted: check your broker's rules.</div>
   <div id="brokerCards"></div></div>
@@ -2546,7 +2892,7 @@ function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mod
  const vm={stocks:"stocks",futures:"stocks",options:"options",orders:"orders",account:"account",admin:"admin"};
  ["stocks","options","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
- if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="account")loadMe();if(m==="admin")loadUsers();
+ if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
 function renderChips(){
@@ -2730,6 +3076,27 @@ $("limClose").onclick=()=>$("limDlg").close();
 $("limSave").onclick=async()=>{const d=await send("PATCH","/api/admin/users/"+limUser.id,{caps:{max_order_value:$("limValue").value,max_qty:$("limQty").value,max_orders:$("limOrders").value,max_fut_lots:$("limLots").value,max_fut_value:$("limFut").value,allow_option_selling:$("limSell").value==="1"}});
  if(d.error){$("limMsg").textContent=d.error;return}$("limDlg").close();loadUsers()};
 $("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{username:$("nuName").value,password:$("nuPw").value,role:$("nuRole").value});$("admNote").textContent=d.error||"User added. Live trading is off for them until you enable it.";if(!d.error){$("nuName").value="";$("nuPw").value=""}loadUsers()};
+let alTimer=null;
+async function loadAlerts(){const d=await (await api("/api/alerts")).json();if(d.error)return;
+ $("alOn").checked=d.enabled;
+ $("alTf").innerHTML=Object.entries(d.tf_names).map(([k,v])=>`<label class="chk"><input type="checkbox" value="${k}" ${d.tfs.includes(k)?"checked":""}> ${esc(v)}</label>`).join("");
+ document.querySelectorAll("#alSide input").forEach(i=>i.checked=d.sides.includes(i.value));
+ $("alSec").innerHTML=d.sector_names.map(n=>`<label class="chk"><input type="checkbox" value="${esc(n)}" ${d.sectors.includes(n)?"checked":""}> ${esc(n)}</label>`).join("");
+ if(document.activeElement!==$("alNtfy"))$("alNtfy").value=d.ntfy_topic||"";
+ $("alTgTag").textContent=!d.telegram_configured?"Not set up on this server":d.telegram_linked?"Linked":"Not linked";
+ $("alTgInfo").textContent=d.telegram_configured?(d.telegram_linked?"Alerts go to your Telegram chat.":"Press Link Telegram, open the link it gives you and press Start in Telegram."):"The admin has not set TELEGRAM_BOT_TOKEN, so only ntfy works for now.";
+ $("alTgLink").hidden=!d.telegram_configured||d.telegram_linked;$("alTgUnlink").hidden=!d.telegram_linked;
+ if(d.last)$("alMsg").textContent="Last alert: "+d.last;
+ if(d.telegram_linked&&alTimer){clearInterval(alTimer);alTimer=null}}
+const alBody=()=>({enabled:$("alOn").checked,tfs:[...document.querySelectorAll("#alTf input:checked")].map(i=>i.value),sides:[...document.querySelectorAll("#alSide input:checked")].map(i=>i.value),sectors:[...document.querySelectorAll("#alSec input:checked")].map(i=>i.value),ntfy_topic:$("alNtfy").value.trim()});
+$("alSave").onclick=async()=>{const d=await send("PUT","/api/alerts",alBody());$("alMsg").textContent=d.error||"Saved.";loadAlerts()};
+$("alTest").onclick=async()=>{const s=await send("PUT","/api/alerts",alBody());if(s.error){$("alMsg").textContent=s.error;return}
+ const d=await send("POST","/api/alerts/test",{});$("alMsg").textContent=d.error||Object.entries(d.results).map(([k,v])=>k+": "+v).join(" · ")};
+$("alRand").onclick=()=>{const a=new Uint8Array(9);crypto.getRandomValues(a);$("alNtfy").value="signals-"+[...a].map(b=>"abcdefghjkmnpqrstuvwxyz23456789"[b%31]).join("")};
+$("alTgLink").onclick=async()=>{const d=await send("POST","/api/alerts/telegram/link",{});if(d.error){$("alMsg").textContent=d.error;return}
+ $("alTgInfo").innerHTML=`Open <a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.url)}</a> and press Start. Or send <b>/start ${esc(d.code)}</b> to @${esc(d.bot)}. The code works for ${d.minutes} minutes.`;
+ if(alTimer)clearInterval(alTimer);let n=0;alTimer=setInterval(()=>{loadAlerts();if(++n>150){clearInterval(alTimer);alTimer=null}},4000)};
+$("alTgUnlink").onclick=async()=>{await send("POST","/api/alerts/telegram/unlink",{});loadAlerts()};
 $("recBtn").onclick=async()=>{const d=await send("POST","/api/account/recovery",{password:$("recPw").value});
  if(d.error){$("recMsg").textContent=d.error;return}$("recPw").value="";$("recMsg").innerHTML="Your new key (shown once, it replaces the old one): <b>"+esc(d.recovery_key)+"</b>";loadMe()};
 loadMe().then(()=>{if(new URLSearchParams(location.search).get("m")==="admin"){history.replaceState(null,"","/");setMode("admin")}else if(mode==="admin")setMode("admin")}).catch(()=>{});
