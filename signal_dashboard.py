@@ -368,26 +368,56 @@ def analyse(symbol, df, interval):
 
 
 # ── Data + cache (one cache per timeframe) ──
-STATES = {tf: {"rows": [], "updated": None, "errors": [], "refreshing": False, "checked": 0.0} for tf in INTERVALS}
+STATES = {tf: {"rows": [], "updated": None, "errors": [], "refreshing": False, "checked": 0.0, "progress": None} for tf in INTERVALS}
 LOCK = threading.Lock()
 
 
-def fetch_all(interval):
+YF_BATCH = int(os.getenv("YF_BATCH", "30"))   # symbols per Yahoo request; one giant request is often throttled
+
+
+def _one(data, ticker, n_tickers):
+    """The candles of one ticker from a yfinance download (its shape depends on how many tickers were asked for)."""
+    cols = data.columns
+    if getattr(cols, "nlevels", 1) > 1:
+        return data[ticker]
+    return data if n_tickers == 1 else None
+
+
+def fetch_all(interval, progress=None):
+    """Download in small batches, retry a failed batch once, and report partial results as they arrive."""
     import yfinance as yf  # imported lazily so the module loads without it
 
-    tickers = [yf_ticker(s) for s in UNIVERSE]
-    data = yf.download(tickers, period=PERIODS[interval], interval=interval, group_by="ticker",
-                       auto_adjust=False, threads=True, progress=False)
     rows, errors = [], []
-    for s in UNIVERSE:
-        try:
-            row = analyse(s, data[yf_ticker(s)].dropna(how="all"), interval)
-            if row:
-                rows.append(row)
-            else:
-                errors.append(f"{s}: not enough data")
-        except Exception as e:  # keep going if one symbol fails
-            errors.append(f"{s}: {e}")
+    for i in range(0, len(UNIVERSE), YF_BATCH):
+        names = UNIVERSE[i:i + YF_BATCH]
+        tickers = [yf_ticker(n) for n in names]
+        data = None
+        for attempt in range(2):
+            try:
+                data = yf.download(tickers, period=PERIODS[interval], interval=interval, group_by="ticker",
+                                   auto_adjust=False, threads=True, progress=False)
+            except Exception as e:
+                data = None
+                errors.append(f"batch {i // YF_BATCH + 1}: {e}")
+            if data is not None and not data.empty:
+                break
+            time.sleep(3 * (attempt + 1))
+        if data is None or data.empty:
+            errors.append(f"batch {i // YF_BATCH + 1}: Yahoo returned nothing for {names[0]}…{names[-1]}")
+        else:
+            for sname, t in zip(names, tickers):
+                try:
+                    df = _one(data, t, len(tickers))
+                    row = analyse(sname, df.dropna(how="all"), interval) if df is not None else None
+                    if row:
+                        rows.append(row)
+                    else:
+                        errors.append(f"{sname}: not enough data")
+                except Exception as e:  # keep going if one symbol fails
+                    errors.append(f"{sname}: {e}")
+        if progress:
+            progress(list(rows), list(errors), min(i + YF_BATCH, len(UNIVERSE)))
+        time.sleep(0.5)
     return rows, errors
 
 
@@ -397,16 +427,28 @@ def refresh(interval):
         if st["refreshing"]:
             return
         st["refreshing"] = True
-    try:
-        rows, errors = fetch_all(interval)
+        st["progress"] = [0, len(UNIVERSE)]
+
+    def partial(rows, errors, done):
         with LOCK:
-            st.update(rows=rows, errors=errors, updated=datetime.now().strftime("%d %b %H:%M:%S"))
+            st["progress"] = [done, len(UNIVERSE)]
+            if not st["rows"] or not st["updated"]:  # first scan: show results as they arrive
+                st.update(rows=rows, errors=errors)
+
+    try:
+        rows, errors = fetch_all(interval, partial)
+        with LOCK:
+            if rows:  # never replace good data with an empty result
+                st.update(rows=rows, errors=errors, updated=datetime.now().strftime("%d %b %H:%M:%S"))
+            else:
+                st["errors"] = errors or ["Yahoo returned no data."]
     except Exception as e:
         with LOCK:
             st["errors"] = [f"Data fetch failed: {e}"]
     finally:
         with LOCK:
             st["refreshing"] = False
+            st["progress"] = None
             st["checked"] = time.time()
 
 
@@ -1667,7 +1709,8 @@ def api_chain(symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
             if r_:
                 all_tf[t_] = {"signal": r_["signal"], "status": r_["status"], "signal_time": r_["signal_time"]}
     out = {**chain, "signal": signal, "bias": side, "suggested": None, "levels": None,
-           "tf": tf, "sig_info": sig_info, "all_tf": all_tf}
+           "tf": tf, "sig_info": sig_info, "all_tf": all_tf,
+           "chg": row.get("chg") if row else None, "sector": row.get("sector") if row else sector_of(symbol)}
     if side:
         atm_row = next((r for r in chain["rows"] if r["strike"] == chain["atm"]), None)
         if atm_row:
@@ -2264,6 +2307,7 @@ tr:last-child td{border-bottom:0}
 .orow[aria-pressed=true]{background:var(--flat);font-weight:700}
 .orow .pill{min-width:0;padding:0 8px;font-size:12px}
 .orow .none{color:var(--mute)}
+.orow .ochg{margin-left:auto;font-size:12px}
 .omain .more{display:inline-flex;gap:6px;align-items:center;margin:0 0 8px;color:var(--mute);font-size:13px}
 .osig{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 16px;margin-bottom:12px;display:flex;flex-direction:column;gap:6px}
 .osl{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;font-size:14px}
@@ -2336,6 +2380,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <div class="ogrid">
  <aside class="olist" aria-label="Scripts">
   <input id="osym" placeholder="Search a stock or index" aria-label="Search scripts" autocomplete="off">
+  <select id="osec" aria-label="Sector"><option value="ALL">All sectors</option></select>
   <select id="ofilt" aria-label="Show"><option value="all">All scripts</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option></select>
   <div class="orows" id="chips"></div>
  </aside>
@@ -2482,7 +2527,7 @@ function render(){
  const t=document.getElementById("tally");
  t.innerHTML=tabs.map(x=>`<button class="${x[3]}" data-f="${x[0]}" aria-pressed="${filter===x[0]}"><b>${x[2]}</b><span>${x[1]}</span></button>`).join("");
  t.onclick=e=>{const b=e.target.closest("button");if(b){filter=b.dataset.f;render()}};
- document.getElementById("meta").textContent=(data.updated?`Updated ${data.updated} · `:"")+`${tfName[data.interval]} candles · ${data.settings}`+(data.refreshing?" · scanning…":"");
+ document.getElementById("meta").textContent=(data.updated?`Updated ${data.updated} · `:"")+`${tfName[data.interval]} candles · ${data.settings}`+(data.refreshing?(data.progress?` · scanning ${data.progress[0]} of ${data.progress[1]}…`:" · scanning…"):"");
  let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q))&&(sector==="ALL"||(r.sector||"Others")===sector));
  v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
   if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
@@ -2510,17 +2555,23 @@ function renderChips(){
  const by={};data.rows.forEach(r=>by[r.symbol]=r);
  const all=(data.indices||[]).concat(data.symbols||[]);
  const text=document.getElementById("osym").value.trim().toUpperCase(),fl=document.getElementById("ofilt").value;
+ const ss=document.getElementById("osec"),sec=ss.value;
+ const secs=[...new Set(data.rows.map(r=>r.sector||"Others"))].sort();
+ if(ss.options.length!==secs.length+1){ss.innerHTML='<option value="ALL">All sectors</option>'+secs.map(x=>`<option>${esc(x)}</option>`).join("");ss.value=secs.includes(sec)?sec:"ALL"}
  const list=all.filter(n=>{const sg=(by[n]||{}).signal||"–";
   if(text&&!n.includes(text))return false;
+  if(sec!=="ALL"&&((by[n]||{}).sector||(data.indices||[]).includes(n)&&"Indices"||"Others")!==sec)return false;
   return fl==="all"||(fl==="sig"?sg!=="–":sg.includes(fl))});
  list.sort((a,b)=>{const ra=by[a]?rank[by[a].signal]:99,rb=by[b]?rank[by[b].signal]:99;return (ra??99)-(rb??99)||a.localeCompare(b)});
  box.innerHTML=list.length?list.map(n=>{const sg=(by[n]||{}).signal||"–";
-  return `<button class="orow" data-s="${esc(n)}" aria-pressed="${n===osym}"><span>${esc(n)}</span>${sg==="–"?'<span class="none">–</span>':`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`}</button>`}).join(""):`<div class="sub" style="padding:12px">No scripts match.</div>`;
+  const c=(by[n]||{}).chg;
+  return `<button class="orow" data-s="${esc(n)}" aria-pressed="${n===osym}"><span>${esc(n)}</span><span class="ochg ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span>${sg==="–"?'<span class="none">–</span>':`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`}</button>`}).join(""):`<div class="sub" style="padding:12px">No scripts match.</div>`;
  box.scrollTop=keep;
 }
 document.getElementById("chips").onclick=e=>{const b=e.target.closest(".orow");if(b){osym=b.dataset.s;oexp="";loadChain()}};
 document.getElementById("osym").oninput=renderChips;
 document.getElementById("ofilt").onchange=renderChips;
+document.getElementById("osec").onchange=renderChips;
 document.getElementById("osym").onkeydown=e=>{if(e.key!=="Enter")return;
  const t=e.target.value.trim().toUpperCase();if(!t)return;
  const all=((data&&data.indices)||[]).concat((data&&data.symbols)||[]);
@@ -2543,6 +2594,8 @@ function renderChain(d){
  sum.hidden=false;
  sum.innerHTML=stat(esc(d.symbol),f2(d.underlying))
   +`<div class="stat"><span class="l">Expiry</span><select id="oexp" aria-label="Expiry">${d.expiries.map(x=>`<option ${x===d.expiry?"selected":""}>${x}</option>`).join("")}</select></div>`
+  +(d.chg!=null?stat("Today",`<span class="${d.chg>=0?"up":"dn"}">${d.chg>0?"+":""}${d.chg.toFixed(2)}%</span>`):"")
+  +(d.sector?stat("Sector",esc(d.sector)):"")
   +stat("PCR (OI)",d.pcr??"–")+stat("Max call OI",d.max_ce??"–")+stat("Max put OI",d.max_pe??"–")
   +stat("Signal",`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`)
   +(d.suggested?stat("Bias",`ATM ${d.suggested.strike} ${d.suggested.side}${d.suggested.ltp!=null?" ₹"+f2(d.suggested.ltp):""}`):"");
