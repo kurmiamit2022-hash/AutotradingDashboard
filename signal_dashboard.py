@@ -961,16 +961,29 @@ def public_user(u):
     return {k: u[k] for k in ("id", "username", "role", "active", "live_allowed", "pin_set", "recovery_set", "brokers", "caps")}
 
 
-def user_mode(u):
+MODE_PREF = {}   # user id -> "live" once they switched live on; cleared at sign-in, sign-out and server restart
+
+
+def live_blocker(u):
+    """Why this person cannot trade live right now, or None."""
     if not LIVE_REQUESTED:
-        return "paper", "Paper mode: orders are simulated. Live trading is switched off on this server."
+        return "Live trading is switched off on this server."
     if not u["live_allowed"]:
-        return "paper", "Paper mode: live trading is not enabled for your account. Ask the admin."
+        return "Live trading is not enabled for your account. Ask the admin."
     if not u["pin_set"]:
-        return "paper", "Paper mode: set your order PIN under Account to enable live trading."
+        return "Set your order PIN under Account to enable live trading."
     if not u["brokers"]:
-        return "paper", "Paper mode: add your broker details under Account to enable live trading."
-    return "live", ""
+        return "Add your broker details under Account to enable live trading."
+    return None
+
+
+def user_mode(u):
+    why = live_blocker(u)
+    if why:
+        return "paper", "Paper mode: " + why
+    if MODE_PREF.get(u["id"]) == "live":
+        return "live", ""
+    return "paper", "Paper mode: orders are simulated. Switch to Live with the toggle at the top when you are ready."
 
 
 RECOVERY_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -2300,6 +2313,7 @@ def api_login(request: Request, payload: dict = Body(...)):
         LOGIN_FAILS[key] = st
         return JSONResponse({"error": "This sign-in is for admins only. Regular users sign in on the main page."}, status_code=403)
     LOGIN_FAILS.pop(key, None)
+    MODE_PREF.pop(rows[0]["id"], None)  # every sign-in starts in paper mode
     if pw == DEFAULT_ADMIN_PW:
         if LIVE_REQUESTED:
             return JSONResponse({"error": "The default password is not accepted while live trading is switched on. Set ADMIN_PASSWORD on the server."}, status_code=403)
@@ -2316,6 +2330,10 @@ def api_login(request: Request, payload: dict = Body(...)):
 def api_logout(request: Request):
     tok = request.cookies.get("sid")
     if tok:
+        try:
+            MODE_PREF.pop(request.state.user["id"], None)
+        except Exception:
+            pass
         x("DELETE FROM sessions WHERE token_hash=?", (sha(tok),))
     resp = JSONResponse({"ok": True})
     resp.delete_cookie("sid", path="/")
@@ -2577,10 +2595,30 @@ def api_trading(request: Request):
     u = request.state.user
     mode, note = user_mode(u)
     c = u["caps"]
-    return {"mode": mode, "note": note, "market_open": market_open_now(),
+    return {"mode": mode, "note": note, "market_open": market_open_now(), "live_blocker": live_blocker(u),
             "brokers": u["brokers"] if mode == "live" else [], "default_broker": u["default_broker"], "broker_names": BROKER_NAMES,
             "caps": {"max_value": c["max_order_value"], "max_qty": c["max_qty"], "max_orders": c["max_orders"],
                      "max_fut_lots": c["max_fut_lots"], "max_fut_value": c["max_fut_value"]}}
+
+
+@app.post("/api/trading/mode")
+def api_trading_mode(request: Request, payload: dict = Body(...)):
+    """Switch between paper and live. Going live needs the order PIN; going back to paper never does."""
+    u = request.state.user
+    want = str(payload.get("mode", ""))
+    if want == "paper":
+        MODE_PREF.pop(u["id"], None)
+        return {"ok": True, "mode": "paper"}
+    if want != "live":
+        return JSONResponse({"error": "Choose paper or live."}, status_code=400)
+    why = live_blocker(u)
+    if why:
+        return {"error": why}
+    err = pin_error(u, payload.get("pin"), True)
+    if err:
+        return {"error": err}
+    MODE_PREF[u["id"]] = "live"
+    return {"ok": True, "mode": "live"}
 
 
 @app.get("/api/trading/check")
@@ -2976,9 +3014,13 @@ def index():
     return PAGE
 
 
+EARLY_THEME = '<script>try{var t=localStorage.getItem("theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>'
+
 AUTH_CSS = """
 :root{--bg:#eef1f4;--panel:#fff;--ink:#16202a;--mute:#6a7783;--line:#d9dfe5;--sell:#b3261e;--buy:#0b7a63}
-@media(prefers-color-scheme:dark){:root{--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;--sell:#ff8a80;--buy:#4cc9a8}}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;--sell:#ff8a80;--buy:#4cc9a8}}
+:root[data-theme=dark]{--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;--sell:#ff8a80;--buy:#4cc9a8;color-scheme:dark}
+:root[data-theme=light]{color-scheme:light}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif;padding:16px}
 form,.box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:26px;width:min(380px,100%)}
@@ -2994,7 +3036,9 @@ a{color:var(--ink)}
 .warn{color:var(--sell);font-size:14px}
 :focus-visible{outline:2px solid var(--ink);outline-offset:2px}
 :root{--bg:#f3f1fb;--panel:#fff;--ink:#1c1b33;--mute:#6b6a86;--line:#e3e0f3;--sell:#e0264b;--buy:#00a77a;--acc:#6c4cf5;--g:linear-gradient(135deg,#6c4cf5,#00b8d9)}
-@media(prefers-color-scheme:dark){:root{--bg:#0b0b1a;--panel:#15152b;--ink:#ecebff;--mute:#9a98c0;--line:#2a2950;--sell:#ff5c7c;--buy:#27f0b0;--acc:#8b6cff;--g:linear-gradient(135deg,#8b6cff,#2de2ff)}}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0b0b1a;--panel:#15152b;--ink:#ecebff;--mute:#9a98c0;--line:#2a2950;--sell:#ff5c7c;--buy:#27f0b0;--acc:#8b6cff;--g:linear-gradient(135deg,#8b6cff,#2de2ff)}}
+:root[data-theme=dark]{--bg:#0b0b1a;--panel:#15152b;--ink:#ecebff;--mute:#9a98c0;--line:#2a2950;--sell:#ff5c7c;--buy:#27f0b0;--acc:#8b6cff;--g:linear-gradient(135deg,#8b6cff,#2de2ff);color-scheme:dark}
+:root[data-theme=light]{color-scheme:light}
 body{background:radial-gradient(900px 500px at 10% -10%,rgba(108,76,245,.28),transparent 60%),radial-gradient(800px 460px at 100% 100%,rgba(0,184,217,.22),transparent 55%),var(--bg)}
 form,.box{border:0;border-radius:20px;box-shadow:0 20px 60px rgba(60,40,160,.25)}
 h1{background:var(--g);-webkit-background-clip:text;background-clip:text;color:transparent;font-size:28px}
@@ -3071,7 +3115,7 @@ def auth_page(kind):
             body = body.replace("<!--CODE-->", '<label>Invite code<input id="c" autocomplete="off" required></label>' if SIGNUP_CODE else "")
     title = {"login": "Sign in", "admin": "Admin console", "signup": "Create account", "forgot": "Reset password"}[kind]
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<title>{title}</title><style>{AUTH_CSS}</style></head><body>{body}<script>{AUTH_JS[kind]}</script></body></html>')
+            f'{EARLY_THEME}<title>{title}</title><style>{AUTH_CSS}</style></head><body>{body}<script>{AUTH_JS[kind]}</script></body></html>')
 
 
 PAGE = r"""<!doctype html>
@@ -3079,7 +3123,9 @@ PAGE = r"""<!doctype html>
 <title>Sign in</title>
 <style>
 :root{--bg:#eef1f4;--panel:#fff;--ink:#16202a;--mute:#6a7783;--line:#d9dfe5;--sell:#b3261e}
-@media(prefers-color-scheme:dark){:root{--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;--sell:#ff8a80}}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;--sell:#ff8a80}}
+:root[data-theme=dark]{--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;--sell:#ff8a80;color-scheme:dark}
+:root[data-theme=light]{color-scheme:light}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif}
 form{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:26px;width:min(360px,92vw)}
@@ -3108,13 +3154,17 @@ PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Signal board</title>
+<script>try{var t=localStorage.getItem("theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#eef1f4;--panel:#fff;--ink:#16202a;--mute:#6a7783;--line:#d9dfe5;
 --buy:#0b7a63;--buy-bg:#d8f0e8;--sell:#b3261e;--sell-bg:#f9dcd9;--flat:#e6eaee}
-@media(prefers-color-scheme:dark){:root{--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;
 --buy:#4cc9a8;--buy-bg:#16372f;--sell:#ff8a80;--sell-bg:#42221f;--flat:#252f38}}
+:root[data-theme=dark]{--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;
+--buy:#4cc9a8;--buy-bg:#16372f;--sell:#ff8a80;--sell-bg:#42221f;--flat:#252f38;color-scheme:dark}
+:root[data-theme=light]{color-scheme:light}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 "Schibsted Grotesk",system-ui,sans-serif;font-variant-numeric:tabular-nums}
 main{max-width:1180px;margin:0 auto;padding:28px 20px 60px}
@@ -3252,9 +3302,13 @@ td.act{white-space:nowrap}
 --buy:#00a77a;--buy-bg:#d3f7ea;--sell:#e0264b;--sell-bg:#ffe0e7;--flat:#ece9f8;
 --acc:#6c4cf5;--acc2:#00b8d9;--hot:#ff9f1a;--glowb:0,196,140;--glows:255,59,95;
 --shadow:0 6px 20px rgba(76,56,180,.09);--g:linear-gradient(135deg,#6c4cf5,#00b8d9)}
-@media(prefers-color-scheme:dark){:root{--bg:#0b0b1a;--panel:#15152b;--ink:#ecebff;--mute:#9a98c0;--line:#2a2950;
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0b0b1a;--panel:#15152b;--ink:#ecebff;--mute:#9a98c0;--line:#2a2950;
 --buy:#27f0b0;--buy-bg:#0c3b31;--sell:#ff5c7c;--sell-bg:#451526;--flat:#201f3d;
 --acc:#8b6cff;--acc2:#2de2ff;--hot:#ffb347;--shadow:0 6px 24px rgba(0,0,0,.45);--g:linear-gradient(135deg,#8b6cff,#2de2ff)}}
+:root[data-theme=dark]{--bg:#0b0b1a;--panel:#15152b;--ink:#ecebff;--mute:#9a98c0;--line:#2a2950;
+--buy:#27f0b0;--buy-bg:#0c3b31;--sell:#ff5c7c;--sell-bg:#451526;--flat:#201f3d;
+--acc:#8b6cff;--acc2:#2de2ff;--hot:#ffb347;--shadow:0 6px 24px rgba(0,0,0,.45);--g:linear-gradient(135deg,#8b6cff,#2de2ff);color-scheme:dark}
+:root[data-theme=light]{color-scheme:light}
 body{background:radial-gradient(1000px 520px at 8% -8%,rgba(108,76,245,.20),transparent 60%),radial-gradient(900px 480px at 100% 0,rgba(0,184,217,.16),transparent 55%),var(--bg);background-attachment:fixed}
 h1{font-size:30px;font-weight:700;background:var(--g);-webkit-background-clip:text;background-clip:text;color:transparent;display:flex;align-items:center;gap:10px}
 h1::before{content:"";width:12px;height:26px;border-radius:4px;background:linear-gradient(var(--buy) 50%,var(--sell) 50%);box-shadow:0 0 14px rgba(var(--glowb),.55)}
@@ -3297,6 +3351,11 @@ dialog{border:0;border-radius:18px;box-shadow:0 24px 70px rgba(30,20,90,.45)}
 dialog::backdrop{background:rgba(14,10,40,.6);backdrop-filter:blur(3px)}
 .tkreview{background:var(--flat);border-radius:10px}
 .tag{background:var(--g);color:#fff!important;border-radius:6px}
+.ai{font-weight:700;background:var(--g);-webkit-background-clip:text;background-clip:text;color:transparent;letter-spacing:.02em}
+#themeBtn{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:6px 10px;cursor:pointer;font:inherit}
+.seg.tm button[data-tm=live][aria-pressed=true]{background:linear-gradient(135deg,#e0264b,#ff9f1a);color:#fff;box-shadow:0 0 14px rgba(var(--glows),.55)}
+.seg.tm button[data-tm=paper][aria-pressed=true]{background:var(--g);color:#fff}
+.seg.tm button:disabled{opacity:.5;cursor:not-allowed}
 /* signal flashing */
 .newb{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:999px;font-size:10.5px;font-weight:800;letter-spacing:.08em;color:#fff;background:linear-gradient(135deg,var(--hot),#ff4d6d);animation:blink 1s steps(2,start) infinite;vertical-align:middle}
 tr.fresh.buy td:first-child{box-shadow:inset 4px 0 0 var(--buy)}tr.fresh.sell td:first-child{box-shadow:inset 4px 0 0 var(--sell)}
@@ -3318,7 +3377,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </style></head><body><main>
 <header>
  <div><h1>Signal board</h1><div class="sub" id="meta">Loading first scan…</div></div>
- <div class="ctl"><div class="seg" id="tfs" role="group" aria-label="Timeframe"></div><button class="btn" id="refresh">Refresh now</button><button id="snd" aria-pressed="false" title="Play a sound when a new signal arrives">🔔 Sound off</button><span class="sub" id="who"></span><button class="mini" id="logout">Sign out</button></div>
+ <div class="ctl"><div class="seg" id="tfs" role="group" aria-label="Timeframe"></div><button class="btn" id="refresh">Refresh now</button><div class="seg tm" id="modeSw" role="group" aria-label="Trading mode"><button data-tm="paper" aria-pressed="true">Paper</button><button data-tm="live" aria-pressed="false">Live</button></div><button id="themeBtn" title="Switch between automatic, light and dark">◐ Auto</button><button id="snd" aria-pressed="false" title="Play a sound when a new signal arrives">🔔 Sound off</button><span class="sub" id="who"></span><button class="mini" id="logout">Sign out</button></div>
 </header>
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
@@ -3536,7 +3595,7 @@ function render(){
  const t=document.getElementById("tally");
  t.innerHTML=tabs.map(x=>`<button class="${x[3]}" data-f="${x[0]}" aria-pressed="${filter===x[0]}"><b>${x[2]}</b><span>${x[1]}</span></button>`).join("");
  t.onclick=e=>{const b=e.target.closest("button");if(b){filter=b.dataset.f;render()}};
- document.getElementById("meta").textContent=(data.updated?`Updated ${data.updated} · `:"")+`${tfName[data.interval]} candles · ${data.settings}`+(data.refreshing?(data.progress?` · scanning ${data.progress[0]} of ${data.progress[1]}…`:" · scanning…"):"");
+ document.getElementById("meta").innerHTML=`<span class="ai">✦ AI-Powered Trade Scanner</span> · `+(data.updated?`Updated ${esc(data.updated)} · `:"")+`${tfName[data.interval]} candles`+(data.refreshing?(data.progress?` · scanning ${data.progress[0]} of ${data.progress[1]}…`:" · scanning…"):"");
  let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q))&&(sector==="ALL"||(r.sector||"Others")===sector));
  v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
   if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
@@ -3612,6 +3671,20 @@ function initFlash(){const b=$("snd");const paint=()=>{b.setAttribute("aria-pres
  b.onclick=()=>{sndOn=!sndOn;try{localStorage.setItem("snd",sndOn?"1":"0")}catch(e){}paint();if(sndOn)beep()};
  $("toast").onclick=()=>$("toast").classList.remove("show");
  document.addEventListener("visibilitychange",()=>{if(!document.hidden){newCount=0;document.title="Signal board"}})}
+// ── theme (auto / light / dark) and paper / live switch ──
+let themePref="auto";try{themePref=localStorage.getItem("theme")||"auto"}catch(e){}
+function paintTheme(){const r=document.documentElement;if(themePref==="auto")r.removeAttribute("data-theme");else r.setAttribute("data-theme",themePref);
+ $("themeBtn").textContent=themePref==="dark"?"🌙 Dark":themePref==="light"?"☀️ Light":"◐ Auto";if($("chartDlg").open&&chSym)drawChart()}
+function paintMode(){const live=tradeInfo&&tradeInfo.mode==="live";$("modeSw").querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",String((b.dataset.tm==="live")===!!live)));
+ const lb=$("modeSw").querySelector('[data-tm=live]');lb.title=tradeInfo&&tradeInfo.live_blocker?tradeInfo.live_blocker:"Send real orders to your broker";lb.classList.toggle("off",!!(tradeInfo&&tradeInfo.live_blocker))}
+function initModes(){paintTheme();
+ $("themeBtn").onclick=()=>{themePref=themePref==="auto"?"dark":themePref==="dark"?"light":"auto";try{localStorage.setItem("theme",themePref)}catch(e){}paintTheme()};
+ $("modeSw").onclick=async e=>{const b=e.target.closest("button");if(!b||!tradeInfo)return;const want=b.dataset.tm;if(want===tradeInfo.mode)return;
+  if(want==="live"){if(tradeInfo.live_blocker){alert(tradeInfo.live_blocker);return}
+   const pin=prompt("Switching to LIVE trading. Orders will go to your real broker account.\nEnter your order PIN to continue.");if(pin===null)return;
+   const d=await post("/api/trading/mode",{mode:"live",pin});if(d.error){alert(d.error);return}}
+  else{const d=await post("/api/trading/mode",{mode:"paper"});if(d.error){alert(d.error);return}}
+  await loadTrading();if(typeof loadOrders==="function")try{loadOrders()}catch(x){}}}
 // ── chart popup (TradingView's open-source Lightweight Charts) ──
 let lwPromise=null,chSym="",chTf="",chObj=null;
 function loadLW(){if(window.LightweightCharts)return Promise.resolve();
@@ -3689,7 +3762,7 @@ const $=id=>document.getElementById(id);
 const post=async(u,b)=>(await api(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json();
 const ltpBtn=(r,s)=>{const l=r[s.toLowerCase()].ltp;if(l==null)return "–";const d=`data-strike="${r.strike}" data-right="${s}" data-ltp="${l}"`;
  return `<span class="px">${f2(l)}</span><button class="ob b" ${d} data-side="BUY" title="Buy ${s}" aria-label="Buy ${r.strike} ${s}">B</button><button class="ob s" ${d} data-side="SELL" title="Sell ${s}" aria-label="Sell ${r.strike} ${s}">S</button>`};
-async function loadTrading(){try{tradeInfo=await (await api("/api/trading")).json();const b=$("banner");b.className="banner "+tradeInfo.mode;
+async function loadTrading(){try{tradeInfo=await (await api("/api/trading")).json();const b=$("banner");b.className="banner "+tradeInfo.mode;paintMode();
  b.textContent=tradeInfo.mode==="live"?`LIVE trading is on. Orders go to your ${(tradeInfo.brokers||[]).map(x=>tradeInfo.broker_names[x]).join(" or ")} account. Limits: ₹${tradeInfo.caps.max_value.toLocaleString("en-IN")} per order and ${tradeInfo.caps.max_orders} orders a day. Futures: up to ${tradeInfo.caps.max_fut_lots} lot(s) and ₹${tradeInfo.caps.max_fut_value.toLocaleString("en-IN")} notional.`:tradeInfo.note}catch(e){}}
 function resetReview(){tkToken=null;$("tkReview").hidden=true;$("tkConfirm").hidden=true;$("tkPlace").hidden=true;$("tkReviewBtn").hidden=false;$("tkMsg").textContent=""}
 function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
@@ -3707,7 +3780,7 @@ function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
 ["tkSide","tkQty","tkType","tkPrice","tkProd","tkBroker","tkAuto","tkTrail"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-initChart();initFlash();
+initChart();initFlash();initModes();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:tf||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
