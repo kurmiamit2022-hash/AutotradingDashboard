@@ -2445,7 +2445,6 @@ def api_signals(tf: str = DEFAULT_INTERVAL):
             "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"]},
             "interval": tf,
             "intervals": INTERVALS,
-            "settings": f"Chandelier {ATR_LEN}x{ATR_MULT} + EMA {EMA_LEN} + QQE MOD",
             "fresh_bars": FRESH_BARS,
             "symbols": SYMBOLS,
             "indices": INDICES,
@@ -3176,18 +3175,11 @@ def chart_data(symbol, tf):
     start = max(0, n - CHART_BARS[tf])
     t = [tm(df.index[i]) for i in range(start, n)]
 
-    def val(a, i):
-        v = a[i]
-        return None if np.isnan(v) else round(float(v), 2)
-
     out = {"symbol": symbol, "tf": tf, "intraday": tf != "1d",
            "candles": [{"time": t[k], "open": round(float(df["Open"].iloc[i]), 2), "high": round(float(df["High"].iloc[i]), 2),
                         "low": round(float(df["Low"].iloc[i]), 2), "close": round(float(c[i]), 2)} for k, i in enumerate(range(start, n))],
-           "ema": [{"time": t[k], "value": val(ema, i)} for k, i in enumerate(range(start, n)) if val(ema, i) is not None],
-           "ce_long": [{"time": t[k], "value": val(ls, i)} for k, i in enumerate(range(start, n)) if d[i] == 1 and val(ls, i) is not None],
-           "ce_short": [{"time": t[k], "value": val(ss, i)} for k, i in enumerate(range(start, n)) if d[i] == -1 and val(ss, i) is not None],
            "markers": [{"time": t[i - start], "side": "BUY" if buy[i] else "SELL"} for i in range(start, n) if buy[i] or sell[i]],
-           "ema_len": EMA_LEN, "signal": None}
+           "signal": None}
     if row.get("entry") is not None:
         j = max((i for i in range(n) if buy[i] or sell[i]), default=None)
         if j is not None:
@@ -4387,10 +4379,8 @@ async function drawChart(){
  const ch=LightweightCharts.createChart($("chart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:d.intraday,secondsVisible:false},crosshair:{mode:0}});
  chObj=ch;
  const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(d.candles);
- const ln=(arr,color,w,style)=>{const s=ch.addLineSeries({color,lineWidth:w,lineStyle:style||0,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});s.setData(arr)};
- ln(d.ema,"#2962ff",1);ln(d.ce_long,up,1,2);ln(d.ce_short,dn,1,2);
  cs.setMarkers(d.markers.map(m=>m.side==="BUY"?{time:m.time,position:"belowBar",color:up,shape:"arrowUp",text:"BUY"}:{time:m.time,position:"aboveBar",color:dn,shape:"arrowDown",text:"SELL"}));
- const sg=d.signal,last=d.candles[d.candles.length-1].time,leg=[`<span><i style="background:#2962ff"></i>EMA ${d.ema_len}</span>`,`<span><i style="background:${up}"></i>Chandelier long stop</span>`,`<span><i style="background:${dn}"></i>Chandelier short stop</span>`];
+ const sg=d.signal,last=d.candles[d.candles.length-1].time,leg=[];
  if(sg){const lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title});s.setData([{time:sg.from,value:price},{time:last,value:price}])};
   lv(sg.entry,ink,"Entry",0);lv(sg.sl,dn,"SL"+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(sg.hits>i?" ✓":""),2));
   leg.unshift(`<b class="${sg.side==="BUY"?"up":"dn"}">${esc(sg.state)}</b> <span>signal candle ${esc(sg.time)}, ${esc(sg.status)}</span>`)}
