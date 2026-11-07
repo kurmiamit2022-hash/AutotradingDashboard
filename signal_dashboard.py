@@ -9,6 +9,7 @@ First sign-in: set ADMIN_USER and ADMIN_PASSWORD, or read the one-time password 
 Locked out: set ADMIN_RESET=1 with ADMIN_PASSWORD, restart once, sign in, then remove ADMIN_RESET.
 
 Optional env vars:  INTERVAL=5m|15m|1d  REFRESH_SECONDS=300  PORT=8000  HOST=0.0.0.0
+  DATABASE_URL=<postgres address, keeps users across redeploys; also set SECRETS_KEY>
   DB_PATH=dashboard.db  ORDER_LOG=orders_log.jsonl  SECRETS_KEY=<Fernet key>  COOKIE_SECURE=1 (when served over https)
   LIVE_TRADING=1 (switch live trading on for the server; an admin must still enable it for each person)
   MAX_ORDER_VALUE, MAX_QTY, MAX_ORDERS_PER_DAY, MAX_FUT_LOTS, MAX_FUT_VALUE, ALLOW_OPTION_SELLING  (default limits per person)
@@ -29,7 +30,7 @@ import re
 import secrets
 import threading
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 
 import numpy as np
 import pandas as pd
@@ -527,6 +528,12 @@ ALLOW_SIGNUP = os.getenv("ALLOW_SIGNUP", "1") == "1"                # anyone can
 SIGNUP_CODE = os.getenv("SIGNUP_CODE", "").strip()                   # optional invite code required to sign up
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") == "1"              # set to 1 when the site is served over https
 ORDER_LOG = os.getenv("ORDER_LOG", "orders_log.jsonl")
+# Set DATABASE_URL (a Postgres address, e.g. a free Neon or Supabase database) and users, broker details and orders live there
+# instead of on the server's disk, so they survive every redeploy. Needs psycopg2-binary.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+USE_PG = bool(DATABASE_URL)
 MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 DHAN_BASE = "https://api.dhan.co/v2"
@@ -544,6 +551,8 @@ BROKER_FIELDS = {"angel": [("api_key", "API key"), ("client_id", "Client ID"), (
                  "dhan": [("client_id", "Client ID"), ("access_token", "Access token")]}
 ORDERS, PENDING, PIN_STATE, LOGIN_FAILS, SYNC, ACCOUNTS = [], {}, {}, {}, {}, {}
 SIGNUP_LOG = {}
+DEFAULT_ADMIN_PW = "Admin@12345"   # used only when ADMIN_PASSWORD is not set; the sign-in page warns until it is changed
+DEFAULT_PW_USERS = set()           # ids of users who signed in with that default password
 ORDER_LOCK = threading.Lock()
 DB_LOCK = threading.Lock()
 
@@ -558,6 +567,12 @@ def market_open_now():
 
 
 def append_log(o):
+    if USE_PG:
+        try:
+            x("INSERT INTO order_log(day, rec) VALUES(?,?)", (o.get("date") or ist_now().strftime("%Y-%m-%d"), json.dumps(o)))
+        except Exception as e:
+            print("order log write failed:", e, flush=True)
+        return
     try:
         with open(ORDER_LOG, "a") as f:
             f.write(json.dumps(o) + "\n")
@@ -569,8 +584,9 @@ def load_orders():
     today = ist_now().strftime("%Y-%m-%d")
     latest = {}
     try:
-        with open(ORDER_LOG) as f:
-            for ln in f:
+        lines = [r["rec"] for r in q("SELECT rec FROM order_log WHERE day=? ORDER BY n", (today,))] if USE_PG else open(ORDER_LOG)
+        if True:
+            for ln in lines:
                 try:
                     o = json.loads(ln)
                 except ValueError:
@@ -584,7 +600,8 @@ def load_orders():
     ORDERS.extend(latest.values())
 
 
-load_orders()
+if not USE_PG:
+    load_orders()  # with Postgres this happens after the tables exist (init_db)
 
 
 # ── database ──
@@ -594,8 +611,51 @@ def _con():
     return con
 
 
+_PG = {"con": None}
+
+
+def _pg_con():
+    import psycopg2  # pip install psycopg2-binary
+    c = _PG["con"]
+    if c is None or c.closed:
+        c = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        c.autocommit = True
+        _PG["con"] = c
+    return c
+
+
+def _pg_sql(sql):
+    sql = sql.replace("?", "%s")
+    return sql.replace("username=%s", "lower(username)=lower(%s)")  # names are not case sensitive
+
+
+def _pg_run(sql, args, fetch):
+    import psycopg2
+    import psycopg2.extras
+    last = None
+    for _ in range(2):  # one retry when the connection has dropped
+        try:
+            cur = _pg_con().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(_pg_sql(sql), tuple(args))
+            if fetch == "all":
+                return [dict(r) for r in cur.fetchall()]
+            if fetch == "id":
+                return cur.fetchone()["id"]
+            return None
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            last = e
+            try:
+                _PG["con"].close()
+            except Exception:
+                pass
+            _PG["con"] = None
+    raise last
+
+
 def q(sql, args=()):
     with DB_LOCK:
+        if USE_PG:
+            return _pg_run(sql, args, "all")
         con = _con()
         try:
             return [dict(r) for r in con.execute(sql, args).fetchall()]
@@ -605,6 +665,10 @@ def q(sql, args=()):
 
 def x(sql, args=()):
     with DB_LOCK:
+        if USE_PG:
+            if sql.lstrip().upper().startswith("INSERT INTO USERS"):
+                return _pg_run(sql + " RETURNING id", args, "id")
+            return _pg_run(sql, args, None)
         con = _con()
         try:
             cur = con.execute(sql, args)
@@ -615,6 +679,23 @@ def x(sql, args=()):
 
 
 def init_db():
+    if USE_PG:
+        with DB_LOCK:
+            c = _pg_con().cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY, username TEXT NOT NULL,
+              pw_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', active INTEGER NOT NULL DEFAULT 1,
+              live_allowed INTEGER NOT NULL DEFAULT 0, pin_hash TEXT, caps TEXT, created TEXT, recovery_hash TEXT)""")
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_name ON users(lower(username))")
+            c.execute("CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, csrf TEXT NOT NULL, expires DOUBLE PRECISION NOT NULL)")
+            c.execute("""CREATE TABLE IF NOT EXISTS creds(user_id INTEGER NOT NULL, broker TEXT NOT NULL, blob TEXT NOT NULL, hint TEXT, updated TEXT,
+              PRIMARY KEY(user_id, broker))""")
+            c.execute("CREATE TABLE IF NOT EXISTS order_log(n SERIAL PRIMARY KEY, day TEXT NOT NULL, rec TEXT NOT NULL)")
+            c.execute("CREATE INDEX IF NOT EXISTS order_log_day ON order_log(day)")
+            c.execute("DELETE FROM order_log WHERE day < %s", ((ist_now() - timedelta(days=14)).strftime("%Y-%m-%d"),))
+        ORDERS.clear()
+        load_orders()
+        ensure_admin()
+        return
     new = not os.path.exists(DB_PATH)
     with DB_LOCK:
         con = _con()
@@ -656,7 +737,12 @@ def ensure_admin():
         return
     pw = os.getenv("ADMIN_PASSWORD") or os.getenv("DASH_PASSWORD") or ""
     generated = not pw
-    if generated:
+    if generated and not LIVE_REQUESTED:
+        pw = DEFAULT_ADMIN_PW
+        generated = False
+        print(f"\n  No ADMIN_PASSWORD set, so the default admin sign-in is in use.\n    username: {name}\n    password: {DEFAULT_ADMIN_PW}\n"
+              "  Change it under Account right after signing in. Set ADMIN_PASSWORD to choose your own from the start.\n", flush=True)
+    elif generated:
         pw = secrets.token_urlsafe(12)
     x("INSERT INTO users(username, pw_hash, role, active, live_allowed, created) VALUES(?,?,?,?,?,?)",
       (name, hash_secret(pw), "admin", 1, 0, ist_now().isoformat()))
@@ -761,6 +847,8 @@ def valid_new_password(name, pw):
         return "Use at least 10 characters."
     if pw.lower() == name.lower():
         return "The password cannot be the same as the username."
+    if pw == DEFAULT_ADMIN_PW:
+        return "Choose a password other than the default one."
     return None
 
 
@@ -781,6 +869,9 @@ def fernet():
     if "f" not in _FERNET:
         from cryptography.fernet import Fernet  # pip install cryptography
         key = os.getenv("SECRETS_KEY", "").strip()
+        if not key and USE_PG:
+            raise RuntimeError("Set SECRETS_KEY (a Fernet key) in the environment so broker details can be stored safely. "
+                               "Make one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"")
         if not key:
             path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "secret.key")
             if os.path.exists(path):
@@ -1369,6 +1460,12 @@ def api_login(request: Request, payload: dict = Body(...)):
         LOGIN_FAILS[key] = st
         return JSONResponse({"error": "Wrong username or password."}, status_code=401)
     LOGIN_FAILS.pop(key, None)
+    if pw == DEFAULT_ADMIN_PW:
+        if LIVE_REQUESTED:
+            return JSONResponse({"error": "The default password is not accepted while live trading is switched on. Set ADMIN_PASSWORD on the server."}, status_code=403)
+        DEFAULT_PW_USERS.add(rows[0]["id"])
+    else:
+        DEFAULT_PW_USERS.discard(rows[0]["id"])
     resp = JSONResponse({"ok": True})
     resp.set_cookie("sid", new_session(rows[0]["id"]), httponly=True, samesite="lax", path="/",
                     secure=COOKIE_SECURE or request.url.scheme == "https", max_age=int(SESSION_HOURS * 3600))
@@ -1462,6 +1559,7 @@ def api_forgot(request: Request, payload: dict = Body(...)):
     x("UPDATE users SET pw_hash=? WHERE id=?", (hash_secret(pw), uid))
     x("DELETE FROM sessions WHERE user_id=?", (uid,))
     PIN_STATE.pop(uid, None)
+    DEFAULT_PW_USERS.discard(uid)
     return {"ok": True, "recovery_key": set_recovery(uid)}  # a recovery key works once; here is the next one
 
 
@@ -1508,7 +1606,15 @@ def api_chain(symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
         row = next((r for r in STATES[tf]["rows"] if r["symbol"] == symbol), None)
     signal = row["signal"] if row else "–"
     side = "CE" if signal.endswith("BUY") else "PE" if signal.endswith("SELL") else None
-    out = {**chain, "signal": signal, "bias": side, "suggested": None, "levels": None}
+    sig_info = {"status": row["status"], "signal_time": row["signal_time"], "bars_ago": row["bars_ago"], "side": row.get("side")} if row else None
+    all_tf = {}
+    with LOCK:
+        for t_ in INTERVALS:
+            r_ = next((r for r in STATES[t_]["rows"] if r["symbol"] == symbol), None)
+            if r_:
+                all_tf[t_] = {"signal": r_["signal"], "status": r_["status"], "signal_time": r_["signal_time"]}
+    out = {**chain, "signal": signal, "bias": side, "suggested": None, "levels": None,
+           "tf": tf, "sig_info": sig_info, "all_tf": all_tf}
     if side:
         atm_row = next((r for r in chain["rows"] if r["strike"] == chain["atm"]), None)
         if atm_row:
@@ -1702,7 +1808,7 @@ def api_me(request: Request):
     u = request.state.user
     mode, note = user_mode(u)
     hints = {r["broker"]: r["hint"] for r in q("SELECT broker, hint FROM creds WHERE user_id=?", (u["id"],))}
-    return {"user": public_user(u), "csrf": u["csrf"], "mode": mode, "note": note, "hints": hints,
+    return {"user": public_user(u), "csrf": u["csrf"], "mode": mode, "note": note, "hints": hints, "default_password": u["id"] in DEFAULT_PW_USERS,
             "broker_fields": BROKER_FIELDS, "broker_names": BROKER_NAMES}
 
 
@@ -1717,6 +1823,7 @@ def api_password(request: Request, payload: dict = Body(...)):
     if bad:
         return {"error": bad}
     x("UPDATE users SET pw_hash=? WHERE id=?", (hash_secret(new), u["id"]))
+    DEFAULT_PW_USERS.discard(u["id"])
     x("DELETE FROM sessions WHERE user_id=? AND token_hash!=?", (u["id"], sha(request.cookies.get("sid", ""))))
     return {"ok": True}
 
@@ -1747,6 +1854,8 @@ def api_recovery(request: Request, payload: dict = Body(...)):
 @app.put("/api/account/broker")
 def api_broker_save(request: Request, payload: dict = Body(...)):
     u = request.state.user
+    if u["id"] in DEFAULT_PW_USERS:
+        return {"error": "Change the default admin password before saving broker details."}
     b = str(payload.get("broker", ""))
     fields = payload.get("fields") or {}
     if b not in BROKER_FIELDS:
@@ -1761,6 +1870,8 @@ def api_broker_save(request: Request, payload: dict = Body(...)):
         save_creds(u["id"], b, clean)
     except ImportError:
         return {"error": "The 'cryptography' package is missing on the server. Run: pip install cryptography"}
+    except RuntimeError as e:
+        return {"error": str(e)}
     return {"ok": True}
 
 
@@ -1782,6 +1893,28 @@ CAP_TYPES = {"max_order_value": float, "max_qty": int, "max_orders": int, "max_f
 
 def active_admins():
     return q("SELECT COUNT(*) AS c FROM users WHERE role='admin' AND active=1")[0]["c"]
+
+
+@app.get("/api/admin/overview")
+def api_admin_overview(request: Request):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    users = q("SELECT id, username, role, active, live_allowed FROM users")
+    names = {r["id"]: r["username"] for r in users}
+    with ORDER_LOCK:
+        orders = [{**public(o), "username": names.get(o.get("user"), "?")} for o in reversed(ORDERS)][:300]
+    sig = {}
+    with LOCK:
+        for t_ in INTERVALS:
+            rows = STATES[t_]["rows"]
+            if rows:
+                sig[t_] = {"buy": sum(1 for r in rows if r["signal"] == "BUY"), "sell": sum(1 for r in rows if r["signal"] == "SELL"),
+                           "open": sum(1 for r in rows if r["signal"].startswith("Open")), "updated": STATES[t_]["updated"]}
+    return {"users": len(users), "active": sum(1 for r in users if r["active"]), "admins": sum(1 for r in users if r["role"] == "admin"),
+            "live_enabled": sum(1 for r in users if r["live_allowed"]), "orders": orders,
+            "live_server": LIVE_REQUESTED, "signup": ALLOW_SIGNUP, "invite": bool(SIGNUP_CODE),
+            "storage": "postgres" if USE_PG else DB_PATH, "signals": sig}
 
 
 @app.get("/api/admin/users")
@@ -1841,12 +1974,17 @@ def api_admin_update(request: Request, uid: int, payload: dict = Body(...)):
         if not new_active:
             x("DELETE FROM sessions WHERE user_id=?", (uid,))
     if "live_allowed" in payload:
+        if me_["id"] in DEFAULT_PW_USERS:
+            return {"error": "Change the default admin password before enabling live trading for anyone."}
         x("UPDATE users SET live_allowed=? WHERE id=?", (int(bool(payload["live_allowed"])), uid))
     if "password" in payload:
         pw = str(payload["password"])
         if len(pw) < 10:
             return {"error": "The password needs at least 10 characters."}
+        if pw == DEFAULT_ADMIN_PW:
+            return {"error": "Choose a password other than the default one."}
         x("UPDATE users SET pw_hash=? WHERE id=?", (hash_secret(pw), uid))
+        DEFAULT_PW_USERS.discard(uid)
         x("DELETE FROM sessions WHERE user_id=?", (uid,))
     if "caps" in payload:
         caps = {}
@@ -2057,7 +2195,9 @@ tr:last-child td{border-bottom:0}
 .orow .pill{min-width:0;padding:0 8px;font-size:12px}
 .orow .none{color:var(--mute)}
 .omain .more{display:inline-flex;gap:6px;align-items:center;margin:0 0 8px;color:var(--mute);font-size:13px}
-.olv{display:flex;flex-wrap:wrap;gap:4px 14px;margin:-4px 0 12px;font-size:13px;color:var(--mute)}
+.osig{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 16px;margin-bottom:12px;display:flex;flex-direction:column;gap:6px}
+.osl{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;font-size:14px}
+.osl .pill{min-width:0;padding:0 10px}
 @media(max-width:800px){.ogrid{grid-template-columns:1fr}.olist{position:static}.orows{max-height:240px}}
 .osum{display:flex;flex-wrap:wrap;gap:6px 24px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;margin-bottom:12px}
 .osum:not([hidden]){display:flex}
@@ -2112,6 +2252,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
  <div class="ctl"><div class="seg" id="tfs" role="group" aria-label="Timeframe"></div><button class="btn" id="refresh">Refresh now</button><span class="sub" id="who"></span><button class="mini" id="logout">Sign out</button></div>
 </header>
 <div class="banner paper" id="banner"></div>
+<div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
 <nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="tally" id="tally"></div>
@@ -2161,6 +2302,8 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <div id="brokerCards"></div></div>
 </section>
 <section id="view-admin" hidden>
+ <div class="card"><h3>Overview</h3><div class="osum" id="admOv" style="margin-bottom:0"></div></div>
+ <div class="card"><h3>Everyone's orders today</h3><div class="wrap"><table id="admOrd"></table></div></div>
  <div class="card"><h3>Add a user</h3>
   <div class="grid2" style="margin-bottom:0"><label>Username<input id="nuName" autocomplete="off"></label><label>Temporary password (at least 10 characters)<input id="nuPw" type="password" autocomplete="new-password"></label></div>
   <div class="tkbtns"><select id="nuRole" aria-label="Role"><option value="user">User</option><option value="admin">Admin</option></select><button class="btn" id="addUser">Add user</button></div></div>
@@ -2316,8 +2459,16 @@ function renderChain(d){
   +stat("PCR (OI)",d.pcr??"–")+stat("Max call OI",d.max_ce??"–")+stat("Max put OI",d.max_pe??"–")
   +stat("Signal",`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`)
   +(d.suggested?stat("Bias",`ATM ${d.suggested.strike} ${d.suggested.side}${d.suggested.ltp!=null?" ₹"+f2(d.suggested.ltp):""}`):"");
- let ol=document.getElementById("olv");if(!ol){ol=document.createElement("div");ol.id="olv";ol.className="olv";sum.after(ol)}
- ol.innerHTML=lv?"Stock levels: "+lv:"";ol.hidden=!lv;
+ let ol=document.getElementById("olv");if(!ol){ol=document.createElement("div");ol.id="olv";ol.className="osig";sum.after(ol)}
+ const si=d.sig_info,tn=tfName[d.tf]||d.tf;let h="";
+ if(sg!=="–"){h=`<div class="osl"><span class="pill ${sg.replace(" ","_")}">${sg}</span><b>${esc(d.symbol)} on ${tn} candles</b><span>signal candle ${esc(si.signal_time)}${si.bars_ago!=null?", "+(si.bars_ago===0?"latest candle":si.bars_ago+(si.bars_ago===1?" candle ago":" candles ago")):""} · ${esc(si.status)}</span></div>`;
+  if(d.suggested)h+=`<div class="osl"><span>Option idea:</span><button class="btn" id="osug" data-strike="${d.suggested.strike}" data-right="${d.suggested.side}" data-ltp="${d.suggested.ltp??""}" ${d.suggested.ltp==null?"disabled":""}>Buy ATM ${d.suggested.strike} ${d.suggested.side}${d.suggested.ltp!=null?" at ₹"+f2(d.suggested.ltp):""}</button><span class="sub">${d.suggested.side==="CE"?"Buy signal, so a call":"Sell signal, so a put"}. The shaded column is the side that matches the signal.</span></div>`;
+  if(lv)h+=`<div class="osl"><span>Stock levels:</span>${lv}</div>`}
+ else{h=`<div class="osl"><span class="pill">–</span><b>No active signal on ${tn} candles</b><span>${si&&si.signal_time!=="–"?"The last signal ("+esc(si.signal_time)+") ended: "+esc(si.status)+".":"No signal in the loaded candles."}</span></div>`}
+ const others=Object.entries(d.all_tf||{}).filter(([k])=>k!==d.tf).map(([k,v])=>`<span>${tfName[k]||k}: <span class="pill ${v.signal.replace(" ","_")}">${v.signal}</span></span>`).join("");
+ if(others)h+=`<div class="osl"><span>Other timeframes:</span>${others}<span class="sub">(only those already scanned)</span></div>`;
+ ol.innerHTML=h;
+ const sb=document.getElementById("osug");if(sb)sb.onclick=()=>openTicket({kind:"option",symbol:d.symbol,expiry:d.expiry,strike:+sb.dataset.strike,right:sb.dataset.right,side:"BUY",price:+sb.dataset.ltp,label:`${d.symbol} ${+sb.dataset.strike} ${sb.dataset.right} ${d.expiry}`});
  document.getElementById("oexp").onchange=e=>{oexp=e.target.value;loadChain()};
  const more=document.getElementById("omore").checked,cls=(...a)=>a.filter(Boolean).join(" ");
  const iv=l=>l.iv==null?"–":l.iv.toFixed(1);
@@ -2399,7 +2550,7 @@ loadTrading();
 // ── Account and admin ──
 const send=async(m,u,b)=>(await api(u,{method:m,headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)})).json();
 async function loadMe(){const d=await (await api("/api/me")).json();me=d;csrf=d.csrf;
- $("who").textContent=d.user.username+(d.user.role==="admin"?" (admin)":"");$("navAdmin").hidden=d.user.role!=="admin";renderAccount(d)}
+ $("dpBanner").hidden=!d.default_password;$("who").textContent=d.user.username+(d.user.role==="admin"?" (admin)":"");$("navAdmin").hidden=d.user.role!=="admin";renderAccount(d)}
 function renderAccount(d){
  $("acctInfo").textContent=d.mode==="live"?"Live trading is enabled for your account.":d.note;
  $("recInfo").textContent=d.user.recovery_set?"You have a recovery key. If you forget your password, the Forgot password page accepts it once. Creating a new key cancels the old one.":"You have no recovery key yet, so you could not reset your own password. Create one and keep it somewhere safe.";
@@ -2409,11 +2560,21 @@ $("brokerCards").onclick=async e=>{const card=e.target.closest(".bcard");if(!car
  if(e.target.closest("[data-save]")){const fields={};card.querySelectorAll("[data-f]").forEach(i=>fields[i.dataset.f]=i.value);
   const d=await send("PUT","/api/account/broker",{broker:b,fields});if(d.error){msg.textContent=d.error;return}await loadMe();loadTrading()}
  if(e.target.closest("[data-rm]")){if(!confirm("Remove these broker details?"))return;await send("DELETE","/api/account/broker/"+b);await loadMe();loadTrading()}};
-$("pwBtn").onclick=async()=>{const d=await send("POST","/api/account/password",{current:$("pwCur").value,new:$("pwNew").value});$("pwMsg").textContent=d.error||"Password changed.";if(!d.error){$("pwCur").value="";$("pwNew").value=""}};
+$("pwBtn").onclick=async()=>{const d=await send("POST","/api/account/password",{current:$("pwCur").value,new:$("pwNew").value});$("pwMsg").textContent=d.error||"Password changed.";if(!d.error){$("pwCur").value="";$("pwNew").value="";loadMe()}};
 $("pinBtn").onclick=async()=>{const d=await send("POST","/api/account/pin",{password:$("pinPw").value,new_pin:$("pinNew").value});$("pinMsg").textContent=d.error||"Order PIN saved.";if(!d.error){$("pinPw").value="";$("pinNew").value="";await loadMe();loadTrading()}};
 $("logout").onclick=async()=>{try{await send("POST","/api/logout",{})}catch(e){}location.href="/login"};
 let users=[],limUser=null;
-async function loadUsers(){const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
+async function loadOverview(){const d=await (await api("/api/admin/overview")).json();if(d.error)return;
+ const st=(l,v)=>`<div class="stat"><span class="l">${l}</span><b>${v}</b></div>`;
+ const sg=Object.entries(d.signals).map(([k,v])=>`${tfName[k]||k}: ${v.buy} buy, ${v.sell} sell, ${v.open} open`).join("<br>")||"Not scanned yet";
+ const live=d.orders.filter(o=>o.mode==="live").length;
+ $("admOv").innerHTML=st("Users",`${d.active} active of ${d.users}`)+st("Admins",d.admins)+st("Live enabled for",d.live_enabled)
+  +st("Orders today",`${d.orders.length} (${live} live)`)+st("Live trading on server",d.live_server?"On":"Off")
+  +st("Sign-up",d.signup?(d.invite?"Open, invite code":"Open"):"Closed")+st("User storage",d.storage==="postgres"?"Postgres":esc(d.storage)+" (needs a persistent disk or users vanish on redeploy)")
+  +st("Signals now",sg);
+ const t=$("admOrd");if(!d.orders.length){t.innerHTML=`<tbody><tr><td class="empty" style="text-align:left">No orders have been placed today.</td></tr></tbody>`;return}
+ t.innerHTML=`<thead><tr><th>Time</th><th>User</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th><th>Broker</th></tr></thead><tbody>`+d.orders.map(o=>`<tr><td>${esc(o.time)}</td><td>${esc(o.username)}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}</td><td>${esc(o.side)}</td><td>${o.qty}</td><td>${o.order_type==="LIMIT"?f2(o.price):o.avg_price?f2(o.avg_price):"Market"}</td><td>${esc(o.status)}</td><td>${esc(o.broker||"paper")}</td></tr>`).join("")+"</tbody>"}
+async function loadUsers(){loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
 function renderUsers(){const bn=(me&&me.broker_names)||{};
  $("usrTable").innerHTML=`<thead><tr><th>User</th><th>Role</th><th>Active</th><th>Live trading</th><th>Brokers</th><th>Order PIN</th><th></th></tr></thead><tbody>`+users.map(u=>`<tr><td><b>${esc(u.username)}</b></td><td>${u.role}</td><td><input type="checkbox" data-act="active" data-id="${u.id}" ${u.active?"checked":""} aria-label="Active"></td><td><input type="checkbox" data-act="live" data-id="${u.id}" ${u.live_allowed?"checked":""} aria-label="Live trading"></td><td>${u.brokers.map(b=>esc(bn[b]||b)).join(", ")||"–"}</td><td>${u.pin_set?"Set":"Not set"}</td><td><button class="mini" data-act="limits" data-id="${u.id}">Limits</button> <button class="mini" data-act="role" data-id="${u.id}">Make ${u.role==="admin"?"user":"admin"}</button> <button class="mini" data-act="reset" data-id="${u.id}">Reset password</button> <button class="mini" data-act="del" data-id="${u.id}">Delete</button></td></tr>`).join("")+"</tbody>"}
 $("usrTable").onchange=async e=>{const c=e.target.closest("input[data-act]");if(!c)return;

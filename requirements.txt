@@ -5,3 +5,4 @@ numpy
 yfinance
 requests
 cryptography
+psycopg2-binary
