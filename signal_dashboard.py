@@ -1,21 +1,28 @@
 """
-CE + EMA + QQE MOD signal dashboard for NSE stocks.
+CE + EMA + QQE MOD signal dashboard for NSE stocks, futures and options, with sign-in for several people.
 Python port of the TradingView indicator "Chandelier Exit + EMA + QQE MOD Signals".
 
-Setup:   pip install fastapi uvicorn pandas numpy yfinance
+Setup:   pip install -r requirements.txt            (live trading also: pip install -r requirements-live.txt)
 Run:     python signal_dashboard.py
 Open:    http://127.0.0.1:8000
-Online:  see Dockerfile; set DASH_PASSWORD on a server.
+First sign-in: set ADMIN_USER and ADMIN_PASSWORD, or read the one-time password printed in the console.
 
-Optional env vars:  INTERVAL=5m|15m|1d (default timeframe)   REFRESH_SECONDS=300   PORT=8000   HOST=0.0.0.0
-Optional file:      symbols.txt  (one NSE symbol per line, e.g. RELIANCE) overrides the default list.
+Optional env vars:  INTERVAL=5m|15m|1d  REFRESH_SECONDS=300  PORT=8000  HOST=0.0.0.0
+  DB_PATH=dashboard.db  ORDER_LOG=orders_log.jsonl  SECRETS_KEY=<Fernet key>  COOKIE_SECURE=1 (when served over https)
+  LIVE_TRADING=1 (switch live trading on for the server; an admin must still enable it for each person)
+  MAX_ORDER_VALUE, MAX_QTY, MAX_ORDERS_PER_DAY, MAX_FUT_LOTS, MAX_FUT_VALUE, ALLOW_OPTION_SELLING  (default limits per person)
+Optional file:      symbols.txt  (one NSE symbol per line, e.g. RELIANCE) overrides the default stock list.
 
-This dashboard only reads market data and shows signals. It never places orders.
+Orders are simulated ("paper") unless live trading is on for the server and enabled for that person.
+Back up the database and the secret.key file together. Without the key, saved broker details cannot be read.
 """
 import base64
 import csv
+import hashlib
+import hmac
 import io
 import json
+import sqlite3
 import os
 import re
 import secrets
@@ -28,7 +35,7 @@ import pandas as pd
 import requests
 import uvicorn
 from fastapi import Body, FastAPI, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # ── Settings: keep these equal to the indicator's inputs ──
 INTERVALS = ["5m", "15m", "1d"]   # timeframes offered on the dashboard
@@ -52,58 +59,18 @@ PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "127.0.0.1")
 OPTION_TTL = int(os.getenv("OPTION_TTL", "120"))                 # seconds an option chain stays cached
 STRIKES_EACH_SIDE = int(os.getenv("STRIKES_EACH_SIDE", "8"))       # strikes shown above and below the money
-PASSWORD = os.getenv("DASH_PASSWORD")  # set this when the dashboard is on the internet
 
 PERIODS = {"5m": "30d", "15m": "60d", "1d": "2y"}
 STEP = {"5m": pd.Timedelta(minutes=5), "15m": pd.Timedelta(minutes=15), "1h": pd.Timedelta(hours=1)}
 IST = "Asia/Kolkata"
 MIN_BARS = 150
 
-DEFAULT_SYMBOLS = DEFAULT_SYMBOLS = [
-    "360ONE", "ABB", "ABCAPITAL", "ADANIENSOL", "ADANIENT",
-    "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "ALKEM", "AMBER",
-    "AMBUJACEM", "ANANDRATHI", "ANGELONE", "APLAPOLLO", "APOLLOHOSP",
-    "ASHOKLEY", "ASIANPAINT", "ASTRAL", "ATHERENERG", "AUBANK",
-    "AUROPHARMA", "AXISBANK", "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE",
-    "BANDHANBNK", "BANKBARODA", "BANKINDIA", "BDL", "BEL",
-    "BHARATFORG", "BHARTIARTL", "BHEL", "BIOCON", "BLUESTARCO",
-    "BOSCHLTD", "BPCL", "BRITANNIA", "BSE", "CAMS",
-    "CANBK", "CDSL", "CGPOWER", "CHOLAFIN", "CIPLA",
-    "COALINDIA", "COCHINSHIP", "COFORGE", "COLPAL", "CONCOR",
-    "COROMANDEL", "CROMPTON", "CUB", "CUMMINSIND", "DABUR",
-    "DATAPATTNS", "DELHIVERY", "DIVISLAB", "DIXON", "DLF",
-    "DMART", "DRREDDY", "EICHERMOT", "ENRIN", "ETERNAL",
-    "FEDERALBNK", "FORCEMOT", "FORTIS", "GAIL", "GLENMARK",
-    "GMRAIRPORT", "GODFRYPHLP", "GODREJCP", "GODREJPROP", "GRASIM",
-    "GVT&D", "HAL", "HAVELLS", "HCLTECH", "HDFCAMC",
-    "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDPETRO",
-    "HINDUNILVR", "HINDZINC", "HYUNDAI", "ICICIBANK", "ICICIGI",
-    "ICICILIFE", "IDEA", "IDFCFIRSTB", "IEX", "INDHOTEL",
-    "INDIANB", "INDIGO", "INDUSINDBK", "INDUSTOWER", "INFY",
-    "INOXWIND", "IOC", "IREDA", "IRFC", "ITC",
-    "JINDALSTEL", "JIOFIN", "JSWENERGY", "JSWSTEEL", "JUBLFOOD",
-    "KALYANKJIL", "KARURVYSYA", "KAYNES", "KEI", "KFINTECH",
-    "KOTAKBANK", "KPITTECH", "LAURUSLABS", "LICHSGFIN", "LICI",
-    "LODHA", "LT", "LTF", "LTM", "LUPIN",
-    "M&M", "MAHABANK", "MANAPPURAM", "MANKIND", "MARICO",
-    "MARUTI", "MAXHEALTH", "MAZDOCK", "MCX", "MFSL",
-    "MOTHERSON", "MOTILALOFS", "MPHASIS", "MUTHOOTFIN", "NAM-INDIA",
-    "NATIONALUM", "NAUKRI", "NAVINFLUOR", "NBCC", "NESTLEIND",
-    "NHPC", "NMDC", "NTPC", "NYKAA", "OBEROIRLTY",
-    "OFSS", "OIL", "ONGC", "PAGEIND", "PATANJALI",
-    "PAYTM", "PERSISTENT", "PETRONET", "PFC", "PGEL",
-    "PHOENIXLTD", "PIDILITIND", "PIIND", "PNB", "PNBHOUSING",
-    "POLICYBZR", "POLYCAB", "POWERGRID", "POWERINDIA", "PREMIERENE",
-    "PRESTIGE", "RADICO", "RBLBANK", "RECLTD", "RELIANCE",
-    "RVNL", "SAGILITY", "SAIL", "SBICARD", "SBILIFE",
-    "SBIN", "SHREECEM", "SHRIRAMFIN", "SIEMENS", "SOLARINDS",
-    "SONACOMS", "SRF", "SUNPHARMA", "SUPREMEIND", "SUZLON",
-    "SWIGGY", "SYRMA", "TATACONSUM", "TATAELXSI", "TATAPOWER",
-    "TATASTEEL", "TCS", "TECHM", "TIINDIA", "TITAN",
-    "TMPV", "TORNTPHARM", "TRENT", "TVSMOTOR", "UJJIVANSFB",
-    "ULTRACEMCO", "UNIONBANK", "UNITDSPR", "UNOMINDA", "UPL",
-    "VBL", "VEDL", "VMM", "VOLTAS", "WAAREEENER",
-    "WIPRO", "YESBANK", "ZYDUSLIFE"
+DEFAULT_SYMBOLS = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "LT", "ITC", "AXISBANK", "KOTAKBANK",
+    "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATAMOTORS", "TATASTEEL", "NTPC",
+    "POWERGRID", "ONGC", "ADANIENT", "ADANIPORTS", "ASIANPAINT", "ULTRACEMCO", "TITAN", "WIPRO",
+    "HCLTECH", "TECHM", "M&M", "COALINDIA", "JSWSTEEL", "HINDALCO", "GRASIM", "CIPLA", "DRREDDY",
+    "EICHERMOT", "BAJAJ-AUTO", "HEROMOTOCO", "BRITANNIA", "NESTLEIND",
 ]
 
 
@@ -508,60 +475,34 @@ def build_chain(symbol, expiry=None):
     return out
 
 
-# ── Order placement (Angel One SmartAPI) ──
-# Safe by default: orders are only simulated ("paper") unless live trading is switched on with environment variables.
-# Live orders also need an Angel One API key tied to a registered static IP (SEBI rule, enforced since 1 April 2026).
+# ── Accounts, sign-in and order placement ──
+# Several people can sign in. Each has their own broker accounts, order PIN and limits.
+# Everything is simulated ("paper") unless live trading is switched on for the server AND enabled for that person by an admin.
+# Brokers accept API orders only from a static IP registered to that client. Check each broker's sharing rules first.
 LIVE_REQUESTED = os.getenv("LIVE_TRADING", "0") == "1"
-ANGEL = {"api_key": os.getenv("ANGEL_API_KEY", ""), "client_id": os.getenv("ANGEL_CLIENT_ID", ""),
-         "pin": os.getenv("ANGEL_PIN", ""), "totp": os.getenv("ANGEL_TOTP_SECRET", "")}
-DHAN = {"client_id": os.getenv("DHAN_CLIENT_ID", ""), "token": os.getenv("DHAN_ACCESS_TOKEN", "")}
-BROKER_PREF = os.getenv("BROKER", "").strip().lower()               # default broker when both are set up: angel or dhan
-ALLOW_OPTION_SELLING = os.getenv("ALLOW_OPTION_SELLING", "1") == "1"
-ORDER_PIN = os.getenv("ORDER_PIN", "")                              # typed before every live order
-MAX_ORDER_VALUE = float(os.getenv("MAX_ORDER_VALUE", "50000"))      # rupees per order
-MAX_QTY = int(os.getenv("MAX_QTY", "500"))                          # shares per order, or lots for options
-MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", "10"))
-MAX_FUT_LOTS = int(os.getenv("MAX_FUT_LOTS", "1"))                  # lots per futures order
-MAX_FUT_VALUE = float(os.getenv("MAX_FUT_VALUE", "2500000"))        # notional rupees per futures order
-EQ_PRICE_BAND, OPT_PRICE_BAND = 5.0, 30.0                           # limit price may differ from last price by this %
+BROKER_PREF = os.getenv("BROKER", "").strip().lower()               # preferred broker for people who set up both
+DB_PATH = os.getenv("DB_PATH", "dashboard.db")
+SESSION_HOURS = float(os.getenv("SESSION_HOURS", "12"))
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") == "1"              # set to 1 when the site is served over https
 ORDER_LOG = os.getenv("ORDER_LOG", "orders_log.jsonl")
 MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 DHAN_BASE = "https://api.dhan.co/v2"
-
-
-def available_brokers():
-    out = []
-    if all(ANGEL.values()):
-        out.append("angel")
-    if all(DHAN.values()):
-        out.append("dhan")
-    return out
-
-
-LIVE_BROKERS = available_brokers()
-DEFAULT_BROKER = BROKER_PREF if BROKER_PREF in LIVE_BROKERS else (LIVE_BROKERS[0] if LIVE_BROKERS else "angel")
+DEFAULT_CAPS = {                                                    # an admin can override these for each person
+    "max_order_value": float(os.getenv("MAX_ORDER_VALUE", "50000")),       # rupees per stock or option-buy order
+    "max_qty": int(os.getenv("MAX_QTY", "500")),                           # shares per order, or lots for option buys
+    "max_orders": int(os.getenv("MAX_ORDERS_PER_DAY", "10")),
+    "max_fut_lots": int(os.getenv("MAX_FUT_LOTS", "1")),                   # lots per futures order or option sell
+    "max_fut_value": float(os.getenv("MAX_FUT_VALUE", "2500000")),         # notional rupees per futures order or option sell
+    "allow_option_selling": os.getenv("ALLOW_OPTION_SELLING", "1") == "1",
+}
+EQ_PRICE_BAND, OPT_PRICE_BAND = 5.0, 30.0                           # limit price may differ from last price by this %
 BROKER_NAMES = {"angel": "Angel One", "dhan": "Dhan", "paper": "Paper"}
-
-
-def decide_mode():
-    if not LIVE_REQUESTED:
-        return "paper", "Paper mode: orders are simulated and nothing is sent to your broker."
-    missing = [n for n, v in [("ORDER_PIN", ORDER_PIN), ("DASH_PASSWORD", PASSWORD or "")] if not v]
-    if not LIVE_BROKERS:
-        missing.append("a broker login (Angel One: ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PIN, ANGEL_TOTP_SECRET. "
-                       "Dhan: DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)")
-    if missing:
-        return "paper", "Live trading is off because these settings are missing: " + ", ".join(missing) + ". Orders are simulated."
-    if len(ORDER_PIN) < 4:
-        return "paper", "Live trading is off because ORDER_PIN needs at least 4 characters. Orders are simulated."
-    return "live", ""
-
-
-MODE, MODE_NOTE = decide_mode()
-ORDERS, PENDING, PIN_STATE = [], {}, {"fails": 0, "until": 0.0}
+BROKER_FIELDS = {"angel": [("api_key", "API key"), ("client_id", "Client ID"), ("pin", "Login PIN"), ("totp_secret", "TOTP secret")],
+                 "dhan": [("client_id", "Client ID"), ("access_token", "Access token")]}
+ORDERS, PENDING, PIN_STATE, LOGIN_FAILS, SYNC, ACCOUNTS = [], {}, {}, {}, {}, {}
 ORDER_LOCK = threading.Lock()
-SYNC = {"t": 0.0}
+DB_LOCK = threading.Lock()
 
 
 def ist_now():
@@ -593,6 +534,7 @@ def load_orders():
                     continue
                 if o.get("date") == today:
                     o.setdefault("broker", "angel" if o.get("mode") == "live" else "paper")
+                    o.setdefault("user", 1)
                     latest[o["id"]] = o
     except OSError:
         pass
@@ -602,27 +544,221 @@ def load_orders():
 load_orders()
 
 
+# ── database ──
+def _con():
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def q(sql, args=()):
+    with DB_LOCK:
+        con = _con()
+        try:
+            return [dict(r) for r in con.execute(sql, args).fetchall()]
+        finally:
+            con.close()
+
+
+def x(sql, args=()):
+    with DB_LOCK:
+        con = _con()
+        try:
+            cur = con.execute(sql, args)
+            con.commit()
+            return cur.lastrowid
+        finally:
+            con.close()
+
+
+def init_db():
+    new = not os.path.exists(DB_PATH)
+    with DB_LOCK:
+        con = _con()
+        try:
+            con.executescript("""
+            CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE COLLATE NOCASE NOT NULL,
+              pw_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', active INTEGER NOT NULL DEFAULT 1,
+              live_allowed INTEGER NOT NULL DEFAULT 0, pin_hash TEXT, caps TEXT, created TEXT);
+            CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, csrf TEXT NOT NULL, expires REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS creds(user_id INTEGER NOT NULL, broker TEXT NOT NULL, blob TEXT NOT NULL, hint TEXT, updated TEXT,
+              PRIMARY KEY(user_id, broker));""")
+            con.commit()
+        finally:
+            con.close()
+    if new:
+        try:
+            os.chmod(DB_PATH, 0o600)
+        except OSError:
+            pass
+    ensure_admin()
+
+
+def ensure_admin():
+    """The first admin comes from ADMIN_USER / ADMIN_PASSWORD. Without them a random password is printed once."""
+    if q("SELECT COUNT(*) AS c FROM users")[0]["c"]:
+        return
+    name = os.getenv("ADMIN_USER", "admin")
+    pw = os.getenv("ADMIN_PASSWORD") or os.getenv("DASH_PASSWORD") or ""
+    generated = not pw
+    if generated:
+        pw = secrets.token_urlsafe(12)
+    x("INSERT INTO users(username, pw_hash, role, active, live_allowed, created) VALUES(?,?,?,?,?,?)",
+      (name, hash_secret(pw), "admin", 1, 0, ist_now().isoformat()))
+    if generated:
+        print(f"\n  First sign-in\n    username: {name}\n    password: {pw}\n  This password is shown once. Change it under Account.\n", flush=True)
+
+
+# ── passwords, sessions and stored broker details ──
+def hash_secret(secret):
+    salt = os.urandom(16)
+    h = hashlib.scrypt(secret.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+    return "scrypt$" + salt.hex() + "$" + h.hex()
+
+
+def check_secret(secret, stored):
+    try:
+        _, salt, h = stored.split("$")
+        calc = hashlib.scrypt(secret.encode(), salt=bytes.fromhex(salt), n=2 ** 14, r=8, p=1, dklen=32)
+        return hmac.compare_digest(calc.hex(), h)
+    except Exception:
+        return False
+
+
+DUMMY_HASH = hash_secret("not-a-real-password")
+
+
+def sha(t):
+    return hashlib.sha256(t.encode()).hexdigest()
+
+
+def new_session(uid):
+    token = secrets.token_urlsafe(32)
+    x("INSERT INTO sessions(token_hash, user_id, csrf, expires) VALUES(?,?,?,?)",
+      (sha(token), uid, secrets.token_urlsafe(24), time.time() + SESSION_HOURS * 3600))
+    return token
+
+
+def build_user(row):
+    caps = dict(DEFAULT_CAPS)
+    try:
+        caps.update(json.loads(row.get("caps") or "{}"))
+    except ValueError:
+        pass
+    have = {r["broker"] for r in q("SELECT broker FROM creds WHERE user_id=?", (row["id"],))}
+    brokers = [b for b in ("angel", "dhan") if b in have]
+    default = BROKER_PREF if BROKER_PREF in brokers else (brokers[0] if brokers else "angel")
+    return {"id": row["id"], "username": row["username"], "role": row["role"], "active": bool(row["active"]),
+            "live_allowed": bool(row["live_allowed"]), "pin_hash": row.get("pin_hash"), "pin_set": bool(row.get("pin_hash")),
+            "caps": caps, "brokers": brokers, "default_broker": default, "csrf": row.get("csrf")}
+
+
+def session_user(request):
+    tok = request.cookies.get("sid")
+    if not tok:
+        return None
+    rows = q("SELECT s.csrf, s.expires, u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash=?", (sha(tok),))
+    if not rows:
+        return None
+    r = rows[0]
+    if r["expires"] < time.time() or not r["active"]:
+        x("DELETE FROM sessions WHERE token_hash=?", (sha(tok),))
+        return None
+    return build_user(r)
+
+
+def public_user(u):
+    return {k: u[k] for k in ("id", "username", "role", "active", "live_allowed", "pin_set", "brokers", "caps")}
+
+
+def user_mode(u):
+    if not LIVE_REQUESTED:
+        return "paper", "Paper mode: orders are simulated. Live trading is switched off on this server."
+    if not u["live_allowed"]:
+        return "paper", "Paper mode: live trading is not enabled for your account. Ask the admin."
+    if not u["pin_set"]:
+        return "paper", "Paper mode: set your order PIN under Account to enable live trading."
+    if not u["brokers"]:
+        return "paper", "Paper mode: add your broker details under Account to enable live trading."
+    return "live", ""
+
+
+_FERNET = {}
+
+
+def fernet():
+    """Broker details are encrypted with SECRETS_KEY, or with a key file kept next to the database."""
+    if "f" not in _FERNET:
+        from cryptography.fernet import Fernet  # pip install cryptography
+        key = os.getenv("SECRETS_KEY", "").strip()
+        if not key:
+            path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "secret.key")
+            if os.path.exists(path):
+                key = open(path).read().strip()
+            else:
+                key = Fernet.generate_key().decode()
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(key)
+        _FERNET["f"] = Fernet(key.encode())
+    return _FERNET["f"]
+
+
+def save_creds(uid, broker_id, fields):
+    blob = fernet().encrypt(json.dumps(fields).encode()).decode()
+    hint = "…" + fields["client_id"][-4:]
+    x("INSERT INTO creds(user_id, broker, blob, hint, updated) VALUES(?,?,?,?,?) "
+      "ON CONFLICT(user_id, broker) DO UPDATE SET blob=excluded.blob, hint=excluded.hint, updated=excluded.updated",
+      (uid, broker_id, blob, hint, ist_now().isoformat()))
+    ACCOUNTS.pop((uid, broker_id), None)
+
+
+def delete_creds(uid, broker_id):
+    x("DELETE FROM creds WHERE user_id=? AND broker=?", (uid, broker_id))
+    ACCOUNTS.pop((uid, broker_id), None)
+
+
+def get_account(uid, broker_id):
+    acct = ACCOUNTS.get((uid, broker_id))
+    if acct:
+        return acct
+    rows = q("SELECT blob FROM creds WHERE user_id=? AND broker=?", (uid, broker_id))
+    if not rows:
+        raise RuntimeError("Broker details are missing.")
+    creds = json.loads(fernet().decrypt(rows[0]["blob"].encode()))
+    acct = AngelAccount(creds) if broker_id == "angel" else DhanAccount(creds)
+    ACCOUNTS[(uid, broker_id)] = acct
+    return acct
+
+
 class OrderRejected(RuntimeError):
     """The broker answered and refused the order, so no order exists."""
 
 
-class Broker:
-    """Angel One session. Reads retry once; order writes are never retried, so an order cannot be sent twice."""
+DHAN_PRODUCT = {"INTRADAY": "INTRADAY", "DELIVERY": "CNC", "CARRYFORWARD": "MARGIN"}
+DHAN_ORDER_TYPE = {"MARKET": "MARKET", "LIMIT": "LIMIT", "STOPLOSS_MARKET": "STOP_LOSS_MARKET"}
+DHAN_STATUS = {"TRADED": "complete", "PENDING": "open", "TRANSIT": "open pending", "PART_TRADED": "open",
+               "REJECTED": "rejected", "CANCELLED": "cancelled", "EXPIRED": "expired"}
 
-    def __init__(self):
+
+class AngelAccount:
+    """One person's Angel One session. Reads retry once; order writes are never retried, so an order cannot be sent twice."""
+
+    def __init__(self, creds):
+        self.c = creds
         self.obj = None
         self.lock = threading.Lock()
 
     def _login(self):
         from SmartApi import SmartConnect  # pip install smartapi-python pyotp
         import pyotp
-        obj = SmartConnect(api_key=ANGEL["api_key"])
-        res = obj.generateSession(ANGEL["client_id"], ANGEL["pin"], pyotp.TOTP(ANGEL["totp"]).now())
+        obj = SmartConnect(api_key=self.c["api_key"])
+        res = obj.generateSession(self.c["client_id"], self.c["pin"], pyotp.TOTP(self.c["totp_secret"]).now())
         if not res or not res.get("status"):
             raise RuntimeError("Angel One login failed: " + str((res or {}).get("message", "no response")))
         self.obj = obj
 
-    def read(self, fn, *a):
+    def _read(self, fn, *a):
         with self.lock:
             for i in (1, 2):
                 try:
@@ -634,7 +770,7 @@ class Broker:
                     if i == 2:
                         raise
 
-    def write(self, names, *a):
+    def _write(self, names, *a):
         with self.lock:
             if self.obj is None:
                 self._login()
@@ -647,8 +783,87 @@ class Broker:
                 self.obj = None
                 raise
 
+    def book(self):
+        out = {}
+        for x_ in (self._read("orderBook") or {}).get("data") or []:
+            st = str(x_.get("orderstatus") or "").lower()
+            out[str(x_.get("orderid"))] = {"status": st, "avg_price": _num(x_.get("averageprice")), "filled": _num(x_.get("filledshares")),
+                                           "note": str(x_.get("text") or "") if st == "rejected" else ""}
+        return out
 
-broker = Broker()
+    def place(self, o, variety="NORMAL", ordertype=None, trigger=None, side=None, qty=None):
+        otype = ordertype or o["order_type"]
+        params = {"variety": variety, "tradingsymbol": o["tradingsymbol"], "symboltoken": o["token"],
+                  "transactiontype": side or o["side"], "exchange": o["exchange"], "ordertype": otype,
+                  "producttype": o["product"], "duration": "DAY", "price": f'{o["price"]:.2f}' if otype == "LIMIT" else "0",
+                  "squareoff": "0", "stoploss": "0", "quantity": str(qty or o["qty"])}
+        if trigger is not None:
+            params["triggerprice"] = f"{trigger:.2f}"
+        res = self._write(("placeOrderFullResponse", "placeOrder"), params)
+        if isinstance(res, dict):
+            if not res.get("status"):
+                raise OrderRejected(str(res.get("message") or "The order was not accepted."))
+            oid = (res.get("data") or {}).get("orderid")
+        else:
+            oid = res
+        if not oid:
+            raise RuntimeError("The broker did not return an order id.")
+        return str(oid)
+
+    def cancel(self, o):
+        self._write(("cancelOrder",), o["id"], o.get("variety", "NORMAL"))
+
+
+class DhanAccount:
+    """One person's Dhan account."""
+
+    def __init__(self, creds):
+        self.c = creds
+
+    def request(self, method, path, body=None):
+        r = requests.request(method, DHAN_BASE + path, json=body, timeout=15,
+                             headers={"access-token": self.c["access_token"], "Content-Type": "application/json", "Accept": "application/json"})
+        try:
+            data = r.json()
+        except ValueError:
+            data = None
+        if 400 <= r.status_code < 500:  # Dhan answered and refused, so nothing was placed
+            msg = data.get("errorMessage") if isinstance(data, dict) else None
+            raise OrderRejected(msg or f"HTTP {r.status_code}")
+        if r.status_code >= 500:
+            raise RuntimeError(f"Dhan server error (HTTP {r.status_code})")
+        return data
+
+    def book(self):
+        res = self.request("GET", "/orders")
+        out = {}
+        for x_ in res if isinstance(res, list) else []:
+            raw = str(x_.get("orderStatus", "")).upper()
+            st = DHAN_STATUS.get(raw, raw.lower())
+            out[str(x_.get("orderId"))] = {"status": st, "avg_price": _num(x_.get("averageTradedPrice")), "filled": _num(x_.get("filledQty")),
+                                           "note": str(x_.get("omsErrorDescription") or "") if st == "rejected" else ""}
+        return out
+
+    def place(self, o, variety="NORMAL", ordertype=None, trigger=None, side=None, qty=None):
+        ot = ordertype or o["order_type"]
+        body = {"dhanClientId": self.c["client_id"], "correlationId": "DB" + secrets.token_hex(8),
+                "transactionType": side or o["side"], "exchangeSegment": o["exchange"],
+                "productType": DHAN_PRODUCT[o["product"]], "orderType": DHAN_ORDER_TYPE[ot], "validity": "DAY",
+                "securityId": str(o["token"]), "quantity": int(qty or o["qty"]), "disclosedQuantity": "",
+                "price": float(o["price"]) if ot == "LIMIT" else "",
+                "triggerPrice": float(trigger) if trigger is not None else "", "afterMarketOrder": False}
+        res = self.request("POST", "/orders", body)
+        oid = str((res or {}).get("orderId") or "")
+        if not oid:
+            raise RuntimeError("Dhan did not return an order id.")
+        if str(res.get("orderStatus", "")).upper() == "REJECTED":
+            raise OrderRejected("Dhan rejected the order.")
+        return oid
+
+    def cancel(self, o):
+        self.request("DELETE", f"/orders/{o['id']}")
+
+
 MASTERS = {n: {"day": None, "eq": {}, "opt": {}, "fut": {}} for n in ("angel", "dhan")}
 
 
@@ -768,16 +983,16 @@ def row_for(symbol, tf):
     return None, None
 
 
-def count_today():
+def count_today(uid, mode):
     with ORDER_LOCK:
-        return sum(1 for o in ORDERS if o["mode"] == MODE and not o.get("is_exit"))
+        return sum(1 for o in ORDERS if o.get("user") == uid and o["mode"] == mode and not o.get("is_exit"))
 
 
 def inr(x):
     return "₹" + f"{x:,.2f}"
 
 
-def make_order(p):
+def make_order(p, u):
     """Check an order request against every limit. Returns (order, error, warnings, lines)."""
     kind = p.get("kind")
     symbol = str(p.get("symbol", "")).upper().strip()
@@ -786,9 +1001,11 @@ def make_order(p):
     product = str(p.get("product", "INTRADAY")).upper()
     tf = p.get("tf") if p.get("tf") in INTERVALS else DEFAULT_INTERVAL
     fail = lambda m: (None, m, [], [])
-    broker_id = str(p.get("broker") or DEFAULT_BROKER).lower() if MODE == "live" else "paper"
-    if MODE == "live" and broker_id not in LIVE_BROKERS:
-        return fail("That broker is not set up.")
+    mode, _ = user_mode(u)
+    caps = u["caps"]
+    broker_id = str(p.get("broker") or u["default_broker"]).lower() if mode == "live" else "paper"
+    if mode == "live" and broker_id not in u["brokers"]:
+        return fail("That broker is not set up on your account.")
     mname = master_name(broker_id)
     if kind not in ("equity", "option", "future"):
         return fail("Unknown order type.")
@@ -802,13 +1019,13 @@ def make_order(p):
         qty = int(p.get("qty"))
     except (TypeError, ValueError):
         return fail("Quantity must be a whole number.")
-    cap = MAX_FUT_LOTS if (kind == "future" or (kind == "option" and side == "SELL")) else MAX_QTY
+    cap = caps["max_fut_lots"] if (kind == "future" or (kind == "option" and side == "SELL")) else caps["max_qty"]
     if qty < 1 or qty > cap:
         return fail(f"Quantity must be between 1 and {cap}" + (" shares." if kind == "equity" else " lots."))
-    if MODE == "live" and not market_open_now():
+    if mode == "live" and not market_open_now():
         return fail("The market is closed. Live orders are accepted 9:15 to 15:30 IST, Monday to Friday.")
-    if count_today() >= MAX_ORDERS_PER_DAY:
-        return fail(f"Daily limit of {MAX_ORDERS_PER_DAY} orders reached.")
+    if count_today(u["id"], mode) >= caps["max_orders"]:
+        return fail(f"Daily limit of {caps['max_orders']} orders reached.")
 
     row, _ = row_for(symbol, tf)
     warnings = []
@@ -854,8 +1071,8 @@ def make_order(p):
             return fail("The option contract details are not valid.")
         if right not in ("CE", "PE"):
             return fail("Option type must be CE or PE.")
-        if side == "SELL" and not ALLOW_OPTION_SELLING:
-            return fail("Selling options is switched off. Set ALLOW_OPTION_SELLING=1 to allow it.")
+        if side == "SELL" and not caps["allow_option_selling"]:
+            return fail("Selling options is switched off for your account.")
         if otype != "LIMIT":
             return fail("Option orders must be limit orders, because option markets can be thin.")
         if product not in ("INTRADAY", "CARRYFORWARD"):
@@ -888,16 +1105,16 @@ def make_order(p):
     selling_opt = kind == "option" and side == "SELL"
     exposure = strike * units if selling_opt else None
     if selling_opt:
-        if exposure > MAX_FUT_VALUE:
-            return fail(f"Selling this option puts about {inr(exposure)} of the underlying at stake, above your limit of {inr(MAX_FUT_VALUE)}.")
+        if exposure > caps["max_fut_value"]:
+            return fail(f"Selling this option puts about {inr(exposure)} of the underlying at stake, above your limit of {inr(caps['max_fut_value'])}.")
     else:
-        value_cap = MAX_FUT_VALUE if kind == "future" else MAX_ORDER_VALUE
+        value_cap = caps["max_fut_value"] if kind == "future" else caps["max_order_value"]
         if est > value_cap:
             return fail(f"This order is worth about {inr(est)}, above your limit of {inr(value_cap)} per order.")
     key = (kind, symbol, side, strike, right)
     now = time.time()
     with ORDER_LOCK:
-        if any(o.get("key") == key and not o.get("is_exit") and now - o["t"] < 60 for o in ORDERS):
+        if any(o.get("user") == u["id"] and o.get("key") == key and not o.get("is_exit") and now - o["t"] < 60 for o in ORDERS):
             return fail("An identical order was sent less than a minute ago. Check the Orders tab before sending another.")
 
     sl = risk = None
@@ -929,7 +1146,7 @@ def make_order(p):
     lines = [["Instrument", label], ["Side", side],
              ["Quantity", f"{qty} lot{'s' if qty > 1 else ''} x {lot} = {units} units" if kind != "equity" else f"{qty} shares"],
              ["Order type", otype.title()], ["Price", inr(price) if otype == "LIMIT" else f"Market (last price {inr(ref)})"],
-             ["Product", product.title()], ["Estimated value", inr(est)], ["Mode", "LIVE, real money" if MODE == "live" else "Paper, simulated"]]
+             ["Product", product.title()], ["Estimated value", inr(est)], ["Mode", "LIVE, real money" if mode == "live" else "Paper, simulated"]]
     if kind == "equity" and sl:
         lines.append(["Stop-loss from the signal", inr(sl) + " (placed from the Orders tab once filled)"])
     if selling_opt:
@@ -938,81 +1155,18 @@ def make_order(p):
         lines.append(["Stop-loss distance", f"{risk:.2f} points from your fill price (placed from the Orders tab)"])
     order = {"kind": kind, "symbol": symbol, "label": label, "tradingsymbol": tsym, "token": token, "exchange": exch,
              "side": side, "qty": units, "lots": qty, "order_type": otype, "price": price, "ref": ref, "product": product,
-             "expiry": expiry, "strike": strike, "right": right, "sl": sl, "risk": risk, "key": key, "broker": broker_id}
+             "expiry": expiry, "strike": strike, "right": right, "sl": sl, "risk": risk, "key": key, "broker": broker_id, "mode": mode, "user": u["id"]}
     return order, None, warnings, lines
-
-
-def place_live(o, variety="NORMAL", ordertype=None, trigger=None, side=None, qty=None):
-    """Angel One."""
-    otype = ordertype or o["order_type"]
-    params = {"variety": variety, "tradingsymbol": o["tradingsymbol"], "symboltoken": o["token"],
-              "transactiontype": side or o["side"], "exchange": o["exchange"], "ordertype": otype,
-              "producttype": o["product"], "duration": "DAY", "price": f'{o["price"]:.2f}' if otype == "LIMIT" else "0",
-              "squareoff": "0", "stoploss": "0", "quantity": str(qty or o["qty"])}
-    if trigger is not None:
-        params["triggerprice"] = f"{trigger:.2f}"
-    res = broker.write(("placeOrderFullResponse", "placeOrder"), params)
-    if isinstance(res, dict):
-        if not res.get("status"):
-            raise OrderRejected(str(res.get("message") or "The order was not accepted."))
-        oid = (res.get("data") or {}).get("orderid")
-    else:
-        oid = res
-    if not oid:
-        raise RuntimeError("The broker did not return an order id.")
-    return str(oid)
-
-
-DHAN_PRODUCT = {"INTRADAY": "INTRADAY", "DELIVERY": "CNC", "CARRYFORWARD": "MARGIN"}
-DHAN_ORDER_TYPE = {"MARKET": "MARKET", "LIMIT": "LIMIT", "STOPLOSS_MARKET": "STOP_LOSS_MARKET"}
-DHAN_STATUS = {"TRADED": "complete", "PENDING": "open", "TRANSIT": "open pending", "PART_TRADED": "open",
-               "REJECTED": "rejected", "CANCELLED": "cancelled", "EXPIRED": "expired"}
-
-
-def dhan_request(method, path, body=None):
-    r = requests.request(method, DHAN_BASE + path, json=body, timeout=15,
-                         headers={"access-token": DHAN["token"], "Content-Type": "application/json", "Accept": "application/json"})
-    try:
-        data = r.json()
-    except ValueError:
-        data = None
-    if 400 <= r.status_code < 500:  # Dhan answered and refused, so nothing was placed
-        msg = data.get("errorMessage") if isinstance(data, dict) else None
-        raise OrderRejected(msg or f"HTTP {r.status_code}")
-    if r.status_code >= 500:
-        raise RuntimeError(f"Dhan server error (HTTP {r.status_code})")
-    return data
-
-
-def place_dhan(o, variety="NORMAL", ordertype=None, trigger=None, side=None, qty=None):
-    """Dhan."""
-    ot = ordertype or o["order_type"]
-    body = {"dhanClientId": DHAN["client_id"], "correlationId": "DB" + secrets.token_hex(8),
-            "transactionType": side or o["side"], "exchangeSegment": o["exchange"],
-            "productType": DHAN_PRODUCT[o["product"]], "orderType": DHAN_ORDER_TYPE[ot], "validity": "DAY",
-            "securityId": str(o["token"]), "quantity": int(qty or o["qty"]), "disclosedQuantity": "",
-            "price": float(o["price"]) if ot == "LIMIT" else "",
-            "triggerPrice": float(trigger) if trigger is not None else "", "afterMarketOrder": False}
-    res = dhan_request("POST", "/orders", body)
-    oid = str((res or {}).get("orderId") or "")
-    if not oid:
-        raise RuntimeError("Dhan did not return an order id.")
-    if str(res.get("orderStatus", "")).upper() == "REJECTED":
-        raise OrderRejected("Dhan rejected the order.")
-    return oid
-
-
-def place_order(o, **kw):
-    return (place_dhan if o.get("broker") == "dhan" else place_live)(o, **kw)
 
 
 def new_record(o, oid, status, variety="NORMAL", is_exit=False, note=""):
     n = ist_now()
-    rec = {"id": oid, "t": time.time(), "date": n.strftime("%Y-%m-%d"), "time": n.strftime("%H:%M:%S"), "mode": MODE,
-           "kind": o["kind"], "symbol": o["symbol"], "label": o["label"], "tradingsymbol": o["tradingsymbol"],
+    rec = {"id": oid, "t": time.time(), "date": n.strftime("%Y-%m-%d"), "time": n.strftime("%H:%M:%S"), "mode": o["mode"],
+           "user": o["user"], "kind": o["kind"], "symbol": o["symbol"], "label": o["label"], "tradingsymbol": o["tradingsymbol"],
            "token": o["token"], "exchange": o["exchange"], "side": o["side"], "qty": o["qty"], "order_type": o["order_type"],
            "price": o["price"], "product": o["product"], "status": status, "avg_price": None, "sl": o.get("sl"),
-           "sl_order_id": None, "risk": o.get("risk"), "variety": variety, "broker": o.get("broker", "paper"), "is_exit": is_exit, "key": o.get("key"), "note": note}
+           "sl_order_id": None, "risk": o.get("risk"), "variety": variety, "broker": o.get("broker", "paper"),
+           "is_exit": is_exit, "key": o.get("key"), "note": note}
     with ORDER_LOCK:
         ORDERS.append(rec)
     append_log(rec)
@@ -1025,94 +1179,127 @@ def paper_id():
 
 
 def public(o):
-    return {k: v for k, v in o.items() if k not in ("token", "key", "t")}
+    return {k: v for k, v in o.items() if k not in ("token", "key", "t", "user")}
 
 
-def pin_error(pin):
-    """Live orders need the order PIN. Five wrong tries lock it for five minutes."""
-    if MODE != "live":
+def pin_error(u, pin, live):
+    """Live orders need the person's order PIN. Five wrong tries lock it for five minutes."""
+    if not live:
         return None
-    if time.time() < PIN_STATE["until"]:
-        return f"Too many wrong PINs. Try again in {int((PIN_STATE['until'] - time.time()) / 60) + 1} minutes."
-    if ORDER_PIN and secrets.compare_digest(str(pin or ""), ORDER_PIN):
-        PIN_STATE["fails"] = 0
+    if not u["pin_hash"]:
+        return "Set your order PIN under Account first."
+    st = PIN_STATE.setdefault(u["id"], {"fails": 0, "until": 0.0})
+    if time.time() < st["until"]:
+        return f"Too many wrong PINs. Try again in {int((st['until'] - time.time()) / 60) + 1} minutes."
+    if check_secret(str(pin or ""), u["pin_hash"]):
+        st["fails"] = 0
         return None
-    PIN_STATE["fails"] += 1
-    if PIN_STATE["fails"] >= 5:
-        PIN_STATE.update(fails=0, until=time.time() + 300)
+    st["fails"] += 1
+    if st["fails"] >= 5:
+        st.update(fails=0, until=time.time() + 300)
     return "Wrong order PIN."
 
 
-def angel_book():
-    out = {}
-    for x in (broker.read("orderBook") or {}).get("data") or []:
-        st = str(x.get("orderstatus") or "").lower()
-        out[str(x.get("orderid"))] = {"status": st, "avg_price": _num(x.get("averageprice")), "filled": _num(x.get("filledshares")),
-                                      "note": str(x.get("text") or "") if st == "rejected" else ""}
-    return out
-
-
-def dhan_book():
-    res = dhan_request("GET", "/orders")
-    out = {}
-    for x in res if isinstance(res, list) else []:
-        raw = str(x.get("orderStatus", "")).upper()
-        st = DHAN_STATUS.get(raw, raw.lower())
-        out[str(x.get("orderId"))] = {"status": st, "avg_price": _num(x.get("averageTradedPrice")), "filled": _num(x.get("filledQty")),
-                                      "note": str(x.get("omsErrorDescription") or "") if st == "rejected" else ""}
-    return out
-
-
-def sync_status():
-    """Copy order statuses from each broker's order book (at most every 5 seconds)."""
-    if MODE != "live" or time.time() - SYNC["t"] < 5:
-        return
-    SYNC["t"] = time.time()
+def find_order(oid, uid):
     with ORDER_LOCK:
-        used = {o.get("broker") for o in ORDERS if o["mode"] == "live"}
-    books = {}
-    for b in used:
+        return next((o for o in ORDERS if str(o["id"]) == str(oid) and o.get("user") == uid), None)
+
+
+def sync_status(u):
+    """Copy this person's order statuses from their brokers' order books (at most every 5 seconds)."""
+    if time.time() - SYNC.get(u["id"], 0) < 5:
+        return
+    SYNC[u["id"]] = time.time()
+    with ORDER_LOCK:
+        mine = [o for o in ORDERS if o.get("user") == u["id"] and o["mode"] == "live"]
+    for b in {o["broker"] for o in mine}:
         try:
-            books[b] = angel_book() if b == "angel" else dhan_book() if b == "dhan" else {}
+            book = get_account(u["id"], b).book()
         except Exception:
             continue
-    with ORDER_LOCK:
-        for o in ORDERS:
-            info = books.get(o.get("broker"), {}).get(str(o["id"]))
-            if not info:
-                continue
-            if info["status"]:
-                o["status"] = info["status"]
-            if info["avg_price"]:
-                o["avg_price"] = info["avg_price"]
-            o["filled"] = info["filled"]
-            if info["note"]:
-                o["note"] = info["note"]
+        with ORDER_LOCK:
+            for o in mine:
+                info = book.get(str(o["id"])) if o["broker"] == b else None
+                if not info:
+                    continue
+                if info["status"]:
+                    o["status"] = info["status"]
+                if info["avg_price"]:
+                    o["avg_price"] = info["avg_price"]
+                o["filled"] = info["filled"]
+                if info["note"]:
+                    o["note"] = info["note"]
 
 
 # ── Web app ──
 app = FastAPI(title="Signal dashboard")
 
 
+PUBLIC_PATHS = {"/login", "/api/login"}
+
+
 @app.middleware("http")
-async def basic_auth(request: Request, call_next):
-    if PASSWORD:
-        ok = False
-        h = request.headers.get("authorization", "")
-        if h.startswith("Basic "):
-            try:
-                _, _, pw = base64.b64decode(h[6:]).decode().partition(":")
-                ok = secrets.compare_digest(pw, PASSWORD)
-            except Exception:
-                ok = False
-        if not ok:
-            return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Signal board"'})
+async def auth_mw(request: Request, call_next):
+    path = request.url.path
+    request.state.user = session_user(request)
+    if path in PUBLIC_PATHS:
+        return await call_next(request)
+    u = request.state.user
+    if not u:
+        if path.startswith("/api/"):
+            return JSONResponse({"error": "Please sign in."}, status_code=401)
+        return RedirectResponse("/login")
+    if request.method in ("POST", "PUT", "PATCH", "DELETE") and not hmac.compare_digest(request.headers.get("x-csrf-token", ""), u["csrf"] or ""):
+        return JSONResponse({"error": "Your session is out of date. Reload the page."}, status_code=403)
     return await call_next(request)
 
 
 @app.on_event("startup")
 def start_worker():
+    init_db()
     threading.Thread(target=refresh, args=(DEFAULT_INTERVAL,), daemon=True).start()
+
+
+@app.post("/api/login")
+def api_login(request: Request, payload: dict = Body(...)):
+    name = str(payload.get("username", "")).strip()
+    pw = str(payload.get("password", ""))
+    key = (name.lower(), request.client.host if request.client else "?")
+    st = LOGIN_FAILS.get(key, {"n": 0, "until": 0.0})
+    if time.time() < st["until"]:
+        return JSONResponse({"error": "Too many attempts. Try again in a few minutes."}, status_code=429)
+    rows = q("SELECT * FROM users WHERE username=?", (name,))
+    ok = bool(rows) and bool(rows[0]["active"]) and check_secret(pw, rows[0]["pw_hash"])
+    if not rows:
+        check_secret(pw, DUMMY_HASH)  # same work whether or not the name exists
+    if not ok:
+        st["n"] += 1
+        if st["n"] >= 5:
+            st = {"n": 0, "until": time.time() + 300}
+        LOGIN_FAILS[key] = st
+        return JSONResponse({"error": "Wrong username or password."}, status_code=401)
+    LOGIN_FAILS.pop(key, None)
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie("sid", new_session(rows[0]["id"]), httponly=True, samesite="lax", path="/",
+                    secure=COOKIE_SECURE or request.url.scheme == "https", max_age=int(SESSION_HOURS * 3600))
+    return resp
+
+
+@app.post("/api/logout")
+def api_logout(request: Request):
+    tok = request.cookies.get("sid")
+    if tok:
+        x("DELETE FROM sessions WHERE token_hash=?", (sha(tok),))
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("sid", path="/")
+    return resp
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    if request.state.user:
+        return RedirectResponse("/")
+    return LOGIN_PAGE
 
 
 @app.get("/api/signals")
@@ -1170,7 +1357,7 @@ def api_chain(symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
 
 @app.get("/api/futures/info")
 def api_fut_info():
-    mn = master_name(DEFAULT_BROKER if MODE == "live" else "paper")
+    mn = master_name("paper")
     ok = load_master(mn)
     out = {}
     for name in UNIVERSE:
@@ -1181,27 +1368,31 @@ def api_fut_info():
 
 
 @app.get("/api/trading")
-def api_trading():
-    return {"mode": MODE, "note": MODE_NOTE, "market_open": market_open_now(),
-            "brokers": LIVE_BROKERS if MODE == "live" else [], "default_broker": DEFAULT_BROKER, "broker_names": BROKER_NAMES,
-            "caps": {"max_value": MAX_ORDER_VALUE, "max_qty": MAX_QTY, "max_orders": MAX_ORDERS_PER_DAY,
-                     "max_fut_lots": MAX_FUT_LOTS, "max_fut_value": MAX_FUT_VALUE}}
+def api_trading(request: Request):
+    u = request.state.user
+    mode, note = user_mode(u)
+    c = u["caps"]
+    return {"mode": mode, "note": note, "market_open": market_open_now(),
+            "brokers": u["brokers"] if mode == "live" else [], "default_broker": u["default_broker"], "broker_names": BROKER_NAMES,
+            "caps": {"max_value": c["max_order_value"], "max_qty": c["max_qty"], "max_orders": c["max_orders"],
+                     "max_fut_lots": c["max_fut_lots"], "max_fut_value": c["max_fut_value"]}}
 
 
 @app.get("/api/trading/check")
-def api_trading_check(which: str = ""):
+def api_trading_check(request: Request, which: str = ""):
     """Read-only test of the broker connection and the instrument list. Places no order."""
-    if MODE != "live":
-        return {"ok": False, "message": "Paper mode: no broker is connected. " + MODE_NOTE}
-    b = which if which in LIVE_BROKERS else DEFAULT_BROKER
+    u = request.state.user
+    if not u["brokers"]:
+        return {"ok": False, "message": "No broker details saved yet. Add them under Account."}
+    b = which if which in u["brokers"] else u["default_broker"]
     name = BROKER_NAMES[b]
     try:
-        angel_book() if b == "angel" else dhan_book()
+        get_account(u["id"], b).book()
     except Exception as e:
         return {"ok": False, "broker": name, "message": f"Could not connect to {name}: {str(e)[:200]}"}
     loaded = load_master(b)
     m = M(b)
-    miss = [x for x in SYMBOLS if x not in m["eq"]]
+    miss = [t for t in SYMBOLS if t not in m["eq"]]
     msg = (f"Connected to {name}. Instrument list: {len(SYMBOLS) - len(miss)} of {len(SYMBOLS)} stocks, "
            f"{len(m['fut'])} futures symbols, {len(m['opt'])} option contracts.")
     if not loaded or not m["eq"]:
@@ -1212,8 +1403,9 @@ def api_trading_check(which: str = ""):
 
 
 @app.post("/api/orders/preview")
-def api_preview(payload: dict = Body(...)):
-    order, err, warnings, lines = make_order(payload)
+def api_preview(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    order, err, warnings, lines = make_order(payload, u)
     if err:
         return {"error": err}
     token = secrets.token_urlsafe(16)
@@ -1221,32 +1413,36 @@ def api_preview(payload: dict = Body(...)):
     with ORDER_LOCK:
         for k in [k for k, v in PENDING.items() if v["exp"] < now]:
             PENDING.pop(k, None)
-        PENDING[token] = {"order": order, "exp": now + 90}
-    return {"token": token, "lines": lines, "warnings": warnings, "mode": MODE}
+        PENDING[token] = {"order": order, "exp": now + 90, "user": u["id"]}
+    return {"token": token, "lines": lines, "warnings": warnings, "mode": order["mode"]}
 
 
 @app.post("/api/orders/confirm")
-def api_confirm(payload: dict = Body(...)):
+def api_confirm(request: Request, payload: dict = Body(...)):
+    u = request.state.user
     token = str(payload.get("token", ""))
     with ORDER_LOCK:
         item = PENDING.get(token)
-    if not item or item["exp"] < time.time():
+    if not item or item["exp"] < time.time() or item["user"] != u["id"]:
         return {"error": "This review expired or was already used. Review the order again."}
     if str(payload.get("confirm", "")).strip().upper() != "YES":
         return {"error": "Type YES to confirm."}
-    err = pin_error(payload.get("pin"))
+    live = item["order"]["mode"] == "live"
+    err = pin_error(u, payload.get("pin"), live)
     if err:
         return {"error": err}
-    if MODE == "live" and not market_open_now():
+    if live and user_mode(u)[0] != "live":
+        return {"error": "Live trading is no longer enabled for your account."}
+    if live and not market_open_now():
         return {"error": "The market is closed."}
-    if count_today() >= MAX_ORDERS_PER_DAY:
-        return {"error": f"Daily limit of {MAX_ORDERS_PER_DAY} orders reached."}
+    if count_today(u["id"], item["order"]["mode"]) >= u["caps"]["max_orders"]:
+        return {"error": f"Daily limit of {u['caps']['max_orders']} orders reached."}
     with ORDER_LOCK:
         item = PENDING.pop(token, None)  # single use: a double click cannot send two orders
     if not item:
         return {"error": "This review was already used. Check the Orders tab."}
     o = item["order"]
-    if MODE == "paper":
+    if not live:
         status = "complete" if o["order_type"] == "MARKET" else "open"
         rec = new_record(o, paper_id(), status)
         if status == "complete":
@@ -1254,7 +1450,7 @@ def api_confirm(payload: dict = Body(...)):
         return {"ok": True, "order": public(rec)}
     bname = BROKER_NAMES.get(o.get("broker"), "broker")
     try:
-        oid = place_order(o)
+        oid = get_account(u["id"], o["broker"]).place(o)
     except OrderRejected as e:
         return {"error": f"{bname} rejected the order: {e}"}
     except Exception as e:
@@ -1265,31 +1461,26 @@ def api_confirm(payload: dict = Body(...)):
 
 
 @app.get("/api/orders")
-def api_orders():
-    sync_status()
+def api_orders(request: Request):
+    u = request.state.user
+    sync_status(u)
     with ORDER_LOCK:
-        return {"mode": MODE, "orders": [public(o) for o in reversed(ORDERS)]}
-
-
-def find_order(oid):
-    with ORDER_LOCK:
-        return next((o for o in ORDERS if str(o["id"]) == str(oid)), None)
+        mine = [public(o) for o in reversed(ORDERS) if o.get("user") == u["id"]]
+    return {"mode": user_mode(u)[0], "orders": mine}
 
 
 @app.post("/api/orders/cancel")
-def api_cancel(payload: dict = Body(...)):
-    o = find_order(payload.get("order_id"))
+def api_cancel(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    o = find_order(payload.get("order_id"), u["id"])
     if not o:
         return {"error": "Order not found."}
-    err = pin_error(payload.get("pin"))
+    err = pin_error(u, payload.get("pin"), o["mode"] == "live")
     if err:
         return {"error": err}
     if o["mode"] == "live":
         try:
-            if o.get("broker") == "dhan":
-                dhan_request("DELETE", f"/orders/{o['id']}")
-            else:
-                broker.write(("cancelOrder",), o["id"], o.get("variety", "NORMAL"))
+            get_account(u["id"], o["broker"]).cancel(o)
         except Exception as e:
             return {"error": f"The broker did not confirm the cancel ({e}). Check your {BROKER_NAMES.get(o.get('broker'), 'broker')} app."}
     o["status"] = "cancelled"
@@ -1298,22 +1489,22 @@ def api_cancel(payload: dict = Body(...)):
 
 
 @app.post("/api/orders/protect")
-def api_protect(payload: dict = Body(...)):
+def api_protect(request: Request, payload: dict = Body(...)):
     """Place the stop-loss as a stop-market order, only after the entry order is complete."""
-    if MODE == "live":
-        sync_status()
-    o = find_order(payload.get("order_id"))
+    u = request.state.user
+    o = find_order(payload.get("order_id"), u["id"])
+    if o and o["mode"] == "live":
+        sync_status(u)
     if not o or o.get("is_exit") or o["kind"] not in ("equity", "future"):
         return {"error": "A stop-loss can only be added to a stock or futures entry order."}
-    if o["mode"] != MODE:
-        return {"error": "This order was placed in a different mode."}
     if not (o.get("risk") if o["kind"] == "future" else o.get("sl")):
         return {"error": "This order has no stop-loss level from a signal."}
     if o.get("sl_order_id"):
         return {"error": "A stop-loss was already placed for this order."}
     if o["status"] != "complete":
         return {"error": "The entry order is not filled yet. Place the stop-loss after it shows complete."}
-    err = pin_error(payload.get("pin"))
+    live = o["mode"] == "live"
+    err = pin_error(u, payload.get("pin"), live)
     if err:
         return {"error": err}
     qty = int(o.get("filled") or o["qty"])
@@ -1329,11 +1520,11 @@ def api_protect(payload: dict = Body(...)):
         if fill and ((o["side"] == "BUY" and sl >= fill) or (o["side"] == "SELL" and sl <= fill)):
             return {"error": "The stop-loss level is on the wrong side of the entry price, so it was not placed."}
     exit_o = {**o, "side": exit_side, "qty": qty, "order_type": "STOPLOSS_MARKET", "price": 0.0, "key": None, "sl": sl}
-    if MODE == "paper":
+    if not live:
         rec = new_record(exit_o, paper_id(), "open", variety="STOPLOSS", is_exit=True, note=f"Trigger {sl:.2f}")
     else:
         try:
-            oid = place_order(o, variety="STOPLOSS", ordertype="STOPLOSS_MARKET", trigger=sl, side=exit_side, qty=qty)
+            oid = get_account(u["id"], o["broker"]).place(o, variety="STOPLOSS", ordertype="STOPLOSS_MARKET", trigger=sl, side=exit_side, qty=qty)
         except Exception as e:
             return {"error": f"The broker did not confirm the stop-loss ({e}). Check your {BROKER_NAMES.get(o.get('broker'), 'broker')} app."}
         rec = new_record(exit_o, oid, "open", variety="STOPLOSS", is_exit=True, note=f"Trigger {sl:.2f}")
@@ -1342,9 +1533,215 @@ def api_protect(payload: dict = Body(...)):
     return {"ok": True, "order": public(rec)}
 
 
+# ── your account ──
+@app.get("/api/me")
+def api_me(request: Request):
+    u = request.state.user
+    mode, note = user_mode(u)
+    hints = {r["broker"]: r["hint"] for r in q("SELECT broker, hint FROM creds WHERE user_id=?", (u["id"],))}
+    return {"user": public_user(u), "csrf": u["csrf"], "mode": mode, "note": note, "hints": hints,
+            "broker_fields": BROKER_FIELDS, "broker_names": BROKER_NAMES}
+
+
+@app.post("/api/account/password")
+def api_password(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    row = q("SELECT pw_hash FROM users WHERE id=?", (u["id"],))[0]
+    if not check_secret(str(payload.get("current", "")), row["pw_hash"]):
+        return {"error": "Your current password is wrong."}
+    new = str(payload.get("new", ""))
+    if len(new) < 10:
+        return {"error": "Use at least 10 characters."}
+    x("UPDATE users SET pw_hash=? WHERE id=?", (hash_secret(new), u["id"]))
+    x("DELETE FROM sessions WHERE user_id=? AND token_hash!=?", (u["id"], sha(request.cookies.get("sid", ""))))
+    return {"ok": True}
+
+
+@app.post("/api/account/pin")
+def api_pin(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    row = q("SELECT pw_hash FROM users WHERE id=?", (u["id"],))[0]
+    if not check_secret(str(payload.get("password", "")), row["pw_hash"]):
+        return {"error": "Your account password is wrong."}
+    pin = str(payload.get("new_pin", ""))
+    if not 4 <= len(pin) <= 32:
+        return {"error": "The order PIN needs 4 to 32 characters."}
+    x("UPDATE users SET pin_hash=? WHERE id=?", (hash_secret(pin), u["id"]))
+    PIN_STATE.pop(u["id"], None)
+    return {"ok": True}
+
+
+@app.put("/api/account/broker")
+def api_broker_save(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    b = str(payload.get("broker", ""))
+    fields = payload.get("fields") or {}
+    if b not in BROKER_FIELDS:
+        return {"error": "Unknown broker."}
+    clean = {}
+    for key, label in BROKER_FIELDS[b]:
+        v = str(fields.get(key, "")).strip()
+        if not v or len(v) > 300:
+            return {"error": f"{label} is required."}
+        clean[key] = v
+    try:
+        save_creds(u["id"], b, clean)
+    except ImportError:
+        return {"error": "The 'cryptography' package is missing on the server. Run: pip install cryptography"}
+    return {"ok": True}
+
+
+@app.delete("/api/account/broker/{b}")
+def api_broker_delete(request: Request, b: str):
+    if b in BROKER_FIELDS:
+        delete_creds(request.state.user["id"], b)
+    return {"ok": True}
+
+
+# ── admin ──
+def need_admin(request):
+    return None if request.state.user["role"] == "admin" else JSONResponse({"error": "Admins only."}, status_code=403)
+
+
+CAP_TYPES = {"max_order_value": float, "max_qty": int, "max_orders": int, "max_fut_lots": int, "max_fut_value": float,
+             "allow_option_selling": bool}
+
+
+def active_admins():
+    return q("SELECT COUNT(*) AS c FROM users WHERE role='admin' AND active=1")[0]["c"]
+
+
+@app.get("/api/admin/users")
+def api_admin_users(request: Request):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    out = []
+    for r in q("SELECT * FROM users ORDER BY id"):
+        r["csrf"] = None
+        u = build_user(r)
+        out.append({**public_user(u), "created": r["created"]})
+    return {"users": out}
+
+
+@app.post("/api/admin/users")
+def api_admin_create(request: Request, payload: dict = Body(...)):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    name = str(payload.get("username", "")).strip()
+    pw = str(payload.get("password", ""))
+    role = payload.get("role", "user")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", name):
+        return {"error": "Username: 3 to 32 letters, digits, dots, dashes or underscores."}
+    if len(pw) < 10:
+        return {"error": "The temporary password needs at least 10 characters."}
+    if role not in ("user", "admin"):
+        return {"error": "Role must be user or admin."}
+    if q("SELECT 1 FROM users WHERE username=?", (name,)):
+        return {"error": "That username is taken."}
+    x("INSERT INTO users(username, pw_hash, role, active, live_allowed, created) VALUES(?,?,?,?,?,?)",
+      (name, hash_secret(pw), role, 1, 0, ist_now().isoformat()))
+    return {"ok": True}
+
+
+@app.patch("/api/admin/users/{uid}")
+def api_admin_update(request: Request, uid: int, payload: dict = Body(...)):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    me_ = request.state.user
+    rows = q("SELECT * FROM users WHERE id=?", (uid,))
+    if not rows:
+        return {"error": "User not found."}
+    t = rows[0]
+    if "active" in payload or "role" in payload:
+        new_active = bool(payload.get("active", t["active"]))
+        new_role = payload.get("role", t["role"])
+        if new_role not in ("user", "admin"):
+            return {"error": "Role must be user or admin."}
+        if uid == me_["id"] and (not new_active or new_role != "admin"):
+            return {"error": "You cannot remove your own admin access."}
+        if t["role"] == "admin" and t["active"] and (not new_active or new_role != "admin") and active_admins() <= 1:
+            return {"error": "There must be at least one active admin."}
+        x("UPDATE users SET active=?, role=? WHERE id=?", (int(new_active), new_role, uid))
+        if not new_active:
+            x("DELETE FROM sessions WHERE user_id=?", (uid,))
+    if "live_allowed" in payload:
+        x("UPDATE users SET live_allowed=? WHERE id=?", (int(bool(payload["live_allowed"])), uid))
+    if "password" in payload:
+        pw = str(payload["password"])
+        if len(pw) < 10:
+            return {"error": "The password needs at least 10 characters."}
+        x("UPDATE users SET pw_hash=? WHERE id=?", (hash_secret(pw), uid))
+        x("DELETE FROM sessions WHERE user_id=?", (uid,))
+    if "caps" in payload:
+        caps = {}
+        try:
+            for k, v in (payload["caps"] or {}).items():
+                if k in CAP_TYPES:
+                    caps[k] = bool(v) if CAP_TYPES[k] is bool else CAP_TYPES[k](v)
+                    if CAP_TYPES[k] is not bool and caps[k] < 0:
+                        raise ValueError
+        except (TypeError, ValueError):
+            return {"error": "Limits must be positive numbers."}
+        x("UPDATE users SET caps=? WHERE id=?", (json.dumps(caps), uid))
+    return {"ok": True}
+
+
+@app.delete("/api/admin/users/{uid}")
+def api_admin_delete(request: Request, uid: int):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    if uid == request.state.user["id"]:
+        return {"error": "You cannot delete your own account."}
+    rows = q("SELECT role, active FROM users WHERE id=?", (uid,))
+    if not rows:
+        return {"error": "User not found."}
+    if rows[0]["role"] == "admin" and rows[0]["active"] and active_admins() <= 1:
+        return {"error": "There must be at least one active admin."}
+    for t in ("sessions", "creds"):
+        x(f"DELETE FROM {t} WHERE user_id=?", (uid,))
+    x("DELETE FROM users WHERE id=?", (uid,))
+    for k in [k for k in ACCOUNTS if k[0] == uid]:
+        ACCOUNTS.pop(k, None)
+    return {"ok": True}
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return PAGE
+
+
+LOGIN_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in</title>
+<style>
+:root{--bg:#eef1f4;--panel:#fff;--ink:#16202a;--mute:#6a7783;--line:#d9dfe5;--sell:#b3261e}
+@media(prefers-color-scheme:dark){:root{--bg:#12181e;--panel:#1a222a;--ink:#e6ebf0;--mute:#8a98a6;--line:#2a343e;--sell:#ff8a80}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif}
+form{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:26px;width:min(360px,92vw)}
+h1{margin:0 0 4px;font-size:24px}p{margin:0 0 16px;color:var(--mute);font-size:14px}
+label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute);margin-bottom:12px}
+input{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+button{width:100%;font:inherit;font-weight:500;background:var(--ink);color:var(--bg);border:0;border-radius:8px;padding:10px;cursor:pointer}
+button:disabled{opacity:.5}
+#msg{min-height:20px;margin:10px 0 0;color:var(--sell);font-size:14px}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+</style></head><body>
+<form id="f"><h1>Signal board</h1><p>Sign in to continue.</p>
+<label>Username<input id="u" autocomplete="username" required autofocus></label>
+<label>Password<input id="p" type="password" autocomplete="current-password" required></label>
+<button id="go">Sign in</button><div id="msg" role="alert"></div></form>
+<script>
+document.getElementById("f").onsubmit=async e=>{e.preventDefault();const b=document.getElementById("go"),m=document.getElementById("msg");b.disabled=true;m.textContent="";
+ try{const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:document.getElementById("u").value,password:document.getElementById("p").value})});
+  const d=await r.json();if(r.ok){location.href="/"}else{m.textContent=d.error||"Could not sign in."}}
+ catch(x){m.textContent="Cannot reach the server."}finally{b.disabled=false}};
+</script></body></html>
+"""
 
 
 PAGE = r"""<!doctype html>
@@ -1441,14 +1838,23 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .btn.go{background:var(--buy);color:#fff}
 #ordTable{min-width:760px}#ordTable th,#ordTable td{text-align:left}
 .tag{font-size:11px;color:var(--mute);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-left:6px;font-weight:400}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:14px}
+.card h3{margin:0 0 8px;font-size:17px}.card h4{margin:0 0 8px;font-size:15px}
+.card label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute);margin-bottom:8px}
+.card input,.card select{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 9px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.bcard{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}
+#usrTable{min-width:820px}#usrTable th,#usrTable td{text-align:left}
+#who{font-size:13px}
+@media(max-width:640px){.grid2{grid-template-columns:1fr}}
 @media(max-width:640px){.tally{grid-template-columns:repeat(2,1fr)}}
 </style></head><body><main>
 <header>
  <div><h1>Signal board</h1><div class="sub" id="meta">Loading first scan…</div></div>
- <div class="ctl"><div class="seg" id="tfs" role="group" aria-label="Timeframe"></div><button class="btn" id="refresh">Refresh now</button></div>
+ <div class="ctl"><div class="seg" id="tfs" role="group" aria-label="Timeframe"></div><button class="btn" id="refresh">Refresh now</button><span class="sub" id="who"></span><button class="mini" id="logout">Sign out</button></div>
 </header>
 <div class="banner paper" id="banner"></div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="orders">Orders</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="tally" id="tally"></div>
 <div class="bar"><input id="q" placeholder="Search symbol" aria-label="Search symbol"></div>
@@ -1471,7 +1877,44 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <div class="wrap"><table id="ordTable"></table></div>
 <div style="margin-top:12px"><button class="mini" id="chk">Check broker connection</button> <span class="sub" id="chkMsg"></span></div>
 </section>
+<section id="view-account" hidden>
+ <div class="card"><h3>Your account</h3><div class="sub" id="acctInfo"></div></div>
+ <div class="grid2">
+  <div class="card"><h3>Change password</h3>
+   <label>Current password<input id="pwCur" type="password" autocomplete="current-password"></label>
+   <label>New password (at least 10 characters)<input id="pwNew" type="password" autocomplete="new-password"></label>
+   <div class="tkbtns"><span class="sub" id="pwMsg"></span><button class="btn" id="pwBtn">Change password</button></div></div>
+  <div class="card"><h3>Order PIN</h3>
+   <div class="sub" style="margin-bottom:8px">Asked before every live order, and when you cancel one. It is separate from your password.</div>
+   <label>Your account password<input id="pinPw" type="password" autocomplete="current-password"></label>
+   <label>New order PIN<input id="pinNew" type="password" autocomplete="off"></label>
+   <div class="tkbtns"><span class="sub" id="pinMsg"></span><button class="btn" id="pinBtn">Save PIN</button></div></div>
+ </div>
+ <div class="card"><h3>Broker accounts</h3>
+  <div class="note" style="margin:0 0 6px">Your broker details are stored encrypted on this server and are never shown again. Brokers accept API orders only from a static IP registered to your own client account, so register this server's IP with your broker. Sharing one IP between different clients is restricted: check your broker's rules.</div>
+  <div id="brokerCards"></div></div>
+</section>
+<section id="view-admin" hidden>
+ <div class="card"><h3>Add a user</h3>
+  <div class="grid2" style="margin-bottom:0"><label>Username<input id="nuName" autocomplete="off"></label><label>Temporary password (at least 10 characters)<input id="nuPw" type="password" autocomplete="new-password"></label></div>
+  <div class="tkbtns"><select id="nuRole" aria-label="Role"><option value="user">User</option><option value="admin">Admin</option></select><button class="btn" id="addUser">Add user</button></div></div>
+ <div class="wrap"><table id="usrTable"></table></div>
+ <div class="note" id="admNote">Live trading is off for every new user until you enable it here, and it also needs LIVE_TRADING=1 on the server. Brokers allow one static IP per client, and sharing it is limited to family members. A platform that trades for unrelated clients has to be an exchange-empanelled algo provider. Enable live trading only where that is allowed, and check with your brokers.</div>
+</section>
 </main>
+<dialog id="limDlg"><div class="tk">
+ <h2 id="limTitle">Limits</h2>
+ <div class="tkgrid">
+  <label>Most rupees per stock order or option buy<input id="limValue" type="number" min="0" step="1000"></label>
+  <label>Most shares per order<input id="limQty" type="number" min="0" step="1"></label>
+  <label>Most orders per day<input id="limOrders" type="number" min="0" step="1"></label>
+  <label>Most lots per futures order or option sell<input id="limLots" type="number" min="0" step="1"></label>
+  <label>Most rupees per futures order or option sell (notional)<input id="limFut" type="number" min="0" step="10000"></label>
+  <label>Allow selling options<select id="limSell"><option value="1">Yes</option><option value="0">No</option></select></label>
+ </div>
+ <div class="tkmsg" id="limMsg" role="status"></div>
+ <div class="tkbtns"><button class="btn ghost" id="limClose">Close</button><button class="btn" id="limSave">Save</button></div>
+</div></dialog>
 <dialog id="ticket" aria-labelledby="tkTitle"><div class="tk">
  <h2 id="tkTitle">Order ticket</h2>
  <div class="sub" id="tkMode"></div>
@@ -1493,6 +1936,8 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
  <div class="tkbtns"><button class="btn ghost" id="tkClose">Close</button><button class="btn" id="tkReviewBtn">Review order</button><button class="btn go" id="tkPlace" hidden>Place order</button></div>
 </div></dialog>
 <script>
+let csrf="",me=null;
+const api=async(u,o={})=>{o.credentials="same-origin";o.headers={...(o.headers||{}),"X-CSRF-Token":csrf};const r=await fetch(u,o);if(r.status===401){location.href="/login";throw new Error("signed out")}return r};
 const colsStocks=[["symbol","Symbol"],["signal","Signal"],["close","Close"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"],["_t",""]];
 const colsFut=[["symbol","Symbol"],["signal","Signal"],["close","Spot"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["status","Status"],["signal_time","Signal candle"],["lot","Lot"],["fexp","Expiry"],["_t",""]];
 let data=null,filter="ALL",sortKey="signal",sortDir=1,q="",timer=null,tf=null,futInfo={},futLoaded=false;
@@ -1504,17 +1949,17 @@ const curCols=()=>mode==="futures"?colsFut:colsStocks;
 function renderHead(){document.getElementById("head").innerHTML=curCols().map(c=>`<th data-k="${c[0]}">${c[1]}</th>`).join("")}
 document.getElementById("head").onclick=e=>{const k=e.target.dataset.k;if(!k||k==="_t")return;sortDir=sortKey===k?-sortDir:1;sortKey=k;render()};
 document.getElementById("q").oninput=e=>{q=e.target.value.trim().toUpperCase();render()};
-document.getElementById("refresh").onclick=async()=>{const b=document.getElementById("refresh");b.disabled=true;await fetch("/api/refresh?tf="+(tf||""),{method:"POST"});setTimeout(()=>{load();b.disabled=false},4000)};
+document.getElementById("refresh").onclick=async()=>{const b=document.getElementById("refresh");b.disabled=true;await api("/api/refresh?tf="+(tf||""),{method:"POST"});setTimeout(()=>{load();b.disabled=false},4000)};
 document.getElementById("tfs").onclick=e=>{const b=e.target.closest("button");if(!b||b.dataset.tf===tf)return;
  tf=b.dataset.tf;try{localStorage.setItem("tf",tf)}catch(x){}
  data=null;document.getElementById("body").innerHTML=`<tr><td colspan="14" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;
  document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(osym)loadChain()};
 async function load(){clearTimeout(timer);const asked=tf;
- try{const d=await (await fetch("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;render();
+ try{const d=await (await api("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;render();
   timer=setTimeout(load,(d.refreshing||!d.updated)?3000:20000)}
  catch(e){document.getElementById("meta").textContent="Cannot reach the server.";timer=setTimeout(load,10000)}}
 async function loadFutInfo(){if(futLoaded)return;futLoaded=true;
- try{const d=await (await fetch("/api/futures/info")).json();futInfo=d.info||{};if(!d.ok)futLoaded=false;render()}catch(e){futLoaded=false}}
+ try{const d=await (await api("/api/futures/info")).json();futInfo=d.info||{};if(!d.ok)futLoaded=false;render()}catch(e){futLoaded=false}}
 const isOpen=r=>r.signal.startsWith("Open");
 function cellFor(r,k){
  const tp=n=>`<td class="${r.hits>=n?"up":""}">${fmt(r["tp"+n])}${r.hits>=n?" ✓":""}</td>`;
@@ -1556,11 +2001,11 @@ const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"
 const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(a>=1e7?(a/1e7).toFixed(2)+" Cr":a>=1e5?(a/1e5).toFixed(2)+" L":a>=1e3?(a/1e3).toFixed(1)+" K":String(Math.round(a)))};
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
-function setMode(m){mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",options:"options",orders:"orders"};
- ["stocks","options","orders"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
+ const vm={stocks:"stocks",futures:"stocks",options:"options",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","options","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
- if(m==="orders")loadOrders();if(m==="options")renderChips();
+ if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="account")loadMe();if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
 function renderChips(){
@@ -1578,7 +2023,7 @@ async function loadChain(quiet){
  if(!quiet){document.getElementById("otable").innerHTML="";document.getElementById("osum").hidden=true;box.textContent=`Loading the ${osym} option chain…`}
  renderChips();
  try{const u=`/api/options/chain?symbol=${encodeURIComponent(osym)}&tf=${tf||""}`+(oexp?`&expiry=${encodeURIComponent(oexp)}`:"");
-  const d=await (await fetch(u)).json();if(my!==oreq)return;renderChain(d)}
+  const d=await (await api(u)).json();if(my!==oreq)return;renderChain(d)}
  catch(e){if(my===oreq)box.textContent="Cannot reach the server."}
 }
 function renderChain(d){
@@ -1610,10 +2055,10 @@ setInterval(()=>{if(mode==="options"&&osym)loadChain(true)},60000);
 // ── Orders and order ticket ──
 let tk=null,tkToken=null,tradeInfo={mode:"paper",caps:{}},lastChain=null;
 const $=id=>document.getElementById(id);
-const post=async(u,b)=>(await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json();
+const post=async(u,b)=>(await api(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json();
 const ltpBtn=(r,s)=>{const l=r[s.toLowerCase()].ltp;if(l==null)return "–";const d=`data-strike="${r.strike}" data-right="${s}" data-ltp="${l}"`;
  return `<span class="px">${f2(l)}</span><button class="ob b" ${d} data-side="BUY" title="Buy ${s}" aria-label="Buy ${r.strike} ${s}">B</button><button class="ob s" ${d} data-side="SELL" title="Sell ${s}" aria-label="Sell ${r.strike} ${s}">S</button>`};
-async function loadTrading(){try{tradeInfo=await (await fetch("/api/trading")).json();const b=$("banner");b.className="banner "+tradeInfo.mode;
+async function loadTrading(){try{tradeInfo=await (await api("/api/trading")).json();const b=$("banner");b.className="banner "+tradeInfo.mode;
  b.textContent=tradeInfo.mode==="live"?`LIVE trading is on. Orders go to your ${(tradeInfo.brokers||[]).map(x=>tradeInfo.broker_names[x]).join(" or ")} account. Limits: ₹${tradeInfo.caps.max_value.toLocaleString("en-IN")} per order and ${tradeInfo.caps.max_orders} orders a day. Futures: up to ${tradeInfo.caps.max_fut_lots} lot(s) and ₹${tradeInfo.caps.max_fut_value.toLocaleString("en-IN")} notional.`:tradeInfo.note}catch(e){}}
 function resetReview(){tkToken=null;$("tkReview").hidden=true;$("tkConfirm").hidden=true;$("tkPlace").hidden=true;$("tkReviewBtn").hidden=false;$("tkMsg").textContent=""}
 function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
@@ -1651,9 +2096,9 @@ $("body").onclick=e=>{const b=e.target.closest("[data-trade]");if(!b||!data)retu
 $("otable").onclick=e=>{const b=e.target.closest(".ob");if(!b||!lastChain)return;
  openTicket({kind:"option",symbol:lastChain.symbol,expiry:lastChain.expiry,strike:+b.dataset.strike,right:b.dataset.right,side:b.dataset.side,price:+b.dataset.ltp,label:`${lastChain.symbol} ${+b.dataset.strike} ${b.dataset.right} ${lastChain.expiry}`})};
 $("chk").onclick=async()=>{$("chkMsg").textContent="Checking…";const bs=(tradeInfo.brokers||[]).length?tradeInfo.brokers:[""];const out=[];
- try{for(const b of bs){out.push((await (await fetch("/api/trading/check?which="+b)).json()).message)}$("chkMsg").textContent=out.join(" ")}catch(e){$("chkMsg").textContent="Cannot reach the server."}};
+ try{for(const b of bs){out.push((await (await api("/api/trading/check?which="+b)).json()).message)}$("chkMsg").textContent=out.join(" ")}catch(e){$("chkMsg").textContent="Cannot reach the server."}};
 const cancelable=new Set(["open","trigger pending","open pending","validation pending","put order req received","modified","after market order req received"]);
-async function loadOrders(){try{renderOrders(await (await fetch("/api/orders")).json())}catch(e){}}
+async function loadOrders(){try{renderOrders(await (await api("/api/orders")).json())}catch(e){}}
 function renderOrders(d){const t=$("ordTable");
  if(!d.orders.length){t.innerHTML="";$("ordNote").textContent="No orders have been placed from this dashboard today.";return}
  $("ordNote").textContent=(d.mode==="live"?"Live orders, with status copied from Angel One.":"Paper orders, simulated.")+" A stop-loss can be placed once its entry order shows complete.";
@@ -1670,6 +2115,39 @@ $("ordTable").onclick=async e=>{const c=e.target.closest("[data-cancel]"),p=e.ta
  if(d.error)alert(d.error);loadOrders()};
 setInterval(()=>{if(mode==="orders")loadOrders()},10000);
 loadTrading();
+// ── Account and admin ──
+const send=async(m,u,b)=>(await api(u,{method:m,headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)})).json();
+async function loadMe(){const d=await (await api("/api/me")).json();me=d;csrf=d.csrf;
+ $("who").textContent=d.user.username+(d.user.role==="admin"?" (admin)":"");$("navAdmin").hidden=d.user.role!=="admin";renderAccount(d)}
+function renderAccount(d){
+ $("acctInfo").textContent=d.mode==="live"?"Live trading is enabled for your account.":d.note;
+ $("brokerCards").innerHTML=Object.keys(d.broker_fields).map(b=>{const f=d.broker_fields[b],hint=d.hints[b];
+  return `<div class="bcard" data-b="${b}"><h4>${esc(d.broker_names[b])} <span class="tag">${hint?"Saved "+esc(hint):"Not set up"}</span></h4><div class="tkgrid">${f.map(x=>`<label>${esc(x[1])}<input data-f="${x[0]}" type="${x[0]==="client_id"?"text":"password"}" autocomplete="off" placeholder="${hint?"Enter again to replace":""}"></label>`).join("")}</div><div class="tkbtns"><span class="sub" data-msg></span>${hint?'<button class="mini" data-rm>Remove</button>':""}<button class="btn" data-save>Save</button></div></div>`}).join("")}
+$("brokerCards").onclick=async e=>{const card=e.target.closest(".bcard");if(!card)return;const b=card.dataset.b,msg=card.querySelector("[data-msg]");
+ if(e.target.closest("[data-save]")){const fields={};card.querySelectorAll("[data-f]").forEach(i=>fields[i.dataset.f]=i.value);
+  const d=await send("PUT","/api/account/broker",{broker:b,fields});if(d.error){msg.textContent=d.error;return}await loadMe();loadTrading()}
+ if(e.target.closest("[data-rm]")){if(!confirm("Remove these broker details?"))return;await send("DELETE","/api/account/broker/"+b);await loadMe();loadTrading()}};
+$("pwBtn").onclick=async()=>{const d=await send("POST","/api/account/password",{current:$("pwCur").value,new:$("pwNew").value});$("pwMsg").textContent=d.error||"Password changed.";if(!d.error){$("pwCur").value="";$("pwNew").value=""}};
+$("pinBtn").onclick=async()=>{const d=await send("POST","/api/account/pin",{password:$("pinPw").value,new_pin:$("pinNew").value});$("pinMsg").textContent=d.error||"Order PIN saved.";if(!d.error){$("pinPw").value="";$("pinNew").value="";await loadMe();loadTrading()}};
+$("logout").onclick=async()=>{try{await send("POST","/api/logout",{})}catch(e){}location.href="/login"};
+let users=[],limUser=null;
+async function loadUsers(){const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
+function renderUsers(){const bn=(me&&me.broker_names)||{};
+ $("usrTable").innerHTML=`<thead><tr><th>User</th><th>Role</th><th>Active</th><th>Live trading</th><th>Brokers</th><th>Order PIN</th><th></th></tr></thead><tbody>`+users.map(u=>`<tr><td><b>${esc(u.username)}</b></td><td>${u.role}</td><td><input type="checkbox" data-act="active" data-id="${u.id}" ${u.active?"checked":""} aria-label="Active"></td><td><input type="checkbox" data-act="live" data-id="${u.id}" ${u.live_allowed?"checked":""} aria-label="Live trading"></td><td>${u.brokers.map(b=>esc(bn[b]||b)).join(", ")||"–"}</td><td>${u.pin_set?"Set":"Not set"}</td><td><button class="mini" data-act="limits" data-id="${u.id}">Limits</button> <button class="mini" data-act="role" data-id="${u.id}">Make ${u.role==="admin"?"user":"admin"}</button> <button class="mini" data-act="reset" data-id="${u.id}">Reset password</button> <button class="mini" data-act="del" data-id="${u.id}">Delete</button></td></tr>`).join("")+"</tbody>"}
+$("usrTable").onchange=async e=>{const c=e.target.closest("input[data-act]");if(!c)return;
+ if(c.dataset.act==="live"&&c.checked&&!confirm("Enable live trading for this user? Their orders will go to their real broker account. Check that their broker allows this from your server's IP."))  {c.checked=false;return}
+ const d=await send("PATCH","/api/admin/users/"+c.dataset.id,c.dataset.act==="active"?{active:c.checked}:{live_allowed:c.checked});$("admNote").textContent=d.error||"Saved.";loadUsers()};
+$("usrTable").onclick=async e=>{const b=e.target.closest("button[data-act]");if(!b)return;const id=+b.dataset.id,u=users.find(x=>x.id===id);let d;
+ if(b.dataset.act==="reset"){const pw=prompt("New temporary password for "+u.username+" (at least 10 characters)");if(!pw)return;d=await send("PATCH","/api/admin/users/"+id,{password:pw});if(!d.error)d={error:"Password reset. Ask them to change it after signing in."}}
+ else if(b.dataset.act==="role"){d=await send("PATCH","/api/admin/users/"+id,{role:u.role==="admin"?"user":"admin"})}
+ else if(b.dataset.act==="del"){if(!confirm("Delete "+u.username+" and their saved broker details?"))return;d=await send("DELETE","/api/admin/users/"+id)}
+ else if(b.dataset.act==="limits"){limUser=u;const c=u.caps;$("limTitle").textContent="Limits for "+u.username;$("limValue").value=c.max_order_value;$("limQty").value=c.max_qty;$("limOrders").value=c.max_orders;$("limLots").value=c.max_fut_lots;$("limFut").value=c.max_fut_value;$("limSell").value=c.allow_option_selling?"1":"0";$("limMsg").textContent="";$("limDlg").showModal();return}
+ if(d)$("admNote").textContent=d.error||"Saved.";loadUsers()};
+$("limClose").onclick=()=>$("limDlg").close();
+$("limSave").onclick=async()=>{const d=await send("PATCH","/api/admin/users/"+limUser.id,{caps:{max_order_value:$("limValue").value,max_qty:$("limQty").value,max_orders:$("limOrders").value,max_fut_lots:$("limLots").value,max_fut_value:$("limFut").value,allow_option_selling:$("limSell").value==="1"}});
+ if(d.error){$("limMsg").textContent=d.error;return}$("limDlg").close();loadUsers()};
+$("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{username:$("nuName").value,password:$("nuPw").value,role:$("nuRole").value});$("admNote").textContent=d.error||"User added. Live trading is off for them until you enable it.";if(!d.error){$("nuName").value="";$("nuPw").value=""}loadUsers()};
+loadMe().then(()=>{if(mode==="admin")setMode("admin")}).catch(()=>{});
 setMode(mode);
 load();
 </script></body></html>
