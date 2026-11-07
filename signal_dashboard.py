@@ -13,6 +13,8 @@ Optional file:      symbols.txt  (one NSE symbol per line, e.g. RELIANCE) overri
 This dashboard only reads market data and shows signals. It never places orders.
 """
 import base64
+import csv
+import io
 import json
 import os
 import re
@@ -473,6 +475,9 @@ def build_chain(symbol, expiry=None):
 LIVE_REQUESTED = os.getenv("LIVE_TRADING", "0") == "1"
 ANGEL = {"api_key": os.getenv("ANGEL_API_KEY", ""), "client_id": os.getenv("ANGEL_CLIENT_ID", ""),
          "pin": os.getenv("ANGEL_PIN", ""), "totp": os.getenv("ANGEL_TOTP_SECRET", "")}
+DHAN = {"client_id": os.getenv("DHAN_CLIENT_ID", ""), "token": os.getenv("DHAN_ACCESS_TOKEN", "")}
+BROKER_PREF = os.getenv("BROKER", "").strip().lower()               # default broker when both are set up: angel or dhan
+ALLOW_OPTION_SELLING = os.getenv("ALLOW_OPTION_SELLING", "1") == "1"
 ORDER_PIN = os.getenv("ORDER_PIN", "")                              # typed before every live order
 MAX_ORDER_VALUE = float(os.getenv("MAX_ORDER_VALUE", "50000"))      # rupees per order
 MAX_QTY = int(os.getenv("MAX_QTY", "500"))                          # shares per order, or lots for options
@@ -482,14 +487,31 @@ MAX_FUT_VALUE = float(os.getenv("MAX_FUT_VALUE", "2500000"))        # notional r
 EQ_PRICE_BAND, OPT_PRICE_BAND = 5.0, 30.0                           # limit price may differ from last price by this %
 ORDER_LOG = os.getenv("ORDER_LOG", "orders_log.jsonl")
 MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+DHAN_BASE = "https://api.dhan.co/v2"
+
+
+def available_brokers():
+    out = []
+    if all(ANGEL.values()):
+        out.append("angel")
+    if all(DHAN.values()):
+        out.append("dhan")
+    return out
+
+
+LIVE_BROKERS = available_brokers()
+DEFAULT_BROKER = BROKER_PREF if BROKER_PREF in LIVE_BROKERS else (LIVE_BROKERS[0] if LIVE_BROKERS else "angel")
+BROKER_NAMES = {"angel": "Angel One", "dhan": "Dhan", "paper": "Paper"}
 
 
 def decide_mode():
     if not LIVE_REQUESTED:
         return "paper", "Paper mode: orders are simulated and nothing is sent to your broker."
-    need = [("ANGEL_API_KEY", ANGEL["api_key"]), ("ANGEL_CLIENT_ID", ANGEL["client_id"]), ("ANGEL_PIN", ANGEL["pin"]),
-            ("ANGEL_TOTP_SECRET", ANGEL["totp"]), ("ORDER_PIN", ORDER_PIN), ("DASH_PASSWORD", PASSWORD or "")]
-    missing = [n for n, v in need if not v]
+    missing = [n for n, v in [("ORDER_PIN", ORDER_PIN), ("DASH_PASSWORD", PASSWORD or "")] if not v]
+    if not LIVE_BROKERS:
+        missing.append("a broker login (Angel One: ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PIN, ANGEL_TOTP_SECRET. "
+                       "Dhan: DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)")
     if missing:
         return "paper", "Live trading is off because these settings are missing: " + ", ".join(missing) + ". Orders are simulated."
     if len(ORDER_PIN) < 4:
@@ -531,6 +553,7 @@ def load_orders():
                 except ValueError:
                     continue
                 if o.get("date") == today:
+                    o.setdefault("broker", "angel" if o.get("mode") == "live" else "paper")
                     latest[o["id"]] = o
     except OSError:
         pass
@@ -538,6 +561,10 @@ def load_orders():
 
 
 load_orders()
+
+
+class OrderRejected(RuntimeError):
+    """The broker answered and refused the order, so no order exists."""
 
 
 class Broker:
@@ -583,22 +610,25 @@ class Broker:
 
 
 broker = Broker()
-MASTER = {"day": None, "eq": {}, "opt": {}, "fut": {}}
+MASTERS = {n: {"day": None, "eq": {}, "opt": {}, "fut": {}} for n in ("angel", "dhan")}
 
 
-def load_master():
-    """Angel One instrument list: tokens, lot sizes, futures and option contracts for the dashboard's symbols."""
-    today = ist_now().date()
-    if MASTER["day"] == today:
-        return True
-    try:
-        r = requests.get(MASTER_URL, timeout=90)
-        r.raise_for_status()
-        items = r.json()
-    except Exception:
-        return MASTER["day"] is not None
+def M(name):
+    return MASTERS[name]
+
+
+def master_name(broker_id):
+    """Which instrument list to use. Paper mode uses Angel One's unless BROKER=dhan."""
+    if broker_id in MASTERS:
+        return broker_id
+    return "dhan" if BROKER_PREF == "dhan" else "angel"
+
+
+def _angel_master():
+    r = requests.get(MASTER_URL, timeout=90)
+    r.raise_for_status()
     names, eq, opt, fut = set(UNIVERSE), {}, {}, {}
-    for it in items:
+    for it in r.json():
         name = it.get("name")
         if name not in names:
             continue
@@ -618,15 +648,76 @@ def load_master():
             except (KeyError, ValueError):
                 continue
             opt[(name, str(it.get("expiry", "")).upper(), strike, sym[-2:])] = (it["token"], sym, lot, seg)
+    return eq, opt, fut
+
+
+def _parse_date(v):
+    v = str(v or "").strip()[:10]
+    for f in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(v, f).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _dhan_master():
+    names, eq, opt, fut = set(UNIVERSE), {}, {}, {}
+    g = lambda row, *keys: next((str(row[k]).strip() for k in keys if row.get(k) not in (None, "")), "")
+    with requests.get(DHAN_MASTER_URL, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        for row in csv.DictReader(ln.decode("utf-8", "ignore") for ln in r.iter_lines()):
+            sym = g(row, "UNDERLYING_SYMBOL", "SEM_TRADING_SYMBOL").upper()
+            if sym not in names:
+                continue
+            inst = g(row, "INSTRUMENT", "SEM_INSTRUMENT_NAME").upper()
+            exch = g(row, "EXCH_ID", "SEM_EXM_EXCH_ID").upper()
+            sid = g(row, "SECURITY_ID", "SEM_SMST_SECURITY_ID")
+            if not sid:
+                continue
+            try:
+                lot = int(float(g(row, "LOT_SIZE", "SEM_LOT_UNITS") or 0))
+            except ValueError:
+                lot = 0
+            label = g(row, "DISPLAY_NAME", "SEM_CUSTOM_SYMBOL") or sym
+            seg = "NSE_FNO" if exch == "NSE" else "BSE_FNO" if exch == "BSE" else ""
+            if inst == "EQUITY" and exch == "NSE" and g(row, "SERIES", "SEM_SERIES").upper() in ("EQ", ""):
+                eq[sym] = (sid, label)
+            elif inst in ("FUTSTK", "FUTIDX") and seg:
+                exp = _parse_date(g(row, "SM_EXPIRY_DATE", "SEM_EXPIRY_DATE"))
+                if exp:
+                    fut.setdefault(sym, []).append((exp, sid, label, lot, seg))
+            elif inst in ("OPTSTK", "OPTIDX") and seg:
+                right = g(row, "OPTION_TYPE", "SEM_OPTION_TYPE").upper()[:2]
+                exp = _parse_date(g(row, "SM_EXPIRY_DATE", "SEM_EXPIRY_DATE"))
+                try:
+                    strike = float(g(row, "STRIKE_PRICE", "SEM_STRIKE_PRICE"))
+                except ValueError:
+                    continue
+                if right in ("CE", "PE") and exp:
+                    opt[(sym, exp.strftime("%d%b%Y").upper(), strike, right)] = (sid, label, lot, seg)
+    return eq, opt, fut
+
+
+def load_master(name="angel"):
+    """Instrument list: ids, lot sizes, futures and option contracts for the dashboard's symbols. Cached for the day."""
+    today = ist_now().date()
+    m = MASTERS[name]
+    if m["day"] == today:
+        return True
+    try:
+        eq, opt, fut = _dhan_master() if name == "dhan" else _angel_master()
+    except Exception:
+        return m["day"] is not None
     for lst in fut.values():
         lst.sort()
-    MASTER.update(day=today, eq=eq, opt=opt, fut=fut)
+    m.update(day=today, eq=eq, opt=opt, fut=fut)
     return True
 
 
-def near_future(symbol):
+def near_future(symbol, name="angel"):
     today = ist_now().date()
-    return next((f for f in MASTER["fut"].get(symbol, []) if f[0] >= today), None)
+    return next((f for f in MASTERS[name]["fut"].get(symbol, []) if f[0] >= today), None)
 
 
 def row_for(symbol, tf):
@@ -656,6 +747,10 @@ def make_order(p):
     product = str(p.get("product", "INTRADAY")).upper()
     tf = p.get("tf") if p.get("tf") in INTERVALS else DEFAULT_INTERVAL
     fail = lambda m: (None, m, [], [])
+    broker_id = str(p.get("broker") or DEFAULT_BROKER).lower() if MODE == "live" else "paper"
+    if MODE == "live" and broker_id not in LIVE_BROKERS:
+        return fail("That broker is not set up.")
+    mname = master_name(broker_id)
     if kind not in ("equity", "option", "future"):
         return fail("Unknown order type.")
     if symbol not in UNIVERSE:
@@ -668,7 +763,7 @@ def make_order(p):
         qty = int(p.get("qty"))
     except (TypeError, ValueError):
         return fail("Quantity must be a whole number.")
-    cap = MAX_FUT_LOTS if kind == "future" else MAX_QTY
+    cap = MAX_FUT_LOTS if (kind == "future" or (kind == "option" and side == "SELL")) else MAX_QTY
     if qty < 1 or qty > cap:
         return fail(f"Quantity must be between 1 and {cap}" + (" shares." if kind == "equity" else " lots."))
     if MODE == "live" and not market_open_now():
@@ -686,21 +781,21 @@ def make_order(p):
             return fail("Delivery sells need shares in your demat account, which this dashboard cannot check. Use Intraday.")
         if not row:
             return fail("No price yet for this stock. Wait for the first scan to finish.")
-        if not load_master():
+        if not load_master(mname):
             return fail("Could not load Angel One's instrument list. Try again in a minute.")
-        inst = MASTER["eq"].get(symbol)
+        inst = M(mname)["eq"].get(symbol)
         if not inst:
             return fail("This stock was not found in Angel One's instrument list.")
         ref, units, lot, band = row["close"], qty, 1, EQ_PRICE_BAND
-        token, tsym, exch, label = inst[0], inst[1], "NSE", symbol
+        token, tsym, exch, label = inst[0], inst[1], ("NSE_EQ" if mname == "dhan" else "NSE"), symbol
     elif kind == "future":
         if product not in ("INTRADAY", "CARRYFORWARD"):
             return fail("Product must be Intraday or Carry forward.")
         if not row:
             return fail("No price yet for this symbol. Wait for the first scan to finish.")
-        if not load_master():
+        if not load_master(mname):
             return fail("Could not load Angel One's instrument list. Try again in a minute.")
-        near = near_future(symbol)
+        near = near_future(symbol, mname)
         if not near or not near[3]:
             return fail("No futures contract was found for this symbol in Angel One's instrument list.")
         ref, lot, band = row["close"], near[3], EQ_PRICE_BAND
@@ -720,15 +815,15 @@ def make_order(p):
             return fail("The option contract details are not valid.")
         if right not in ("CE", "PE"):
             return fail("Option type must be CE or PE.")
-        if side != "BUY":
-            return fail("Only buying options is allowed here. Selling options carries unlimited risk, so it is switched off.")
+        if side == "SELL" and not ALLOW_OPTION_SELLING:
+            return fail("Selling options is switched off. Set ALLOW_OPTION_SELLING=1 to allow it.")
         if otype != "LIMIT":
             return fail("Option orders must be limit orders, because option markets can be thin.")
         if product not in ("INTRADAY", "CARRYFORWARD"):
             return fail("Product must be Intraday or Carry forward.")
-        if not load_master():
+        if not load_master(mname):
             return fail("Could not load Angel One's instrument list. Try again in a minute.")
-        inst = MASTER["opt"].get((symbol, exp_key, strike, right))
+        inst = M(mname)["opt"].get((symbol, exp_key, strike, right))
         if not inst or not inst[2]:
             return fail("This contract was not found in Angel One's instrument list.")
         chain = build_chain(symbol, expiry)
@@ -751,9 +846,15 @@ def make_order(p):
         if abs(price / ref - 1) * 100 > band:
             return fail(f"The limit price is more than {band:.0f}% away from the last price {inr(ref)}. Check it for a typo.")
     est = (price or ref) * units
-    value_cap = MAX_FUT_VALUE if kind == "future" else MAX_ORDER_VALUE
-    if est > value_cap:
-        return fail(f"This order is worth about {inr(est)}, above your limit of {inr(value_cap)} per order.")
+    selling_opt = kind == "option" and side == "SELL"
+    exposure = strike * units if selling_opt else None
+    if selling_opt:
+        if exposure > MAX_FUT_VALUE:
+            return fail(f"Selling this option puts about {inr(exposure)} of the underlying at stake, above your limit of {inr(MAX_FUT_VALUE)}.")
+    else:
+        value_cap = MAX_FUT_VALUE if kind == "future" else MAX_ORDER_VALUE
+        if est > value_cap:
+            return fail(f"This order is worth about {inr(est)}, above your limit of {inr(value_cap)} per order.")
     key = (kind, symbol, side, strike, right)
     now = time.time()
     with ORDER_LOCK:
@@ -770,8 +871,8 @@ def make_order(p):
             elif signal_row.get("sl") and signal_row.get("entry"):
                 sl = round(round(signal_row["sl"] / 0.05) * 0.05, 2)
                 risk = round(abs(signal_row["entry"] - signal_row["sl"]), 2)
-        elif (sig_side == "BUY") != (right == "CE"):
-            warnings.append(f"This option is against the current {sig_side} signal.")
+        elif ((sig_side == "BUY") == (right == "CE")) != (side == "BUY"):
+            warnings.append(f"This option {side.lower()} is against the current {sig_side} signal.")
         if signal_row["bars_ago"] is not None and signal_row["bars_ago"] > FRESH_BARS:
             warnings.append(f"The signal is {signal_row['bars_ago']} candles old.")
         if signal_row.get("sl_hit"):
@@ -782,6 +883,9 @@ def make_order(p):
         warnings.append("This symbol has no active signal on this timeframe.")
     if kind == "future":
         warnings.append("Futures are leveraged and the stop-loss is not automatic. Place it from the Orders tab once the entry fills.")
+    if selling_opt:
+        warnings.append("Selling an option can lose far more than the premium you receive. It needs margin, and no stop-loss is placed for you. "
+                        "If you are closing an option you bought, this is a sell to close.")
 
     lines = [["Instrument", label], ["Side", side],
              ["Quantity", f"{qty} lot{'s' if qty > 1 else ''} x {lot} = {units} units" if kind != "equity" else f"{qty} shares"],
@@ -789,15 +893,18 @@ def make_order(p):
              ["Product", product.title()], ["Estimated value", inr(est)], ["Mode", "LIVE, real money" if MODE == "live" else "Paper, simulated"]]
     if kind == "equity" and sl:
         lines.append(["Stop-loss from the signal", inr(sl) + " (placed from the Orders tab once filled)"])
+    if selling_opt:
+        lines.append(["Exposure (strike x units)", inr(exposure)])
     if kind == "future" and risk:
         lines.append(["Stop-loss distance", f"{risk:.2f} points from your fill price (placed from the Orders tab)"])
     order = {"kind": kind, "symbol": symbol, "label": label, "tradingsymbol": tsym, "token": token, "exchange": exch,
              "side": side, "qty": units, "lots": qty, "order_type": otype, "price": price, "ref": ref, "product": product,
-             "expiry": expiry, "strike": strike, "right": right, "sl": sl, "risk": risk, "key": key}
+             "expiry": expiry, "strike": strike, "right": right, "sl": sl, "risk": risk, "key": key, "broker": broker_id}
     return order, None, warnings, lines
 
 
 def place_live(o, variety="NORMAL", ordertype=None, trigger=None, side=None, qty=None):
+    """Angel One."""
     otype = ordertype or o["order_type"]
     params = {"variety": variety, "tradingsymbol": o["tradingsymbol"], "symboltoken": o["token"],
               "transactiontype": side or o["side"], "exchange": o["exchange"], "ordertype": otype,
@@ -808,7 +915,7 @@ def place_live(o, variety="NORMAL", ordertype=None, trigger=None, side=None, qty
     res = broker.write(("placeOrderFullResponse", "placeOrder"), params)
     if isinstance(res, dict):
         if not res.get("status"):
-            raise RuntimeError(str(res.get("message") or "The broker did not accept the order."))
+            raise OrderRejected(str(res.get("message") or "The order was not accepted."))
         oid = (res.get("data") or {}).get("orderid")
     else:
         oid = res
@@ -817,13 +924,56 @@ def place_live(o, variety="NORMAL", ordertype=None, trigger=None, side=None, qty
     return str(oid)
 
 
+DHAN_PRODUCT = {"INTRADAY": "INTRADAY", "DELIVERY": "CNC", "CARRYFORWARD": "MARGIN"}
+DHAN_ORDER_TYPE = {"MARKET": "MARKET", "LIMIT": "LIMIT", "STOPLOSS_MARKET": "STOP_LOSS_MARKET"}
+DHAN_STATUS = {"TRADED": "complete", "PENDING": "open", "TRANSIT": "open pending", "PART_TRADED": "open",
+               "REJECTED": "rejected", "CANCELLED": "cancelled", "EXPIRED": "expired"}
+
+
+def dhan_request(method, path, body=None):
+    r = requests.request(method, DHAN_BASE + path, json=body, timeout=15,
+                         headers={"access-token": DHAN["token"], "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        data = r.json()
+    except ValueError:
+        data = None
+    if 400 <= r.status_code < 500:  # Dhan answered and refused, so nothing was placed
+        msg = data.get("errorMessage") if isinstance(data, dict) else None
+        raise OrderRejected(msg or f"HTTP {r.status_code}")
+    if r.status_code >= 500:
+        raise RuntimeError(f"Dhan server error (HTTP {r.status_code})")
+    return data
+
+
+def place_dhan(o, variety="NORMAL", ordertype=None, trigger=None, side=None, qty=None):
+    """Dhan."""
+    ot = ordertype or o["order_type"]
+    body = {"dhanClientId": DHAN["client_id"], "correlationId": "DB" + secrets.token_hex(8),
+            "transactionType": side or o["side"], "exchangeSegment": o["exchange"],
+            "productType": DHAN_PRODUCT[o["product"]], "orderType": DHAN_ORDER_TYPE[ot], "validity": "DAY",
+            "securityId": str(o["token"]), "quantity": int(qty or o["qty"]), "disclosedQuantity": "",
+            "price": float(o["price"]) if ot == "LIMIT" else "",
+            "triggerPrice": float(trigger) if trigger is not None else "", "afterMarketOrder": False}
+    res = dhan_request("POST", "/orders", body)
+    oid = str((res or {}).get("orderId") or "")
+    if not oid:
+        raise RuntimeError("Dhan did not return an order id.")
+    if str(res.get("orderStatus", "")).upper() == "REJECTED":
+        raise OrderRejected("Dhan rejected the order.")
+    return oid
+
+
+def place_order(o, **kw):
+    return (place_dhan if o.get("broker") == "dhan" else place_live)(o, **kw)
+
+
 def new_record(o, oid, status, variety="NORMAL", is_exit=False, note=""):
     n = ist_now()
     rec = {"id": oid, "t": time.time(), "date": n.strftime("%Y-%m-%d"), "time": n.strftime("%H:%M:%S"), "mode": MODE,
            "kind": o["kind"], "symbol": o["symbol"], "label": o["label"], "tradingsymbol": o["tradingsymbol"],
            "token": o["token"], "exchange": o["exchange"], "side": o["side"], "qty": o["qty"], "order_type": o["order_type"],
            "price": o["price"], "product": o["product"], "status": status, "avg_price": None, "sl": o.get("sl"),
-           "sl_order_id": None, "risk": o.get("risk"), "variety": variety, "is_exit": is_exit, "key": o.get("key"), "note": note}
+           "sl_order_id": None, "risk": o.get("risk"), "variety": variety, "broker": o.get("broker", "paper"), "is_exit": is_exit, "key": o.get("key"), "note": note}
     with ORDER_LOCK:
         ORDERS.append(rec)
     append_log(rec)
@@ -854,26 +1004,51 @@ def pin_error(pin):
     return "Wrong order PIN."
 
 
+def angel_book():
+    out = {}
+    for x in (broker.read("orderBook") or {}).get("data") or []:
+        st = str(x.get("orderstatus") or "").lower()
+        out[str(x.get("orderid"))] = {"status": st, "avg_price": _num(x.get("averageprice")), "filled": _num(x.get("filledshares")),
+                                      "note": str(x.get("text") or "") if st == "rejected" else ""}
+    return out
+
+
+def dhan_book():
+    res = dhan_request("GET", "/orders")
+    out = {}
+    for x in res if isinstance(res, list) else []:
+        raw = str(x.get("orderStatus", "")).upper()
+        st = DHAN_STATUS.get(raw, raw.lower())
+        out[str(x.get("orderId"))] = {"status": st, "avg_price": _num(x.get("averageTradedPrice")), "filled": _num(x.get("filledQty")),
+                                      "note": str(x.get("omsErrorDescription") or "") if st == "rejected" else ""}
+    return out
+
+
 def sync_status():
-    """Copy order statuses from the broker's order book (at most every 5 seconds)."""
+    """Copy order statuses from each broker's order book (at most every 5 seconds)."""
     if MODE != "live" or time.time() - SYNC["t"] < 5:
         return
     SYNC["t"] = time.time()
-    try:
-        res = broker.read("orderBook")
-    except Exception:
-        return
-    book = {str(x.get("orderid")): x for x in (res or {}).get("data") or []}
+    with ORDER_LOCK:
+        used = {o.get("broker") for o in ORDERS if o["mode"] == "live"}
+    books = {}
+    for b in used:
+        try:
+            books[b] = angel_book() if b == "angel" else dhan_book() if b == "dhan" else {}
+        except Exception:
+            continue
     with ORDER_LOCK:
         for o in ORDERS:
-            b = book.get(str(o["id"]))
-            if not b:
+            info = books.get(o.get("broker"), {}).get(str(o["id"]))
+            if not info:
                 continue
-            o["status"] = str(b.get("orderstatus") or o["status"]).lower()
-            o["avg_price"] = _num(b.get("averageprice")) or o["avg_price"]
-            o["filled"] = _num(b.get("filledshares"))
-            if o["status"] == "rejected" and b.get("text"):
-                o["note"] = str(b["text"])
+            if info["status"]:
+                o["status"] = info["status"]
+            if info["avg_price"]:
+                o["avg_price"] = info["avg_price"]
+            o["filled"] = info["filled"]
+            if info["note"]:
+                o["note"] = info["note"]
 
 
 # ── Web app ──
@@ -956,10 +1131,11 @@ def api_chain(symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
 
 @app.get("/api/futures/info")
 def api_fut_info():
-    ok = load_master()
+    mn = master_name(DEFAULT_BROKER if MODE == "live" else "paper")
+    ok = load_master(mn)
     out = {}
     for name in UNIVERSE:
-        near = near_future(name)
+        near = near_future(name, mn)
         if near:
             out[name] = {"lot": near[3], "expiry": near[0].strftime(EXPIRY_FMT)}
     return {"ok": ok, "info": out}
@@ -968,8 +1144,32 @@ def api_fut_info():
 @app.get("/api/trading")
 def api_trading():
     return {"mode": MODE, "note": MODE_NOTE, "market_open": market_open_now(),
+            "brokers": LIVE_BROKERS if MODE == "live" else [], "default_broker": DEFAULT_BROKER, "broker_names": BROKER_NAMES,
             "caps": {"max_value": MAX_ORDER_VALUE, "max_qty": MAX_QTY, "max_orders": MAX_ORDERS_PER_DAY,
                      "max_fut_lots": MAX_FUT_LOTS, "max_fut_value": MAX_FUT_VALUE}}
+
+
+@app.get("/api/trading/check")
+def api_trading_check(which: str = ""):
+    """Read-only test of the broker connection and the instrument list. Places no order."""
+    if MODE != "live":
+        return {"ok": False, "message": "Paper mode: no broker is connected. " + MODE_NOTE}
+    b = which if which in LIVE_BROKERS else DEFAULT_BROKER
+    name = BROKER_NAMES[b]
+    try:
+        angel_book() if b == "angel" else dhan_book()
+    except Exception as e:
+        return {"ok": False, "broker": name, "message": f"Could not connect to {name}: {str(e)[:200]}"}
+    loaded = load_master(b)
+    m = M(b)
+    miss = [x for x in SYMBOLS if x not in m["eq"]]
+    msg = (f"Connected to {name}. Instrument list: {len(SYMBOLS) - len(miss)} of {len(SYMBOLS)} stocks, "
+           f"{len(m['fut'])} futures symbols, {len(m['opt'])} option contracts.")
+    if not loaded or not m["eq"]:
+        msg += " The instrument list did not load or did not match, so orders will be refused until it does."
+    elif miss:
+        msg += " Not found: " + ", ".join(miss[:5]) + ("..." if len(miss) > 5 else "") + "."
+    return {"ok": bool(loaded and m["eq"]), "broker": name, "message": msg}
 
 
 @app.post("/api/orders/preview")
@@ -1013,12 +1213,15 @@ def api_confirm(payload: dict = Body(...)):
         if status == "complete":
             rec["avg_price"] = o["ref"]
         return {"ok": True, "order": public(rec)}
+    bname = BROKER_NAMES.get(o.get("broker"), "broker")
     try:
-        oid = place_live(o)
+        oid = place_order(o)
+    except OrderRejected as e:
+        return {"error": f"{bname} rejected the order: {e}"}
     except Exception as e:
-        rec = new_record(o, "UNKNOWN-" + secrets.token_hex(3), "unknown",
-                         note="The broker did not confirm this order. Check your Angel One app before sending it again.")
-        return {"error": f"The broker did not confirm the order ({e}). Check your Angel One app before trying again."}
+        new_record(o, "UNKNOWN-" + secrets.token_hex(3), "unknown",
+                   note=f"{bname} did not confirm this order. Check your {bname} app before sending it again.")
+        return {"error": f"{bname} did not confirm the order ({e}). Check your {bname} app before trying again."}
     return {"ok": True, "order": public(new_record(o, oid, "open"))}
 
 
@@ -1044,9 +1247,12 @@ def api_cancel(payload: dict = Body(...)):
         return {"error": err}
     if o["mode"] == "live":
         try:
-            broker.write(("cancelOrder",), o["id"], o.get("variety", "NORMAL"))
+            if o.get("broker") == "dhan":
+                dhan_request("DELETE", f"/orders/{o['id']}")
+            else:
+                broker.write(("cancelOrder",), o["id"], o.get("variety", "NORMAL"))
         except Exception as e:
-            return {"error": f"The broker did not confirm the cancel ({e}). Check your Angel One app."}
+            return {"error": f"The broker did not confirm the cancel ({e}). Check your {BROKER_NAMES.get(o.get('broker'), 'broker')} app."}
     o["status"] = "cancelled"
     append_log(o)
     return {"ok": True}
@@ -1088,9 +1294,9 @@ def api_protect(payload: dict = Body(...)):
         rec = new_record(exit_o, paper_id(), "open", variety="STOPLOSS", is_exit=True, note=f"Trigger {sl:.2f}")
     else:
         try:
-            oid = place_live(o, variety="STOPLOSS", ordertype="STOPLOSS_MARKET", trigger=sl, side=exit_side, qty=qty)
+            oid = place_order(o, variety="STOPLOSS", ordertype="STOPLOSS_MARKET", trigger=sl, side=exit_side, qty=qty)
         except Exception as e:
-            return {"error": f"The broker did not confirm the stop-loss ({e}). Check your Angel One app."}
+            return {"error": f"The broker did not confirm the stop-loss ({e}). Check your {BROKER_NAMES.get(o.get('broker'), 'broker')} app."}
         rec = new_record(exit_o, oid, "open", variety="STOPLOSS", is_exit=True, note=f"Trigger {sl:.2f}")
     o["sl_order_id"] = rec["id"]
     append_log(o)
@@ -1176,7 +1382,9 @@ td.pick-pe{box-shadow:inset 0 0 0 2px var(--sell);font-weight:700}
 .banner{border-radius:8px;padding:8px 14px;margin-bottom:14px;font-size:14px;border:1px solid var(--line);background:var(--panel);color:var(--mute)}
 .banner.live{background:var(--sell-bg);color:var(--sell);border-color:var(--sell);font-weight:500}
 .mini{background:none;border:1px solid var(--ink);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:13px}
-.ltp{background:none;border:0;border-bottom:1px dashed var(--mute);cursor:pointer;color:inherit;font:inherit;padding:0}
+.ob{border:0;border-radius:4px;width:20px;height:20px;font-size:11px;font-weight:700;cursor:pointer;margin-left:4px;color:var(--bg)}
+.ob.b{background:var(--buy)}.ob.s{background:var(--sell)}
+.px{display:inline-block;min-width:52px}
 dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0;width:min(460px,92vw)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
 .tk{padding:20px}.tk h2{margin:0 0 4px;font-size:20px}
@@ -1222,6 +1430,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <section id="view-orders" hidden>
 <div class="note" id="ordNote" style="margin:0 0 10px">Orders placed from this dashboard today.</div>
 <div class="wrap"><table id="ordTable"></table></div>
+<div style="margin-top:12px"><button class="mini" id="chk">Check broker connection</button> <span class="sub" id="chkMsg"></span></div>
 </section>
 </main>
 <dialog id="ticket" aria-labelledby="tkTitle"><div class="tk">
@@ -1234,6 +1443,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <label>Order type<select id="tkType"></select></label>
   <label>Limit price<input id="tkPrice" type="number" step="0.05" min="0"></label>
   <label>Product<select id="tkProd"></select></label>
+  <label id="tkBrokerL" hidden>Broker<select id="tkBroker"></select></label>
  </div>
  <div class="tkreview" id="tkReview" hidden></div>
  <div class="tkgrid" id="tkConfirm" hidden>
@@ -1355,31 +1565,34 @@ function renderChain(d){
   const pe=[ltpBtn(r,"PE"),iv(r.pe),fk(r.pe.vol),sgn(r.pe.doi),fk(r.pe.oi)].map((c,i)=>`<td class="${cls(d.bias==="PE"&&"bias-pe",pickPe(atm,i))}">${c}</td>`).join("");
   return `<tr class="${atm?"atm":""}">${ce}<td class="k">${r.strike.toLocaleString("en-IN")}</td>${pe}</tr>`}).join("");
  tb.innerHTML=`<thead><tr><th class="g" colspan="5">Calls</th><th class="k" rowspan="2">Strike</th><th class="g" colspan="5">Puts</th></tr><tr><th>OI</th><th>Change in OI</th><th>Volume</th><th>IV</th><th>LTP</th><th>LTP</th><th>IV</th><th>Volume</th><th>Change in OI</th><th>OI</th></tr></thead><tbody>${rows}</tbody>`;
- box.textContent=(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The indicator runs on the stock's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click an LTP to open an order ticket for buying that option.";
+ box.textContent=(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The indicator runs on the stock's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click B or S beside a price to buy or sell that option.";
 }
 setInterval(()=>{if(mode==="options"&&osym)loadChain(true)},60000);
 // ── Orders and order ticket ──
 let tk=null,tkToken=null,tradeInfo={mode:"paper",caps:{}},lastChain=null;
 const $=id=>document.getElementById(id);
 const post=async(u,b)=>(await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json();
-const ltpBtn=(r,s)=>{const l=r[s.toLowerCase()].ltp;return l==null?"–":`<button class="ltp" data-strike="${r.strike}" data-right="${s}" data-ltp="${l}">${f2(l)}</button>`};
+const ltpBtn=(r,s)=>{const l=r[s.toLowerCase()].ltp;if(l==null)return "–";const d=`data-strike="${r.strike}" data-right="${s}" data-ltp="${l}"`;
+ return `<span class="px">${f2(l)}</span><button class="ob b" ${d} data-side="BUY" title="Buy ${s}" aria-label="Buy ${r.strike} ${s}">B</button><button class="ob s" ${d} data-side="SELL" title="Sell ${s}" aria-label="Sell ${r.strike} ${s}">S</button>`};
 async function loadTrading(){try{tradeInfo=await (await fetch("/api/trading")).json();const b=$("banner");b.className="banner "+tradeInfo.mode;
- b.textContent=tradeInfo.mode==="live"?`LIVE trading is on. Orders go to your Angel One account. Limits: ₹${tradeInfo.caps.max_value.toLocaleString("en-IN")} per order and ${tradeInfo.caps.max_orders} orders a day. Futures: up to ${tradeInfo.caps.max_fut_lots} lot(s) and ₹${tradeInfo.caps.max_fut_value.toLocaleString("en-IN")} notional.`:tradeInfo.note}catch(e){}}
+ b.textContent=tradeInfo.mode==="live"?`LIVE trading is on. Orders go to your ${(tradeInfo.brokers||[]).map(x=>tradeInfo.broker_names[x]).join(" or ")} account. Limits: ₹${tradeInfo.caps.max_value.toLocaleString("en-IN")} per order and ${tradeInfo.caps.max_orders} orders a day. Futures: up to ${tradeInfo.caps.max_fut_lots} lot(s) and ₹${tradeInfo.caps.max_fut_value.toLocaleString("en-IN")} notional.`:tradeInfo.note}catch(e){}}
 function resetReview(){tkToken=null;$("tkReview").hidden=true;$("tkConfirm").hidden=true;$("tkPlace").hidden=true;$("tkReviewBtn").hidden=false;$("tkMsg").textContent=""}
 function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
- $("tkTitle").textContent=opt?"Buy an option":fut?"Futures order":"Order ticket";$("tkInst").value=s.label;
- $("tkSide").innerHTML=opt?"<option>BUY</option>":"<option>BUY</option><option>SELL</option>";$("tkSide").value=s.side;
+ $("tkTitle").textContent=opt?"Option order":fut?"Futures order":"Order ticket";$("tkInst").value=s.label;
+ $("tkSide").innerHTML="<option>BUY</option><option>SELL</option>";$("tkSide").value=s.side;
  $("tkQtyT").textContent=opt||fut?"Lots":"Quantity (shares)";$("tkQty").value=1;
  $("tkType").innerHTML=opt?'<option value="LIMIT">Limit</option>':'<option value="MARKET">Market</option><option value="LIMIT">Limit</option>';
  $("tkPrice").value=s.price??"";$("tkPrice").disabled=$("tkType").value!=="LIMIT";
  $("tkProd").innerHTML=opt||fut?'<option value="INTRADAY">Intraday</option><option value="CARRYFORWARD">Carry forward</option>':'<option value="INTRADAY">Intraday</option><option value="DELIVERY">Delivery</option>';
  $("tkMode").textContent=tradeInfo.mode==="live"?"LIVE: this sends a real order to your broker.":"Paper mode: this order is only simulated.";
+ const bl=tradeInfo.brokers||[];$("tkBroker").innerHTML=bl.map(x=>`<option value="${x}">${tradeInfo.broker_names[x]}</option>`).join("");
+ $("tkBrokerL").hidden=bl.length<2;if(tradeInfo.default_broker&&bl.length)$("tkBroker").value=tradeInfo.default_broker;
  $("tkYes").value="";$("tkPin").value="";resetReview();$("ticket").showModal()}
-["tkSide","tkQty","tkType","tkPrice","tkProd"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
+["tkSide","tkQty","tkType","tkPrice","tkProd","tkBroker"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
 $("tkReviewBtn").onclick=async()=>{
- const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,tf:tf||"",expiry:tk.expiry,strike:tk.strike,right:tk.right};
+ const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:tf||"",expiry:tk.expiry,strike:tk.strike,right:tk.right};
  $("tkMsg").textContent="Checking the order…";
  const d=await post("/api/orders/preview",body);
  if(d.error){$("tkMsg").textContent=d.error;return}
@@ -1396,8 +1609,10 @@ $("tkPlace").onclick=async()=>{const b=$("tkPlace");b.disabled=true;
 $("body").onclick=e=>{const b=e.target.closest("[data-trade]");if(!b||!data)return;const r=data.rows.find(x=>x.symbol===b.dataset.trade);if(!r)return;
  const side=r.signal.endsWith("SELL")?"SELL":"BUY";
  openTicket(mode==="futures"?{kind:"future",symbol:r.symbol,label:r.symbol+" futures, nearest month",side,price:r.close}:{kind:"equity",symbol:r.symbol,label:r.symbol,side,price:r.close})};
-$("otable").onclick=e=>{const b=e.target.closest(".ltp");if(!b||!lastChain)return;
- openTicket({kind:"option",symbol:lastChain.symbol,expiry:lastChain.expiry,strike:+b.dataset.strike,right:b.dataset.right,side:"BUY",price:+b.dataset.ltp,label:`${lastChain.symbol} ${+b.dataset.strike} ${b.dataset.right} ${lastChain.expiry}`})};
+$("otable").onclick=e=>{const b=e.target.closest(".ob");if(!b||!lastChain)return;
+ openTicket({kind:"option",symbol:lastChain.symbol,expiry:lastChain.expiry,strike:+b.dataset.strike,right:b.dataset.right,side:b.dataset.side,price:+b.dataset.ltp,label:`${lastChain.symbol} ${+b.dataset.strike} ${b.dataset.right} ${lastChain.expiry}`})};
+$("chk").onclick=async()=>{$("chkMsg").textContent="Checking…";const bs=(tradeInfo.brokers||[]).length?tradeInfo.brokers:[""];const out=[];
+ try{for(const b of bs){out.push((await (await fetch("/api/trading/check?which="+b)).json()).message)}$("chkMsg").textContent=out.join(" ")}catch(e){$("chkMsg").textContent="Cannot reach the server."}};
 const cancelable=new Set(["open","trigger pending","open pending","validation pending","put order req received","modified","after market order req received"]);
 async function loadOrders(){try{renderOrders(await (await fetch("/api/orders")).json())}catch(e){}}
 function renderOrders(d){const t=$("ordTable");
@@ -1408,7 +1623,7 @@ function renderOrders(d){const t=$("ordTable");
   if(cancelable.has(o.status))act.push(`<button class="mini" data-cancel="${esc(o.id)}">Cancel</button>`);
   if(!o.is_exit&&(o.kind==="equity"||o.kind==="future")&&(o.sl||o.risk)&&!o.sl_order_id&&o.status==="complete")act.push(`<button class="mini" data-protect="${esc(o.id)}">Place stop-loss${o.kind==="future"?"":" "+f2(o.sl)}</button>`);
   const price=o.order_type==="LIMIT"?f2(o.price):o.is_exit?(o.note||""):o.avg_price?f2(o.avg_price):"Market";
-  return `<tr><td>${o.time}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}</td><td>${o.side}</td><td>${o.qty}</td><td>${o.order_type.replace("_"," ").toLowerCase()}</td><td>${price}</td><td title="${esc(o.note||"")}">${esc(o.status)}${o.sl_order_id?", SL placed":""}</td><td>${esc(o.id)}</td><td>${act.join(" ")}</td></tr>`}).join("")+"</tbody>"}
+  return `<tr><td>${o.time}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}${o.broker&&o.broker!=="paper"?`<span class="tag">${esc((tradeInfo.broker_names||{})[o.broker]||o.broker)}</span>`:""}</td><td>${o.side}</td><td>${o.qty}</td><td>${o.order_type.replace("_"," ").toLowerCase()}</td><td>${price}</td><td title="${esc(o.note||"")}">${esc(o.status)}${o.sl_order_id?", SL placed":""}</td><td>${esc(o.id)}</td><td>${act.join(" ")}</td></tr>`}).join("")+"</tbody>"}
 $("ordTable").onclick=async e=>{const c=e.target.closest("[data-cancel]"),p=e.target.closest("[data-protect]");if(!c&&!p)return;
  if(!confirm(c?"Cancel this order?":"Place the stop-loss order now?"))return;
  const live=tradeInfo.mode==="live",pin=live?prompt("Order PIN"):"";if(live&&pin===null)return;
