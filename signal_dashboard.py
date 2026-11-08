@@ -3767,8 +3767,13 @@ def api_broker_save(request: Request, payload: dict = Body(...)):
     clean = {}
     for key, label in BROKER_FIELDS[b]:
         v = str(fields.get(key, "")).strip()
-        if not v or len(v) > 300:
+        if v[:7].lower() == "bearer ":
+            v = v[7:]
+        v = "".join(v.split())  # drop spaces and line breaks picked up when pasting
+        if not v:
             return {"error": f"{label} is required."}
+        if len(v) > (4000 if key == "access_token" else 300):  # Dhan tokens are long JWTs, 500+ characters
+            return {"error": f"{label} looks too long. Paste only the token itself."}
         clean[key] = v
     try:
         save_creds(u["id"], b, clean)
