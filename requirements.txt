@@ -6,3 +6,4 @@ yfinance
 requests
 cryptography
 psycopg2-binary
+websockets>=12

@@ -9,6 +9,7 @@ First sign-in: set ADMIN_USER and ADMIN_PASSWORD, or read the one-time password 
 Locked out: set ADMIN_RESET=1 with ADMIN_PASSWORD, restart once, sign in, then remove ADMIN_RESET.
 
 Optional env vars:  INTERVAL=5m|15m|1d  REFRESH_SECONDS=300  PORT=8000  HOST=0.0.0.0
+                     DATA_BROKER=dhan (one source: Dhan live stream + Dhan history)  CANDLE_SOURCE=dhan|yahoo  YAHOO_FALLBACK=0|1  LIVE_RESYNC_SECONDS=1800
   DATABASE_URL=<postgres address, keeps users across redeploys; also set SECRETS_KEY>
   DB_PATH=dashboard.db  ORDER_LOG=orders_log.jsonl  SECRETS_KEY=<Fernet key>  COOKIE_SECURE=1 (when served over https)
   LIVE_TRADING=1 (switch live trading on for the server; an admin must still enable it for each person)
@@ -28,6 +29,7 @@ import os
 import queue
 import re
 import secrets
+import struct
 import threading
 import time
 from datetime import datetime, timedelta, time as dtime
@@ -416,6 +418,600 @@ def analyse(symbol, df, interval):
     return base
 
 
+# ── Live candles: with a live price feed, the 5 and 15 minute candles are completed from the feed the moment each one closes,
+#    so signals appear within seconds instead of waiting for the data provider to publish the candle. ──
+LIVE_CANDLES = os.getenv("LIVE_CANDLES", "1") != "0"
+LIVE_TFS = ("5m", "15m")
+LIVE_MINUTES = {"5m": 5, "15m": 15}
+TAIL_BARS = 1500
+LIVE_RESYNC_SECONDS = int(os.getenv("LIVE_RESYNC_SECONDS", "1800"))   # with the Dhan stream running, a full re-read is only a safety net
+TAILS = {}     # (symbol, tf) -> the last closed candles from the data provider
+BUILD = {}     # (symbol, tf) -> the candle being built from feed prices
+CLOSED = {}    # (symbol, tf) -> {candle start: candle} finished from feed prices
+LIVEC = {tf: {"bucket": None, "at": None, "n": 0, "busy": False} for tf in LIVE_TFS}
+
+
+def live_active():
+    return LIVE_CANDLES and bool(FEED["t"]) and time.time() - FEED["t"] < 30 and market_window()
+
+
+def live_bucket(now, tf):
+    m = LIVE_MINUTES[tf]
+    mins = now.hour * 60 + now.minute
+    return now.normalize() + pd.Timedelta(minutes=(mins // m) * m)
+
+
+def live_tail(df):
+    """The closed candles worth keeping for the live engine, in India time."""
+    d = df.dropna(subset=["Close", "High", "Low", "Open"]).copy()
+    if d.empty:
+        return None
+    d.index = d.index.tz_localize("UTC").tz_convert(IST) if d.index.tz is None else d.index.tz_convert(IST)
+    keep = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in d]
+    return d[keep].tail(TAIL_BARS + 1)
+
+
+LIVE_LOCK = threading.RLock()
+LASTP = {}     # symbol -> price of the last tick since the feed (re)connected
+LASTV = {}     # symbol -> cumulative day volume at the last tick (Dhan's quote packets carry it)
+REPAIR = {tf: set() for tf in LIVE_TFS}   # symbols whose candle was only partly seen: re-read from the broker's history
+
+
+def live_tick(sym, price, now, cum=None):
+    """Feed one price (and the day's cumulative volume, when the feed has it) into the 5 and 15 minute candles."""
+    with LIVE_LOCK:
+        first = sym not in LASTP
+        prev_v = LASTV.get(sym)
+        LASTP[sym] = price
+        if cum is not None:
+            LASTV[sym] = cum
+        for tf in LIVE_TFS:
+            b = live_bucket(now, tf)
+            cur = BUILD.get((sym, tf))
+            if cur and cur["b"] == b:
+                cur["h"], cur["l"], cur["c"] = max(cur["h"], price), min(cur["l"], price), price
+                if cum is not None:
+                    cur["v"] = cum
+                continue
+            if cur:
+                _live_store(sym, tf, cur, b)
+            if cum is None:
+                v0 = None
+            elif prev_v is None:
+                v0 = cum
+            else:
+                v0 = 0 if cum < prev_v else prev_v   # the day's total starts again from zero each morning
+            late = first and (now - b).total_seconds() > 20   # connected mid-candle: its open and extremes were not all seen
+            BUILD[(sym, tf)] = {"b": b, "o": price, "h": price, "l": price, "c": price, "v0": v0, "v": cum, "part": bool(late and use_dhan())}
+
+
+def _live_store(sym, tf, cur, upto):
+    """Keep a finished candle, and fill candles in which nothing traded with flat ones, so no hole stops the scan."""
+    if cur.get("part"):
+        REPAIR[tf].add(sym)
+        return
+    got = CLOSED.setdefault((sym, tf), {})
+    got[cur["b"]] = cur
+    step, k = STEP[tf], cur["b"] + STEP[tf]
+    while k < upto and k.date() == cur["b"].date():
+        got[k] = {"b": k, "o": cur["c"], "h": cur["c"], "l": cur["c"], "c": cur["c"], "v0": 0, "v": 0}
+        k += step
+
+
+def live_reset():
+    """Forget the candles built so far: used when the feed connection starts again, as ticks may have been missed."""
+    with LIVE_LOCK:
+        BUILD.clear()
+        CLOSED.clear()
+        LASTP.clear()
+        LASTV.clear()
+
+
+def live_frame(sym, tf):
+    """Provider candles up to the last closed one, then the candles finished from the feed. None if there is a hole in between."""
+    base = TAILS.get((sym, tf))
+    if base is None or base.empty:
+        return None
+    base = drop_forming(base, tf)
+    if base.empty:
+        return None
+    last, step = base.index[-1], STEP[tf]
+    with LIVE_LOCK:
+        got = dict(CLOSED.get((sym, tf)) or {})
+    keys = sorted(k for k in got if k > last)
+    now = pd.Timestamp.now(tz=IST)
+    prev, rows = last, []
+    for k in keys:
+        if k.date() == prev.date() and k - prev != step:
+            return None
+        if k + step > now:
+            break
+        c = got[k]
+        vol = (c["v"] - c["v0"]) if c.get("v") is not None and c.get("v0") is not None else np.nan
+        rows.append((k, c["o"], c["h"], c["l"], c["c"], vol))
+        prev = k
+    if use_dhan() and last.date() == now.date() and prev < live_bucket(now, tf) - step:
+        return None   # candles are missing up to the one that just closed: keep the previous result until they are repaired
+    if not rows:
+        return base
+    add = pd.DataFrame([r[1:5] for r in rows], index=pd.DatetimeIndex([r[0] for r in rows]), columns=["Open", "High", "Low", "Close"])
+    if "Volume" in base:
+        add["Volume"] = [r[5] for r in rows]
+    return pd.concat([base, add])
+
+
+def live_rescan(tf):
+    """Recompute every symbol of one timeframe from provider candles plus feed-built candles, and publish the result."""
+    if not LIVE_CANDLES or tf not in LIVE_TFS or LIVEC[tf]["busy"]:
+        return 0
+    LIVEC[tf]["busy"] = True
+    try:
+        with LOCK:
+            old = list(STATES[tf]["rows"])
+        if not old:
+            return 0
+        out, n = [], 0
+        for r in old:
+            try:
+                df = live_frame(r["symbol"], tf)
+                row = analyse(r["symbol"], df, tf) if df is not None else None
+            except Exception:
+                row = None
+            if not row:
+                out.append(r)
+                continue
+            row.pop("hist", None)
+            row["vol"], row["val_cr"] = r.get("vol"), r.get("val_cr")   # traded value is carried from the last full scan
+            out.append(row)
+            n += 1
+        with LOCK:
+            STATES[tf].update(rows=out, updated=datetime.now().strftime("%d %b %H:%M:%S"))
+        LIVEC[tf].update(at=datetime.now().strftime("%H:%M:%S"), n=n)
+        try:
+            check_alerts(tf, out)
+        except Exception as e:
+            print("alert check failed:", e, flush=True)
+        return n
+    finally:
+        LIVEC[tf]["busy"] = False
+
+
+def live_repair(tf):
+    """Re-read the last few days of the symbols whose candle was only partly seen, straight from Dhan's history."""
+    with LIVE_LOCK:
+        todo = sorted(REPAIR[tf])
+        REPAIR[tf].clear()
+    if not todo or not use_dhan():
+        return 0
+    got, _ = dhan_frames(todo, tf, 3)
+    for s, df in got.items():
+        tl = live_tail(df)
+        if tl is None:
+            continue
+        with LIVE_LOCK:
+            old = TAILS.get((s, tf))
+            if old is not None and len(old):
+                tl = pd.concat([old[old.index < tl.index[0]], tl])   # the top-up is joined onto the longer history already kept
+            TAILS[(s, tf)] = tl.tail(TAIL_BARS + 1)
+            d = CLOSED.get((s, tf))
+            if d:
+                for k in [k for k in d if k <= tl.index[-1]]:
+                    d.pop(k, None)
+    return len(got)
+
+
+def live_cycle(tf):
+    try:
+        live_repair(tf)
+    except Exception as e:
+        DHAN_STAT["hist_error"] = f"{type(e).__name__}: {str(e)[:100]}"
+    live_rescan(tf)
+
+
+def live_boundary(now):
+    """Called about every second: when a candle has just closed, finish it and rescan that timeframe in the background."""
+    for tf in LIVE_TFS:
+        b = live_bucket(now, tf)
+        with LIVE_LOCK:
+            was = LIVEC[tf]["bucket"]
+            LIVEC[tf]["bucket"] = b
+            if was is None or b <= was:
+                continue
+            for k in [k for k, v in BUILD.items() if k[1] == tf and v["b"] < b]:
+                _live_store(k[0], tf, BUILD.pop(k), b)
+            if use_dhan():
+                for s in {s for (s, t) in TAILS if t == tf}:
+                    if s not in LASTP:
+                        REPAIR[tf].add(s)   # nothing has traded or arrived for it yet: take its candles from the history
+            cut = now - pd.Timedelta(days=3)
+            for k, d in CLOSED.items():
+                if k[1] == tf:
+                    for t in [t for t in d if t < cut]:
+                        d.pop(t, None)
+        threading.Thread(target=live_cycle, args=(tf,), daemon=True).start()
+
+
+# ── Dhan as the single data source: live prices over its WebSocket, candles from its historical API ──
+# With DATA_BROKER=dhan the dashboard reads everything from Dhan: the WebSocket feed gives every price and the day's running
+# volume, the historical API fills in the candles before the market opens, and each new 5 and 15 minute candle is built from the
+# stream. Yahoo is not used unless YAHOO_FALLBACK=1 or an admin switches the data source to Yahoo on the Admin page.
+CANDLE_SOURCE = os.getenv("CANDLE_SOURCE", "").strip().lower()      # "dhan" or "yahoo"; empty means dhan when DATA_BROKER=dhan
+YAHOO_FALLBACK = os.getenv("YAHOO_FALLBACK", "0") == "1"           # when on, a symbol Dhan cannot supply is read from Yahoo
+SRC = {"override": None}                                            # set from the Admin page: "dhan" or "yahoo"
+DHAN_STAT = {"ws": "off", "last": 0.0, "error": None, "frames": 0, "connects": 0, "subscribed": 0,
+             "hist_error": None, "hist_ok": 0, "hist_at": None, "tz": None}
+DHAN_WS_URL = "wss://api-feed.dhan.co"
+DHAN_SEG = {"IDX_I": 0, "NSE_EQ": 1, "NSE_FNO": 2, "NSE_CURRENCY": 3, "BSE_EQ": 4, "MCX_COMM": 5, "BSE_CURRENCY": 7, "BSE_FNO": 8}
+DHAN_PKT = {2: 16, 4: 50, 6: 16, 5: 12, 8: 162, 7: 10}             # packet sizes in bytes, header included
+DHAN_DATA_ERRORS = {
+    "800": "Dhan had an internal error", "804": "too many instruments requested", "805": "too many requests or connections",
+    "806": "Data APIs are not subscribed on this Dhan account (subscribe under web.dhan.co, My Profile, DhanHQ Trading APIs)",
+    "807": "the Dhan access token has expired", "808": "Dhan could not authenticate the token", "809": "the Dhan access token is invalid",
+    "810": "the Dhan client ID is invalid", "811": "invalid expiry", "812": "invalid date format", "813": "invalid security id",
+    "814": "invalid request", "DH-901": "the Dhan access token is invalid or expired", "DH-902": "Data APIs are not subscribed on this Dhan account",
+    "DH-904": "Dhan rate limit reached", "DH-905": "Dhan rejected the request"}
+DHAN_AUTH_CODES = {"807", "808", "809", "810", "DH-901", "DH-902", "806"}
+
+
+class DhanDataError(Exception):
+    def __init__(self, msg, auth=False):
+        super().__init__(msg)
+        self.auth = auth
+
+
+def data_source():
+    if SRC["override"] in ("dhan", "yahoo"):
+        return SRC["override"]
+    if CANDLE_SOURCE in ("dhan", "yahoo"):
+        return CANDLE_SOURCE
+    return "dhan" if DATA_BROKER == "dhan" else "yahoo"
+
+
+def use_dhan():
+    return DATA_BROKER == "dhan" and data_source() == "dhan"
+
+
+def _dhan_reason(res, status):
+    """A plain sentence for a refused Dhan data request. Returns (text, is_a_sign_in_problem)."""
+    codes = []
+    if isinstance(res, dict):
+        d = res.get("data")
+        if isinstance(d, dict):
+            codes += [str(k) for k in d]
+        for k in ("errorCode", "internalErrorCode"):
+            if res.get(k):
+                codes.append(str(res[k]))
+    if status in (401, 403) and not codes:
+        codes.append("808")
+    for c in codes:
+        if c in DHAN_DATA_ERRORS:
+            return f"{DHAN_DATA_ERRORS[c]} ({c})", c in DHAN_AUTH_CODES
+    msg = (res.get("errorMessage") or res.get("internalErrorMessage")) if isinstance(res, dict) else None
+    return (str(msg)[:120] if msg else f"HTTP {status}"), False
+
+
+_HTHROT = {"lock": threading.Lock(), "last": 0.0}
+
+
+def dhan_post(path, body):
+    """One Dhan data request, spaced to stay under the 5 a second limit that all threads share."""
+    with _HTHROT["lock"]:
+        wait = 0.21 - (time.time() - _HTHROT["last"])
+        if wait > 0:
+            time.sleep(wait)
+        _HTHROT["last"] = time.time()
+    c = feed_account().c
+    for attempt in range(2):
+        r = requests.post(DHAN_BASE + path, json=body, timeout=20,
+                          headers={"access-token": c["access_token"], "client-id": str(c["client_id"]),
+                                   "Content-Type": "application/json", "Accept": "application/json"})
+        if r.status_code == 429 and attempt == 0:
+            time.sleep(1.2)
+            continue
+        break
+    try:
+        res = r.json()
+    except ValueError:
+        res = None
+    if r.status_code != 200:
+        text, auth = _dhan_reason(res, r.status_code)
+        raise DhanDataError(text, auth)
+    if isinstance(res, dict) and res.get("status") == "failed":
+        text, auth = _dhan_reason(res, 200)
+        raise DhanDataError(text, auth)
+    return res
+
+
+def dhan_inst(sym):
+    """(security id, exchange segment, instrument) for a dashboard symbol, or None if Dhan's list does not have it."""
+    ix = INDEX_FEED["dhan"].get(sym)
+    if ix:
+        return ix[1], ix[0], "INDEX"
+    eq = M("dhan")["eq"].get(sym)
+    return (str(eq[0]), "NSE_EQ", "EQUITY") if eq else None
+
+
+def dhan_to_df(res, daily):
+    """Dhan's parallel arrays as a candle table. The time base of the epoch is read from the data itself."""
+    if not isinstance(res, dict) or not res.get("close"):
+        return None
+    ts = res.get("timestamp") or res.get("start_Time") or []
+    n = min(len(ts), len(res["close"]), len(res.get("open", [])), len(res.get("high", [])), len(res.get("low", [])))
+    if n == 0:
+        return None
+    vol = res.get("volume") or [0] * n
+    df = pd.DataFrame({"Open": res["open"][:n], "High": res["high"][:n], "Low": res["low"][:n], "Close": res["close"][:n],
+                       "Volume": (list(vol) + [0] * n)[:n]}, index=pd.to_datetime(list(ts)[:n], unit="s"))
+    if daily:
+        if (df.index.hour >= 12).any():   # midnight India time written as an epoch lands at 18:30 the evening before
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
+        df.index = pd.DatetimeIndex(df.index.date)
+        DHAN_STAT["tz"] = DHAN_STAT["tz"] or "daily"
+    else:
+        first = pd.Series(df.index).groupby(df.index.date).min()
+        mins = [t.hour * 60 + t.minute for t in first]
+        med = sorted(mins)[len(mins) // 2]
+        if 9 * 60 <= med <= 9 * 60 + 40 or med >= 15 * 60:   # the epoch already holds the India clock time (a first candle near 09:15)
+            df.index = df.index.tz_localize(IST)
+            DHAN_STAT["tz"] = "ist-clock"
+        else:
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
+            DHAN_STAT["tz"] = "utc"
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df.dropna(subset=["Close", "High", "Low", "Open"])
+
+
+def dhan_candles(sym, interval, days):
+    """Candles of one symbol from Dhan: intraday in pieces of up to 80 days, daily in one request."""
+    inst = dhan_inst(sym)
+    if not inst:
+        raise DhanDataError(f"{sym} is not in Dhan's instrument list")
+    sid, seg, kind = inst
+    now = ist_now()
+    end = now.date() + timedelta(days=1)
+    parts = []
+    if interval == "1d":
+        res = dhan_post("/charts/historical", {"securityId": sid, "exchangeSegment": seg, "instrument": kind, "expiryCode": 0, "oi": False,
+                                               "fromDate": (end - timedelta(days=days + 2)).isoformat(), "toDate": end.isoformat()})
+        df = dhan_to_df(res, True)
+        return df
+    mins = {"5m": 5, "15m": 15, "1h": 60}[interval]
+    start = end - timedelta(days=days)
+    while start < end:
+        stop = min(end, start + timedelta(days=80))
+        res = dhan_post("/charts/intraday", {"securityId": sid, "exchangeSegment": seg, "instrument": kind, "interval": mins, "oi": False,
+                                             "fromDate": f"{start.isoformat()} 00:00:00", "toDate": f"{stop.isoformat()} 00:00:00"})
+        d = dhan_to_df(res, False)
+        if d is not None and not d.empty:
+            parts.append(d)
+        start = stop
+    if not parts:
+        return None
+    df = pd.concat(parts)
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
+def _days(period):
+    return int(str(period).rstrip("dy")) * (365 if str(period).endswith("y") else 1)
+
+
+def yahoo_frames(symbols, interval, days):
+    """Candles per symbol from Yahoo (only used as the optional fallback)."""
+    import yfinance as yf
+    out = {}
+    span = {"period": f"{min(days, 58)}d"} if interval != "1d" else {"start": (ist_now().date() - timedelta(days=days + 5)).isoformat()}
+    tk = [yf_ticker(s) for s in symbols]
+    try:
+        data = yf.download(tk, interval=interval, group_by="ticker", auto_adjust=False, threads=True, progress=False, **span)
+    except Exception:
+        return out
+    for s, t in zip(symbols, tk):
+        try:
+            d = _one(data, t, len(tk)) if data is not None and not data.empty else None
+            if d is not None and not d.dropna(how="all").empty:
+                out[s] = d.dropna(how="all")
+        except Exception:
+            continue
+    return out
+
+
+def dhan_frames(symbols, interval, days, progress=None):
+    """({symbol: candles}, [problems]) from Dhan, with Yahoo filling the gaps only when YAHOO_FALLBACK is on."""
+    out, errs = {}, []
+    if not load_master("dhan"):
+        return out, ["Dhan's instrument list could not be loaded."]
+    for i, s in enumerate(symbols):
+        try:
+            d = dhan_candles(s, interval, days)
+            if d is None or d.empty:
+                errs.append(f"{s}: Dhan returned no candles")
+            else:
+                out[s] = d
+                DHAN_STAT.update(hist_ok=DHAN_STAT["hist_ok"] + 1, hist_at=time.time())
+        except DhanDataError as e:
+            errs.append(f"{s}: {e}")
+            if e.auth:   # the same sign-in problem would repeat for every symbol
+                DHAN_STAT["hist_error"] = str(e)
+                errs.append("Stopped: " + str(e) + ". Put a fresh Dhan access token in the DHAN_ACCESS_TOKEN setting.")
+                break
+        except Exception as e:
+            errs.append(f"{s}: {type(e).__name__}: {str(e)[:80]}")
+        if progress:
+            progress(i + 1, len(symbols))
+    if out:
+        DHAN_STAT["hist_error"] = None
+    elif errs:
+        DHAN_STAT["hist_error"] = errs[-1] if len(errs) == 1 else errs[0]
+    if YAHOO_FALLBACK:
+        miss = [s for s in symbols if s not in out]
+        if miss:
+            got = yahoo_frames(miss, interval, days)
+            out.update(got)
+            errs = [e for e in errs if e.split(":")[0] not in got]
+    return out, errs
+
+
+def candle_frames(symbols, interval, days):
+    """One place to get candles for a few symbols from whichever source is active."""
+    if use_dhan():
+        return dhan_frames(symbols, interval, days)
+    got = yahoo_frames(symbols, interval, days)
+    return got, ([] if got else ["The data provider returned no candles."])
+
+
+# ── The WebSocket client ──
+def dhan_parse(buf):
+    """Packets of one WebSocket message (little endian, 8 byte header: code, length, segment, security id).
+    Returns [{"code", "seg", "sid", "ltp", "vol"?, "disc"?}]. Unknown packets are skipped."""
+    out, i, n = [], 0, len(buf)
+    while i + 8 <= n:
+        code, length, seg, sid = struct.unpack_from("<BHBi", buf, i)
+        size = DHAN_PKT.get(code) or (length if length >= 8 else 8)
+        if i + size > n and code not in DHAN_PKT:
+            size = n - i
+        pkt = {"code": code, "seg": seg, "sid": sid}
+        try:
+            if code in (1, 2) and i + 12 <= n:
+                pkt["ltp"] = struct.unpack_from("<f", buf, i + 8)[0]
+            elif code == 4 and i + 50 <= n:
+                pkt["ltp"] = struct.unpack_from("<f", buf, i + 8)[0]
+                pkt["vol"] = struct.unpack_from("<i", buf, i + 22)[0]
+            elif code == 8 and i + 62 <= n:
+                pkt["ltp"] = struct.unpack_from("<f", buf, i + 8)[0]
+                pkt["vol"] = struct.unpack_from("<i", buf, i + 22)[0]
+            elif code == 50 and i + 10 <= n:
+                pkt["disc"] = struct.unpack_from("<h", buf, i + 8)[0]
+        except struct.error:
+            break
+        out.append(pkt)
+        i += max(size, 8)
+    return out
+
+
+def dhan_on_packets(pkts, lookup, now_ts=None):
+    """Apply parsed packets: update the live prices and feed the candle builder."""
+    now_ts = now_ts or time.time()
+    now = pd.Timestamp.fromtimestamp(now_ts, tz=IST)
+    today = now.strftime("%Y-%m-%d")
+    n = 0
+    for p in pkts:
+        if "ltp" not in p:
+            continue
+        sym = lookup.get((p["seg"], p["sid"]))
+        price = p["ltp"]
+        if not sym or not price or price != price or price <= 0:
+            continue
+        ref = candle_close(sym)
+        if ref and abs(price / ref - 1) > LTP_MAX_JUMP:
+            continue
+        LTP[sym] = {"p": float(price), "t": now_ts, "d": today}
+        n += 1
+        if LIVE_CANDLES:
+            live_tick(sym, float(price), now, p.get("vol") if (p.get("vol") or 0) > 0 else None)
+    if n:
+        DHAN_STAT["frames"] += n
+        DHAN_STAT["last"] = now_ts
+        FEED.update(count=len(LTP), t=now_ts, error=None)
+    return n
+
+
+def dhan_subscriptions(items):
+    """Subscribe messages, at most 100 instruments each: quotes (with volume) for shares, ticker for indices."""
+    msgs = []
+    for code, group in ((17, [x for x in items if x[1] != "IDX_I"]), (15, [x for x in items if x[1] == "IDX_I"])):
+        for i in range(0, len(group), 100):
+            part = group[i:i + 100]
+            msgs.append(json.dumps({"RequestCode": code, "InstrumentCount": len(part),
+                                    "InstrumentList": [{"ExchangeSegment": ex, "SecurityId": str(tok)} for _, ex, tok in part]}))
+    return msgs
+
+
+def dhan_ws_healthy():
+    return DHAN_STAT["ws"] == "connected" and time.time() - DHAN_STAT["last"] < 20
+
+
+def dhan_housekeeping(last_touch):
+    """About once a second while connected: finish candles that have just closed, and keep quiet shares' last prices valid."""
+    now = time.time()
+    if LIVE_CANDLES:
+        live_boundary(pd.Timestamp.now(tz=IST))
+    if now - last_touch >= 5:
+        today = ist_now().strftime("%Y-%m-%d")
+        for v in LTP.values():
+            if v.get("d") == today:   # no new trade is not a stale price while the connection is alive
+                v["t"] = now
+        return now
+    return last_touch
+
+
+def dhan_ws_session(connect=None, stop=None):
+    """One connection from connect to disconnect. Returns the reason it ended."""
+    load_master("dhan")
+    items = feed_items("dhan")
+    lookup = {(DHAN_SEG[ex], int(tok)): name for name, ex, tok in items}
+    c = feed_account().c
+    url = f"{DHAN_WS_URL}?version=2&token={c['access_token']}&clientId={c['client_id']}&authType=2"
+    if connect is None:
+        from websockets.sync.client import connect as ws_connect
+        connect = lambda u: ws_connect(u, open_timeout=15, max_size=2 ** 20, ping_interval=None)
+    first = DHAN_STAT["connects"] == 0
+    with connect(url) as ws:
+        DHAN_STAT.update(ws="connected", error=None, connects=DHAN_STAT["connects"] + 1, subscribed=len(items), last=time.time())
+        live_reset()
+        for m in dhan_subscriptions(items):
+            ws.send(m)
+        if not first:
+            for tf in LIVE_TFS:
+                if STATES[tf]["rows"]:
+                    threading.Thread(target=refresh, args=(tf,), daemon=True).start()   # fill what was missed while offline
+        touch = heard = time.time()
+        while market_window() and use_dhan() and not (stop and stop()):
+            try:
+                msg = ws.recv(timeout=1)
+            except TimeoutError:
+                msg = None
+            if isinstance(msg, (bytes, bytearray)):
+                heard = time.time()
+                pkts = dhan_parse(bytes(msg))
+                for p in pkts:
+                    if "disc" in p:
+                        code = str(p["disc"])
+                        text = DHAN_DATA_ERRORS.get(code, f"Dhan closed the live feed (code {code})")
+                        DHAN_STAT["error"] = text + f" ({code})"
+                        return "auth" if code in DHAN_AUTH_CODES else "refused"
+                dhan_on_packets(pkts, lookup)
+            touch = dhan_housekeeping(touch)
+            if time.time() - heard > 60:
+                return "silent"
+    return "closed"
+
+
+def dhan_ws_loop():
+    wait = 3
+    while True:
+        try:
+            if not (use_dhan() and market_window()):
+                DHAN_STAT["ws"] = "idle" if use_dhan() else "off"
+                time.sleep(15)
+                continue
+            why = dhan_ws_session()
+            DHAN_STAT["ws"] = "closed"
+            wait = 3 if why == "closed" else 60 if why in ("auth", "refused") else 5
+        except Exception as e:
+            DHAN_STAT["ws"] = "error"
+            text = f"{type(e).__name__}: {str(e)[:100]}"
+            resp = getattr(e, "response", None)
+            status = getattr(resp, "status_code", None)
+            if status in (401, 403):
+                text = "Dhan refused the live feed sign-in (the access token has probably expired)"
+            elif status == 429:
+                text = "Dhan allows 5 live feed connections: close the others"
+            DHAN_STAT["error"] = text
+            FEED["error"] = text
+            wait = min(60, wait * 2)
+        time.sleep(wait)
+
+
 # ── Data + cache (one cache per timeframe) ──
 HIST = {tf: [] for tf in INTERVALS}   # every past signal per timeframe, with its outcome
 STATES = {tf: {"rows": [], "updated": None, "errors": [], "refreshing": False, "checked": 0.0, "progress": None} for tf in INTERVALS}
@@ -435,12 +1031,37 @@ def _one(data, ticker, n_tickers):
 
 def fetch_all(interval, progress=None):
     """Download in small batches, retry a failed batch once, and report partial results as they arrive."""
-    import yfinance as yf  # imported lazily so the module loads without it
-
     rows, errors, hist = [], [], []
     for i in range(0, len(UNIVERSE), YF_BATCH):
         names = UNIVERSE[i:i + YF_BATCH]
         tickers = [yf_ticker(n) for n in names]
+        if use_dhan():
+            frames, errs = dhan_frames(names, interval, _days(PERIODS[interval]))
+            errors.extend(errs)
+            for sname in names:
+                df = frames.get(sname)
+                try:
+                    row = analyse(sname, df, interval) if df is not None else None
+                    if row and LIVE_CANDLES and interval in LIVE_TFS:
+                        tl = live_tail(df)
+                        if tl is not None:
+                            with LIVE_LOCK:
+                                TAILS[(sname, interval)] = tl
+                    if row:
+                        hist.extend(row.pop("hist", []))
+                        rows.append(row)
+                    elif df is not None:
+                        errors.append(f"{sname}: not enough data")
+                except Exception as e:
+                    errors.append(f"{sname}: {e}")
+            if DHAN_STAT["hist_error"] and not frames and any("Stopped:" in e for e in errs):
+                if progress:
+                    progress(list(rows), list(errors), len(UNIVERSE))
+                break
+            if progress:
+                progress(list(rows), list(errors), min(i + YF_BATCH, len(UNIVERSE)))
+            continue
+        import yfinance as yf  # imported lazily so the module loads without it
         data = None
         for attempt in range(2):
             try:
@@ -459,6 +1080,10 @@ def fetch_all(interval, progress=None):
                 try:
                     df = _one(data, t, len(tickers))
                     row = analyse(sname, df.dropna(how="all"), interval) if df is not None else None
+                    if row and LIVE_CANDLES and interval in LIVE_TFS:
+                        tl = live_tail(df)
+                        if tl is not None:
+                            TAILS[(sname, interval)] = tl
                     if row:
                         hist.extend(row.pop("hist", []))
                         rows.append(row)
@@ -493,12 +1118,14 @@ def refresh(interval):
                 st.update(rows=rows, errors=errors, updated=datetime.now().strftime("%d %b %H:%M:%S"))
                 HIST[interval] = hist
             else:
-                st["errors"] = errors or ["Yahoo returned no data."]
+                st["errors"] = errors or [f"{'Dhan' if use_dhan() else 'Yahoo'} returned no data."]
         if rows:
             try:
                 check_alerts(interval, rows)
             except Exception as e:
                 print("alert check failed:", e, flush=True)
+            if interval in LIVE_TFS and live_active():
+                live_rescan(interval)   # keep the candles the feed already finished if the provider is a candle behind
     except Exception as e:
         with LOCK:
             st["errors"] = [f"Data fetch failed: {e}"]
@@ -513,7 +1140,8 @@ def ensure_fresh(interval):
     """Rescan a timeframe in the background when its data is older than REFRESH_SECONDS."""
     st = STATES[interval]
     with LOCK:
-        stale = not st["refreshing"] and time.time() - st["checked"] > REFRESH_SECONDS
+        ttl = LIVE_RESYNC_SECONDS if (use_dhan() and interval in LIVE_TFS and dhan_ws_healthy()) else REFRESH_SECONDS
+        stale = not st["refreshing"] and time.time() - st["checked"] > ttl
     if stale:
         threading.Thread(target=refresh, args=(interval,), daemon=True).start()
 
@@ -1724,7 +2352,7 @@ def sync_status(u):
 # DATA_BROKER=angel|dhan with that broker's credentials in the environment turns on a live price feed for the dashboard.
 # Without it the dashboard uses Yahoo's candle closes, which can lag. Automatic stop-loss and trailing work either way.
 DATA_BROKER = os.getenv("DATA_BROKER", "").strip().lower()
-FEED_SECONDS = max(5, int(os.getenv("FEED_SECONDS", "10")))
+FEED_SECONDS = max(1, int(os.getenv("FEED_SECONDS", "5")))   # one call fetches every symbol; Dhan allows about one such call a second
 AUTOPILOT_SECONDS = max(5, int(os.getenv("AUTOPILOT_SECONDS", "10")))
 LTP_MAX_AGE = 60            # seconds a live price stays usable
 LTP_MAX_JUMP = 0.25         # a live price more than 25% from the candle close is treated as bad data
@@ -1805,7 +2433,11 @@ def feed_once():
             continue
         LTP[sym] = {"p": float(p), "t": now}
         n += 1
+        if LIVE_CANDLES:
+            live_tick(sym, float(p), pd.Timestamp.now(tz=IST))
     FEED.update(count=n, t=now, error=None)
+    if LIVE_CANDLES:
+        live_boundary(pd.Timestamp.now(tz=IST))
     return n
 
 
@@ -1818,7 +2450,8 @@ def feed_loop():
     while True:
         try:
             if market_window():
-                feed_once()
+                if not (use_dhan() and dhan_ws_healthy()):   # the live stream does the work while it is healthy
+                    feed_once()
             else:
                 time.sleep(30)
         except Exception as e:
@@ -1984,6 +2617,8 @@ def start_engine():
     if DATA_BROKER in ("angel", "dhan"):
         FEED["source"] = DATA_BROKER
         threading.Thread(target=feed_loop, daemon=True).start()
+    if DATA_BROKER == "dhan":
+        threading.Thread(target=dhan_ws_loop, daemon=True).start()
 
 
 # ── BSE index options (Sensex, Bankex): NSE's site has no BSE contracts, so the chain is built from the broker's instrument list
@@ -2359,6 +2994,9 @@ NIFTY_STATE = {}   # user id -> {"day": date string, "done": True, "why": text}
 
 
 def nifty_frame():
+    if use_dhan():
+        got, _ = dhan_frames(["NIFTY"], "5m", 7)
+        return got.get("NIFTY")
     import yfinance as yf
     df = yf.download("^NSEI", period="7d", interval="5m", auto_adjust=False, progress=False)
     if df is None or df.empty:
@@ -2451,8 +3089,10 @@ STOCK_GAP_MAX = float(os.getenv("STOCK_GAP_MAX", str(OPTBOT_MAX_CHG)))
 
 
 def stock_frames(symbols):
-    import yfinance as yf
     out = {}
+    if use_dhan():
+        return dhan_frames(list(symbols), "5m", 7)[0]
+    import yfinance as yf
     tk = [yf_ticker(s) for s in symbols]
     df = yf.download(" ".join(tk), period="7d", interval="5m", auto_adjust=False, progress=False, group_by="ticker", threads=True)
     if df is None or df.empty:
@@ -2880,7 +3520,6 @@ def bt_norm(df):
 
 def bt_fetch(symbols, interval, days, progress=None):
     """Candles per symbol from Yahoo, 10 minutes of caching. Returns ({symbol: candles}, [problems])."""
-    import yfinance as yf
     out, bad, need, now = {}, [], [], time.time()
     for s in symbols:
         hit = BT_CACHE.get((s, interval, days))
@@ -2888,6 +3527,16 @@ def bt_fetch(symbols, interval, days, progress=None):
             out[s] = hit[1]
         else:
             need.append(s)
+    if use_dhan():
+        got, errs = dhan_frames(need, interval, days, progress=(lambda a, b: progress(a, b)) if progress else None)
+        for s, d in got.items():
+            d = bt_norm(d)
+            if not d.empty:
+                out[s] = d
+                BT_CACHE[(s, interval, days)] = (time.time(), d)
+        bad.extend(errs)
+        return out, bad
+    import yfinance as yf
     # Yahoo refuses intraday requests that reach back more than 60 days, so those use a period; daily candles use a start date
     span = {"period": f"{min(days, 58)}d"} if interval != "1d" else {"start": (ist_now().date() - timedelta(days=days + 5)).isoformat()}
     errs = []
@@ -3960,11 +4609,24 @@ def api_signals(tf: str = DEFAULT_INTERVAL):
         **snap,
         "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"]},
         "interval": tf,
+        "live": {"on": bool(live_active() and tf in LIVE_TFS), "at": LIVEC.get(tf, {}).get("at"), "source": data_source() if DATA_BROKER == "dhan" else "yahoo",
+                 "stream": dhan_ws_healthy() if DATA_BROKER == "dhan" else False},
         "intervals": INTERVALS,
         "fresh_bars": FRESH_BARS,
         "symbols": SYMBOLS,
         "indices": INDICES,
     })
+
+
+@app.get("/api/ticks")
+def api_ticks(tf: str = DEFAULT_INTERVAL):
+    """Just the live prices (a few KB), so the page can update every couple of seconds without reloading every row."""
+    if tf not in INTERVALS:
+        tf = DEFAULT_INTERVAL
+    with LOCK:
+        rows = list(STATES[tf]["rows"])
+    out = {r["symbol"]: [r["ltp"], r.get("ltp_chg")] for r in apply_live(rows) if r.get("ltp")}
+    return {"p": out, "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "source": FEED["source"]}
 
 
 @app.post("/api/refresh")
@@ -4660,8 +5322,11 @@ CHART_BARS = {"5m": 400, "15m": 400, "1d": 500}
 
 
 def chart_data(symbol, tf, at=0):
-    import yfinance as yf
-    df = yf.download(yf_ticker(symbol), period=PERIODS[tf], interval=tf, auto_adjust=False, progress=False)
+    if use_dhan():
+        df = dhan_frames([symbol], tf, _days(PERIODS[tf]))[0].get(symbol)
+    else:
+        import yfinance as yf
+        df = yf.download(yf_ticker(symbol), period=PERIODS[tf], interval=tf, auto_adjust=False, progress=False)
     if df is None or df.empty:
         return None
     if getattr(df.columns, "nlevels", 1) > 1:
@@ -5501,6 +6166,40 @@ def api_admin_overview(request: Request):
             "auto": {"last_age": None if not AUTO["last"] else int(time.time() - AUTO["last"]), "error": AUTO["error"]}}
 
 
+def source_report():
+    on = DATA_BROKER == "dhan"
+    return {"dhan_available": on, "source": data_source(), "fallback": YAHOO_FALLBACK, "stream": DHAN_STAT["ws"], "healthy": dhan_ws_healthy(),
+            "stream_error": DHAN_STAT["error"], "hist_error": DHAN_STAT["hist_error"], "subscribed": DHAN_STAT["subscribed"],
+            "age": None if not DHAN_STAT["last"] else int(time.time() - DHAN_STAT["last"]), "connects": DHAN_STAT["connects"],
+            "hist_ok": DHAN_STAT["hist_ok"], "clock": DHAN_STAT["tz"]}
+
+
+@app.get("/api/admin/source")
+def api_admin_source(request: Request):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    return source_report()
+
+
+@app.post("/api/admin/source")
+def api_admin_source_set(request: Request, payload: dict = Body(...)):
+    """Switch where candles and prices come from: Dhan (the default with a Dhan feed) or Yahoo."""
+    denied = need_admin(request)
+    if denied:
+        return denied
+    want = str(payload.get("source", "")).lower()
+    if want not in ("dhan", "yahoo"):
+        return {"error": "Choose dhan or yahoo."}
+    if want == "dhan" and DATA_BROKER != "dhan":
+        return {"error": "Dhan cannot be the data source until DATA_BROKER=dhan and the Dhan details are set on the server."}
+    SRC["override"] = want
+    live_reset()
+    for tf in INTERVALS:
+        STATES[tf]["checked"] = 0.0    # every timeframe is read again from the new source the next time someone looks
+    return {"ok": True, **source_report()}
+
+
 @app.get("/api/admin/session")
 def api_admin_session(request: Request):
     denied = need_admin(request)
@@ -6209,6 +6908,10 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="sub">On a day the exchange opens outside the usual hours (Muhurat trading, a weekend session), live orders stay blocked until you open it here. It lasts for today only and is forgotten on restart. To keep it through restarts, set SPECIAL_SESSIONS (for example 2026-11-08 18:00-19:15) in Render.</div>
   <div class="botrow"><label>From<input id="ssFrom" value="09:15" size="5"></label><label>To<input id="ssTo" value="15:30" size="5"></label><button class="btn go" id="ssOpen">Open for today</button><button class="btn" id="ssClear">Clear</button></div>
   <div class="sub" id="ssNote"></div></div>
+ <div class="card"><h3>Data source</h3>
+  <div class="sub">Where candles and live prices come from. With Dhan, prices stream over Dhan's WebSocket and the candles come from Dhan's historical data, so there is a single source. Yahoo is slower and can lag, so it is only a fallback.</div>
+  <div class="botrow"><button class="btn go" id="srcDhan">Use Dhan</button><button class="btn" id="srcYahoo">Use Yahoo</button></div>
+  <div class="sub" id="srcNote"></div></div>
  <div class="card"><h3>Everyone's orders today</h3><div class="wrap"><table id="admOrd"></table></div></div>
  <div class="card"><h3>Add a user</h3>
   <div class="grid2" style="margin-bottom:0"><label>Username<input id="nuName" autocomplete="off"></label><label>Temporary password (at least 10 characters)<input id="nuPw" type="password" autocomplete="new-password"></label></div>
@@ -6279,9 +6982,15 @@ document.getElementById("tfs").onclick=e=>{const b=e.target.closest("button");if
  tf=b.dataset.tf;try{localStorage.setItem("tf",tf)}catch(x){}
  data=null;document.getElementById("body").innerHTML=`<tr><td colspan="14" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;
  optOverride="";document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(osym)loadChain();if(mode==="history")loadHistory()};
+let tickT=null,tickBusy=false;
+async function tick(){clearTimeout(tickT);
+ try{if(mode==="stocks"&&data&&data.feed&&data.feed.source&&!document.hidden&&!tickBusy){tickBusy=true;const asked=tf;const d=await (await api("/api/ticks?tf="+asked)).json();tickBusy=false;
+  if(asked===tf&&data&&d.p&&d.age!=null&&d.age<30){let ch=false;for(const r of data.rows){const x=d.p[r.symbol];if(x&&(r.ltp!==x[0]||r.ltp_chg!==x[1])){r.ltp=x[0];if(x[1]!=null)r.ltp_chg=x[1];ch=true}}if(ch)render()}}}
+ catch(e){tickBusy=false}
+ tickT=setTimeout(tick,2000)}
 async function load(){clearTimeout(timer);const asked=tf;
  try{const d=await (await api("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;detectNew(d);render();
-  timer=setTimeout(load,(d.refreshing||!d.updated)?3000:20000)}
+  timer=setTimeout(load,(d.refreshing||!d.updated)?3000:20000);if(!tickT)tick()}
  catch(e){document.getElementById("meta").textContent="Cannot reach the server.";timer=setTimeout(load,10000)}}
 async function loadFutInfo(){if(futLoaded)return;futLoaded=true;
  try{const d=await (await api("/api/futures/info")).json();futInfo=d.info||{};if(!d.ok)futLoaded=false;render()}catch(e){futLoaded=false}}
@@ -6330,7 +7039,7 @@ function render(){
  const t=document.getElementById("tally");
  t.innerHTML=tabs.map(x=>`<button class="${x[3]}" data-f="${x[0]}" aria-pressed="${filter===x[0]}"><b>${x[2]}</b><span>${x[1]}</span></button>`).join("");
  t.onclick=e=>{const b=e.target.closest("button");if(b){filter=b.dataset.f;render()}};
- document.getElementById("meta").innerHTML=`<span class="ai">✦ AI-Powered Trade Scanner</span> · `+(data.updated?`Updated ${esc(data.updated)} · `:"")+`${tfName[data.interval]} candles`+(data.refreshing?(data.progress?` · scanning ${data.progress[0]} of ${data.progress[1]}…`:" · scanning…"):"");
+ document.getElementById("meta").innerHTML=`<span class="ai">✦ AI-Powered Trade Scanner</span> · `+(data.live&&data.live.on?`<b title="Candles are completed from the live feed the moment they close">Live candles${data.live.at?" "+esc(data.live.at):""}</b> · `:(data.updated?`Updated ${esc(data.updated)} · `:""))+`${tfName[data.interval]} candles`+(data.live?` · <span title="Where candles and prices come from">${data.live.source==="dhan"?(data.live.stream?"Dhan live stream":"Dhan"):"Yahoo"}</span>`:"")+(data.refreshing?(data.progress?` · scanning ${data.progress[0]} of ${data.progress[1]}…`:" · scanning…"):"");
  let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q))&&(!$("confOnly").checked||(r.conf&&r.conf.g==="A"))&&(sector==="ALL"||(r.sector||"Others")===sector));
  v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
   if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
@@ -6767,8 +7476,12 @@ async function loadOverview(){const d=await (await api("/api/admin/overview")).j
  const t=$("admOrd");if(!d.orders.length){t.innerHTML=`<tbody><tr><td class="empty" style="text-align:left">No orders have been placed today.</td></tr></tbody>`;return}
  t.innerHTML=`<thead><tr><th>Time</th><th>User</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th><th>Broker</th></tr></thead><tbody>`+d.orders.map(o=>`<tr><td>${esc(o.time)}</td><td>${esc(o.username)}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}</td><td>${esc(o.side)}</td><td>${o.qty}</td><td>${o.order_type==="LIMIT"?f2(o.price):o.avg_price?f2(o.avg_price):"Market"}</td><td>${esc(o.status)}</td><td>${esc(o.broker||"paper")}</td></tr>`).join("")+"</tbody>"}
 async function loadSession(){try{const d=await (await api("/api/admin/session")).json();if(d.error)return;$("ssNote").textContent=(d.override?`Special session open today ${d.override.start} to ${d.override.end}. `:"")+(d.env.length?`From settings: ${d.env.join(", ")}. `:"")+(d.open_now?"The market counts as open right now.":"The market counts as closed right now.")}catch(e){}}
+async function loadSource(){try{const d=await (await api("/api/admin/source")).json();if(d.error){$("srcNote").textContent=d.error;return}
+ const sm={connected:"connected",idle:"waiting for the market",closed:"reconnecting",error:"error",off:"off"};
+ $("srcNote").innerHTML=`Now using <b>${d.source==="dhan"?"Dhan":"Yahoo"}</b>`+(d.dhan_available?(`. Live stream: ${sm[d.stream]||esc(d.stream)}`+(d.subscribed?`, ${d.subscribed} instruments`:"")+(d.age!=null&&d.healthy?`, last price ${d.age}s ago`:"")+(d.stream_error?`. <span style="color:var(--sell)">${esc(d.stream_error)}</span>`:"")+(d.hist_error?`. <span style="color:var(--sell)">Dhan history: ${esc(d.hist_error)}</span>`:"")+(d.clock?`. Candle clock: ${esc(d.clock)}`:"")+(d.fallback?". Yahoo fills any gap.":"")):". Dhan is not set up on this server.")}catch(e){}}
+async function srcSet(w){const d=await post("/api/admin/source",{source:w});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
 async function ssSet(b){const d=await post("/api/admin/session",b);if(d.error)$("ssNote").textContent=d.error;else loadSession()}
-async function loadUsers(){loadSession();loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
+async function loadUsers(){loadSession();loadSource();loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
 function renderUsers(){const bn=(me&&me.broker_names)||{};
  $("usrTable").innerHTML=`<thead><tr><th>User</th><th>Role</th><th>Active</th><th>Live trading</th><th>Brokers</th><th>Order PIN</th><th></th></tr></thead><tbody>`+users.map(u=>`<tr><td><b>${esc(u.username)}</b></td><td>${u.role}</td><td><input type="checkbox" data-act="active" data-id="${u.id}" ${u.active?"checked":""} aria-label="Active"></td><td><input type="checkbox" data-act="live" data-id="${u.id}" ${u.live_allowed?"checked":""} aria-label="Live trading"></td><td>${u.brokers.map(b=>esc(bn[b]||b)).join(", ")||"–"}</td><td>${u.pin_set?"Set":"Not set"}</td><td><button class="mini" data-act="limits" data-id="${u.id}">Limits</button> <button class="mini" data-act="role" data-id="${u.id}">Make ${u.role==="admin"?"user":"admin"}</button> <button class="mini" data-act="reset" data-id="${u.id}">Reset password</button> <button class="mini" data-act="del" data-id="${u.id}">Delete</button></td></tr>`).join("")+"</tbody>"}
 $("usrTable").onchange=async e=>{const c=e.target.closest("input[data-act]");if(!c)return;
@@ -6781,7 +7494,7 @@ $("usrTable").onclick=async e=>{const b=e.target.closest("button[data-act]");if(
  else if(b.dataset.act==="limits"){limUser=u;const c=u.caps;$("limTitle").textContent="Limits for "+u.username;$("limValue").value=c.max_order_value;$("limQty").value=c.max_qty;$("limOrders").value=c.max_orders;$("limLots").value=c.max_fut_lots;$("limFut").value=c.max_fut_value;$("limSell").value=c.allow_option_selling?"1":"0";$("limMsg").textContent="";$("limDlg").showModal();return}
  if(d)$("admNote").textContent=d.error||"Saved.";loadUsers()};
 $("limClose").onclick=()=>$("limDlg").close();
-$("ssOpen").onclick=()=>ssSet({start:$("ssFrom").value,end:$("ssTo").value});$("ssClear").onclick=()=>ssSet({clear:true});
+$("ssOpen").onclick=()=>ssSet({start:$("ssFrom").value,end:$("ssTo").value});$("ssClear").onclick=()=>ssSet({clear:true});$("srcDhan").onclick=()=>srcSet("dhan");$("srcYahoo").onclick=()=>srcSet("yahoo");
 $("limSave").onclick=async()=>{const d=await send("PATCH","/api/admin/users/"+limUser.id,{caps:{max_order_value:$("limValue").value,max_qty:$("limQty").value,max_orders:$("limOrders").value,max_fut_lots:$("limLots").value,max_fut_value:$("limFut").value,allow_option_selling:$("limSell").value==="1"}});
  if(d.error){$("limMsg").textContent=d.error;return}$("limDlg").close();loadUsers()};
 $("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{username:$("nuName").value,password:$("nuPw").value,role:$("nuRole").value});$("admNote").textContent=d.error||"User added. Live trading is off for them until you enable it.";if(!d.error){$("nuName").value="";$("nuPw").value=""}loadUsers()};
