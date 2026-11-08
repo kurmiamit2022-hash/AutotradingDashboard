@@ -4998,6 +4998,9 @@ def api_preview(request: Request, payload: dict = Body(...)):
     order, err, warnings, lines = make_order(payload, u)
     if err:
         return {"error": err}
+    if order["mode"] != "live":
+        why = live_blocker(u)
+        warnings = list(warnings) + ["PAPER ORDER: nothing is sent to your broker. " + (why if why else "To send real orders, switch the toggle at the top of the page from Paper to Live (it asks for your order PIN), then review the order again. Signing in always starts in Paper.")]
     token = secrets.token_urlsafe(16)
     now = time.time()
     with ORDER_LOCK:
