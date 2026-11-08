@@ -2067,25 +2067,34 @@ OPTBOT_SQUAREOFF = dtime(*map(int, os.getenv("OPTBOT_SQUAREOFF", "15:15").split(
 OPTBOT_NEAR_ATR = float(os.getenv("OPTBOT_NEAR_ATR", "0.6"))   # price must be within this many ATRs of the 20 EMA
 OPTBOT_MAX_CHG = float(os.getenv("OPTBOT_MAX_CHG", "2"))       # day change limit, percent, each side
 OPTBOT_MAX_LOSS_PCT = float(os.getenv("OPTBOT_MAX_LOSS_PCT", "50"))   # the option stop is never set further than this percent below the price paid
-OPTBOT = {}   # user id -> settings. Kept in memory: after a restart the autopilot is Off until you switch it on again
+OPTBOT = {}   # (user id, "scanner" or "nifty") -> settings. Two separate autopilots with their own mode, limits and Play/Pause/Stop. Kept in memory: after a restart the autopilot is Off until you switch it on again
 OPTBOT_LOG = []
 OPTBOT_SKIP = {}   # (user id, symbol) -> time until which a stock that could not be traded is left alone
 OPTBOT_DEFAULTS = {"mode": "off", "strategy": "scanner", "paused": False, "last_mode": "paper", "max_trades": 3, "lots": 1, "loss_limit": 3000.0, "armed_day": None}
 
 
-def bot_cfg(uid):
-    return OPTBOT.setdefault(uid, dict(OPTBOT_DEFAULTS))
+BOT_KINDS = ("scanner", "nifty")
 
 
-def bot_log(uid, text):
-    OPTBOT_LOG.append({"uid": uid, "t": ist_now().strftime("%H:%M:%S"), "text": text})
+def bot_kind(v):
+    return "nifty" if v == "nifty" else "scanner"
+
+
+def bot_cfg(uid, kind="scanner"):
+    kind = bot_kind(kind)
+    return OPTBOT.setdefault((uid, kind), dict(OPTBOT_DEFAULTS, strategy=kind, **({"max_trades": 1} if kind == "nifty" else {})))
+
+
+def bot_log(uid, text, bot=None):
+    OPTBOT_LOG.append({"uid": uid, "bot": bot, "t": ist_now().strftime("%H:%M:%S"), "text": text})
     del OPTBOT_LOG[:-200]
 
 
-def bot_positions(uid, open_only=True):
+def bot_positions(uid, open_only=True, kind=None):
     with ORDER_LOCK:
         td = ist_now().strftime("%Y-%m-%d")
-        return [o for o in ORDERS if o.get("user") == uid and o.get("bot") and ((o.get("bot_state") == "open") if open_only else o.get("date") == td)]
+        return [o for o in ORDERS if o.get("user") == uid and o.get("bot") and (kind is None or bot_kind(o.get("bot_strategy")) == kind)
+                and ((o.get("bot_state") == "open") if open_only else o.get("date") == td)]
 
 
 def bot_pnl(o):
@@ -2095,9 +2104,9 @@ def bot_pnl(o):
     return None
 
 
-def bot_day_loss(uid):
-    """Net loss today across closed autopilot trades (0 or less means no loss)."""
-    return -sum(bot_pnl(o) or 0 for o in bot_positions(uid, open_only=False))
+def bot_day_loss(uid, kind=None):
+    """Net loss today across closed autopilot trades of one bot (0 or less means no loss)."""
+    return -sum(bot_pnl(o) or 0 for o in bot_positions(uid, open_only=False, kind=kind))
 
 
 def bot_place(u, o, entry_rec=None, exit_px=None):
@@ -2187,13 +2196,13 @@ def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False):
     rows = (ch or {}).get("rows") or []
     if not rows or not ch.get("expiry"):
         OPTBOT_SKIP[(u["id"], c["symbol"])] = time.time() + 300
-        bot_log(u["id"], f"{c['symbol']}: no option chain, skipped for 5 minutes.")
+        bot_log(u["id"], f"{c['symbol']}: no option chain, skipped for 5 minutes.", bot=strategy)
         return "skip"
     row = min(rows, key=lambda r: abs(r["strike"] - c["px"]))
     ltp = (row.get(right.lower()) or {}).get("ltp")
     if not ltp:
         OPTBOT_SKIP[(u["id"], c["symbol"])] = time.time() + 300
-        bot_log(u["id"], f"{c['symbol']}: no price for the {int(row['strike'])} {right}, skipped for 5 minutes.")
+        bot_log(u["id"], f"{c['symbol']}: no price for the {int(row['strike'])} {right}, skipped for 5 minutes.", bot=strategy)
         return "skip"
     limit = round(round(ltp * 1.01 / 0.05) * 0.05, 2)
     payload = {"kind": "option", "symbol": c["symbol"], "side": "BUY", "qty": cfg["lots"], "order_type": "LIMIT", "price": limit,
@@ -2201,14 +2210,14 @@ def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False):
     order, err, _, _ = make_order(payload, u, force=mode)
     if err:
         OPTBOT_SKIP[(u["id"], c["symbol"])] = time.time() + 300
-        bot_log(u["id"], f"{c['symbol']} {right}: {err} (skipped for 5 minutes)")
+        bot_log(u["id"], f"{c['symbol']} {right}: {err} (skipped for 5 minutes)", bot=strategy)
         return "skip"
     if order["mode"] != mode:
-        bot_log(u["id"], "Your trading mode changed, so no order was sent.")
+        bot_log(u["id"], "Your trading mode changed, so no order was sent.", bot=strategy)
         return "changed"
     rec, err = bot_place(u, order)
     if err:
-        bot_log(u["id"], f"{c['symbol']} {right}: {err}")
+        bot_log(u["id"], f"{c['symbol']} {right}: {err}", bot=strategy)
         notify_user(u["id"], f"Autopilot order failed: {c['symbol']}", err)
         if err.startswith("UNSURE"):
             cfg["mode"] = "off"
@@ -2224,7 +2233,7 @@ def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False):
                bot_t1_done=False, bot_exit_px=None, bot_reason=None)
     append_log(rec)
     bot_log(u["id"], f"{'LIVE' if mode == 'live' else 'Paper'} BUY {rec['label']} at about {limit:.2f}: {c['symbol']} {c['px']:.2f}, {c['note']}. "
-                     f"Option stop {p_sl:.2f}, T1 {p_t1:.2f}, T2 {p_t2:.2f} (delta {delta:.2f}); {c['symbol']} stop {lv['sl']:.2f}, target {lv['tp2']:.2f}.")
+                     f"Option stop {p_sl:.2f}, T1 {p_t1:.2f}, T2 {p_t2:.2f} (delta {delta:.2f}); {c['symbol']} stop {lv['sl']:.2f}, target {lv['tp2']:.2f}.", bot=strategy)
     notify_user(u["id"], f"Autopilot bought {rec['label']}", f"{mode} order at about {limit:.2f}. Option stop {p_sl:.2f}, target {p_t2:.2f}.")
     return "done"
 
@@ -2361,12 +2370,12 @@ def nifty_enter(u, cfg):
         return False   # the data provider is a little late, so look again shortly
     if why:
         st.update(day=today, done=True, why=why)
-        bot_log(u["id"], f"NIFTY: no trade today, {why}.")
+        bot_log(u["id"], f"NIFTY: no trade today, {why}.", bot="nifty")
         return False
     plan, why = nifty_plan(side, prev, first)
     if not plan:
         st.update(day=today, done=True, why=why)
-        bot_log(u["id"], f"NIFTY: no trade today, {why}.")
+        bot_log(u["id"], f"NIFTY: no trade today, {why}.", bot="nifty")
         return False
     c = {"symbol": "NIFTY", "side": plan["side"], "px": plan["entry"], "levels": {"sl": plan["sl"], "tp1": plan["tp1"], "tp2": plan["tp2"]},
          "note": f"gap {plan['gap']:+.2f}% with yesterday's {plan['side']} signal open; stop at {plan['sl_name']}, target pivot {plan['target_name']}, reward/risk {plan['rr']:.1f}"}
@@ -2409,14 +2418,14 @@ def bot_exit(u, pos, reason):
         pos["bot_warned"] = True
         append_log(pos)
         if unsure:
-            bot_cfg(u["id"])["mode"] = "off"
+            bot_cfg(u["id"], pos.get("bot_strategy"))["mode"] = "off"
         notify_user(u["id"], f"AUTOPILOT EXIT FAILED: {pos['label']}", f"{err}\nYour option position may still be open or may already be sold. Check your broker app now.")
-        bot_log(u["id"], f"Exit of {pos['label']} failed: {err}")
+        bot_log(u["id"], f"Exit of {pos['label']} failed: {err}", bot=bot_kind(pos.get("bot_strategy")))
         return
     pos.update(bot_state="closed", bot_exit_px=ltp, bot_reason=reason)
     append_log(pos)
     pnl = bot_pnl(pos)
-    bot_log(u["id"], f"Sold {pos['label']} at about {limit:.2f} ({reason})" + (f", profit/loss {pnl:+.0f}." if pnl is not None else "."))
+    bot_log(u["id"], f"Sold {pos['label']} at about {limit:.2f} ({reason})" + (f", profit/loss {pnl:+.0f}." if pnl is not None else "."), bot=bot_kind(pos.get("bot_strategy")))
     notify_user(u["id"], f"Autopilot sold {pos['label']}", f"{reason}. Sold at about {limit:.2f}.")
 
 
@@ -2441,7 +2450,7 @@ def bot_manage(u, pos):
         pos["bot_t1_done"] = True
         pos["bot_p_sl"] = max(pos["bot_p_sl"], pos["bot_p0"])
         append_log(pos)
-        bot_log(u["id"], f"{pos['label']}: T1 reached at {ltp:.2f}, option stop moved to the entry price {pos['bot_p0']:.2f}.")
+        bot_log(u["id"], f"{pos['label']}: T1 reached at {ltp:.2f}, option stop moved to the entry price {pos['bot_p0']:.2f}.", bot=bot_kind(pos.get("bot_strategy")))
 
 
 def optbot_once():
@@ -2449,7 +2458,7 @@ def optbot_once():
         return
     today = ist_now().strftime("%Y-%m-%d")
     now_t = ist_now().time()
-    uids = {uid for uid, c in OPTBOT.items() if c["mode"] != "off"} | {o["user"] for o in list(ORDERS) if o.get("bot") and o.get("bot_state") == "open"}
+    uids = {k[0] for k, c in OPTBOT.items() if c["mode"] != "off"} | {o["user"] for o in list(ORDERS) if o.get("bot") and o.get("bot_state") == "open"}
     for o in list(ORDERS):
         if o.get("bot") and o.get("bot_state") in ("open", "unconfirmed") and o.get("date") != today:
             o["bot_state"] = "closed"   # an intraday position from an earlier day is closed by the broker, so it is no longer managed
@@ -2457,36 +2466,36 @@ def optbot_once():
             append_log(o)
     for uid in uids:
         u = user_by_id(uid)
-        cfg = bot_cfg(uid)
         if not u:
             continue
-        try:
-            if cfg["mode"] == "live" and (cfg["armed_day"] != today or user_mode(u)[0] != "live"):
-                cfg["mode"] = "off"
-                bot_log(uid, "Live autopilot was switched off because it was not armed today or your account is no longer in live mode.")
-                notify_user(uid, "Autopilot switched off", "Live autopilot needs your PIN each day, and your account must be in live mode.")
-            for pos in bot_positions(uid):
-                if pos["mode"] == "live":
-                    sync_status(u)
-                bot_manage(u, pos)
-            if cfg["mode"] == "off" or cfg.get("paused") or not (OPTBOT_FIRST_ENTRY <= now_t <= OPTBOT_LAST_ENTRY):
-                continue
-            made = bot_positions(uid, open_only=False)
-            if len(made) >= cfg["max_trades"] or len(bot_positions(uid)) >= 2:
-                continue
-            if bot_day_loss(uid) >= cfg["loss_limit"]:
-                cfg["mode"] = "off"
-                bot_log(uid, f"Daily loss limit of {cfg['loss_limit']:.0f} reached. Autopilot switched off for today.")
-                notify_user(uid, "Autopilot stopped: loss limit", f"The daily loss limit of {cfg['loss_limit']:.0f} was reached.")
-                continue
-            cfg["last_scan"] = now_t.strftime("%H:%M:%S")
-            if cfg.get("strategy") == "nifty":
-                if now_t >= OPTBOT_FIRST_ENTRY:
+        for kind in BOT_KINDS:
+            cfg = bot_cfg(uid, kind)
+            try:
+                if cfg["mode"] == "live" and (cfg["armed_day"] != today or user_mode(u)[0] != "live"):
+                    cfg["mode"] = "off"
+                    bot_log(uid, f"Live {kind} autopilot was switched off because it was not armed today or your account is no longer in live mode.", bot=kind)
+                    notify_user(uid, "Autopilot switched off", "Live autopilot needs your PIN each day, and your account must be in live mode.")
+                for pos in bot_positions(uid, kind=kind):
+                    if pos["mode"] == "live":
+                        sync_status(u)
+                    bot_manage(u, pos)
+                if cfg["mode"] == "off" or cfg.get("paused") or not (OPTBOT_FIRST_ENTRY <= now_t <= OPTBOT_LAST_ENTRY):
+                    continue
+                made = bot_positions(uid, open_only=False, kind=kind)
+                if len(made) >= cfg["max_trades"] or len(bot_positions(uid, kind=kind)) >= 2:
+                    continue
+                if bot_day_loss(uid, kind) >= cfg["loss_limit"]:
+                    cfg["mode"] = "off"
+                    bot_log(uid, f"Daily loss limit of {cfg['loss_limit']:.0f} reached. {kind.title()} autopilot switched off for today.", bot=kind)
+                    notify_user(uid, "Autopilot stopped: loss limit", f"The daily loss limit of {cfg['loss_limit']:.0f} was reached.")
+                    continue
+                cfg["last_scan"] = now_t.strftime("%H:%M:%S")
+                if kind == "nifty":
                     nifty_enter(u, cfg)
-            else:
-                bot_enter(u, cfg)
-        except Exception as e:
-            bot_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}")
+                else:
+                    bot_enter(u, cfg)
+            except Exception as e:
+                bot_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}", bot=kind)
 
 
 # ── Web app ──
@@ -4237,31 +4246,32 @@ def api_portfolio(request: Request):
     return {"mode": mode, "positions": pos, "totals": tot, "funds": funds, "errors": errors}
 
 
-def bot_view(u):
-    cfg = bot_cfg(u["id"])
+def bot_view(u, kind="scanner"):
+    kind = bot_kind(kind)
+    cfg = bot_cfg(u["id"], kind)
     today = ist_now().strftime("%Y-%m-%d")
     trades = []
-    for o in sorted(bot_positions(u["id"], open_only=False), key=lambda o: o["time"]):
+    for o in sorted(bot_positions(u["id"], open_only=False, kind=kind), key=lambda o: o["time"]):
         trades.append({"time": o["time"], "label": o["label"], "mode": o["mode"], "entry": o.get("avg_price") or o["price"], "state": o.get("bot_state"),
                        "exit": o.get("bot_exit_px"), "pnl": bot_pnl(o), "reason": o.get("bot_reason"), "p_sl": o.get("bot_p_sl"), "p_t1": o.get("bot_p_t1"), "p_t2": o.get("bot_p_t2"), "dir": o.get("bot_dir")})
     pnl = round(sum(t["pnl"] or 0 for t in trades), 2)
     why = live_blocker(u) or ("Switch your account to Live with the toggle at the top first." if user_mode(u)[0] != "live" else None)
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
-    return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": cfg.get("strategy", "scanner"), "nifty_note": (NIFTY_STATE.get(u["id"]) or {}).get("why") if (NIFTY_STATE.get(u["id"]) or {}).get("day") == today else None, "open": len(bot_positions(u["id"])), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
+    return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "nifty_note": (NIFTY_STATE.get(u["id"]) or {}).get("why") if (NIFTY_STATE.get(u["id"]) or {}).get("day") == today else None, "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
-            "rules": NIFTY_RULES if cfg.get("strategy") == "nifty" else f"Buys at the money options on the scanner's top stocks from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}. Day change 0 to {OPTBOT_MAX_CHG:g}% buys a CE, 0 to -{OPTBOT_MAX_CHG:g}% buys a PE, "
+            "rules": NIFTY_RULES if kind == "nifty" else f"Buys at the money options on the scanner's top stocks from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}. Day change 0 to {OPTBOT_MAX_CHG:g}% buys a CE, 0 to -{OPTBOT_MAX_CHG:g}% buys a PE, "
                      f"with the 5 min signal in the same direction and price nearest its 20 EMA. The stock's stop-loss and targets are converted to option prices using the option's delta: sell at the option stop (never worse than -{OPTBOT_MAX_LOSS_PCT:g}%) or at T2, stop moves to the price paid at T1, all closed by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
-            "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"]][-25:][::-1]}
+            "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
 
 
 @app.get("/api/optbot")
-def api_optbot(request: Request):
-    return bot_view(request.state.user)
+def api_optbot(request: Request, bot: str = "scanner"):
+    return bot_view(request.state.user, bot)
 
 
-def bot_apply(u, payload, mode):
+def bot_apply(u, payload, mode, kind="scanner"):
     """Check the settings and, for Live, the PIN. Returns an error text or None. Applies nothing until everything passes."""
-    cfg = bot_cfg(u["id"])
+    cfg = bot_cfg(u["id"], kind)
     try:
         mt, lots, ll = int(payload.get("max_trades", cfg["max_trades"])), int(payload.get("lots", cfg["lots"])), float(payload.get("loss_limit", cfg["loss_limit"]))
     except (TypeError, ValueError):
@@ -4284,25 +4294,27 @@ def bot_apply(u, payload, mode):
 def api_optbot_set(request: Request, payload: dict = Body(...)):
     """Settings and mode in one call (Off, Paper or Live)."""
     u = request.state.user
-    cfg = bot_cfg(u["id"])
+    kind = bot_kind(payload.get("bot") or payload.get("strategy"))
+    cfg = bot_cfg(u["id"], kind)
     mode = str(payload.get("mode", cfg["mode"]))
     if mode not in ("off", "paper", "live"):
         return {"error": "Choose Off, Paper or Live."}
-    err = bot_apply(u, payload, mode)
+    err = bot_apply(u, payload, mode, kind)
     if err:
         return {"error": err}
     cfg.update(mode=mode, paused=False)
     if mode != "off":
         cfg["last_mode"] = mode
-    bot_log(u["id"], f"Autopilot set to {mode.upper()}: up to {cfg['max_trades']} trades, {cfg['lots']} lot(s), daily loss limit {cfg['loss_limit']:.0f}.")
-    return {"ok": True, **bot_view(u)}
+    bot_log(u["id"], f"{kind.title()} autopilot set to {mode.upper()}: up to {cfg['max_trades']} trades, {cfg['lots']} lot(s), daily loss limit {cfg['loss_limit']:.0f}.", bot=kind)
+    return {"ok": True, **bot_view(u, kind)}
 
 
 @app.post("/api/optbot/control")
 def api_optbot_control(request: Request, payload: dict = Body(...)):
     """Play, pause and stop. Play starts or resumes. Pause stops new trades but keeps managing open ones. Stop sells everything and switches off."""
     u = request.state.user
-    cfg = bot_cfg(u["id"])
+    kind = bot_kind(payload.get("bot") or payload.get("strategy"))
+    cfg = bot_cfg(u["id"], kind)
     action = str(payload.get("action", ""))
     if action == "play":
         mode = str(payload.get("mode") or "")
@@ -4312,39 +4324,38 @@ def api_optbot_control(request: Request, payload: dict = Body(...)):
             return {"error": "Choose Paper or Live, then press Play."}
         if cfg["mode"] != "off" and mode != cfg["mode"]:
             return {"error": f"The autopilot is running in {cfg['mode'].title()} mode. Press Stop before changing mode."}
-        err = bot_apply(u, payload, mode)
+        err = bot_apply(u, payload, mode, kind)
         if err:
             return {"error": err}
-        if cfg["mode"] == "off":
-            cfg["strategy"] = "nifty" if payload.get("strategy") == "nifty" else "scanner"
         cfg.update(mode=mode, paused=False, last_mode=mode)
-        bot_log(u["id"], f"Play: {'NIFTY gap continuation' if cfg['strategy'] == 'nifty' else 'scanner stocks'} autopilot running in {mode.upper()} mode.")
+        bot_log(u["id"], f"Play: {'NIFTY gap continuation' if kind == 'nifty' else 'scanner stocks'} autopilot running in {mode.upper()} mode.", bot=kind)
     elif action == "pause":
         if cfg["mode"] == "off":
             return {"error": "The autopilot is not running."}
         cfg["paused"] = True
-        bot_log(u["id"], "Paused: no new trades. Open positions are still managed.")
+        bot_log(u["id"], "Paused: no new trades. Open positions are still managed.", bot=kind)
     elif action == "stop":
-        for pos in bot_positions(u["id"]):
+        for pos in bot_positions(u["id"], kind=kind):
             bot_exit(u, pos, "stopped by you")
-        left = len(bot_positions(u["id"]))
+        left = len(bot_positions(u["id"], kind=kind))
         cfg.update(mode="off", paused=False)
-        bot_log(u["id"], "Stopped: " + ("all positions closed." if not left else f"{left} position(s) could not be closed. Check them in your broker app."))
-        return {"ok": True, "left": left, **bot_view(u)}
+        bot_log(u["id"], f"{kind.title()} stopped: " + ("all positions closed." if not left else f"{left} position(s) could not be closed. Check them in your broker app."), bot=kind)
+        return {"ok": True, "left": left, **bot_view(u, kind)}
     elif action == "save":
-        err = bot_apply(u, payload, cfg["mode"])
+        err = bot_apply(u, payload, cfg["mode"], kind)
         if err:
             return {"error": err}
     else:
         return {"error": "Unknown action."}
-    return {"ok": True, **bot_view(u)}
+    return {"ok": True, **bot_view(u, kind)}
 
 
 @app.post("/api/optbot/exit_all")
-def api_optbot_exit(request: Request):
+def api_optbot_exit(request: Request, payload: dict = Body(default={})):
     u = request.state.user
     n = 0
-    for pos in bot_positions(u["id"]):
+    k = payload.get("bot") if isinstance(payload, dict) else None
+    for pos in bot_positions(u["id"], kind=bot_kind(k) if k else None):
         bot_exit(u, pos, "closed by you")
         n += 1
     return {"ok": True, "closed": n}
@@ -5163,27 +5174,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="ixrow"><div class="seg" id="scTfs" role="group" aria-label="Timeframe"></div>
  <b class="scttl" id="scTtl">Top 15 by traded value today</b>
  <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label><span class="sub" id="scMeta"></span></div>
-<div class="card botbox" id="botBox">
- <div class="ixrow"><b>Options autopilot</b><span class="sub" id="botState"></span></div>
- <div class="sub" id="botRules"></div>
- <div class="botrow">
-  <label>Strategy<select id="botStrat"><option value="scanner">Scanner stocks</option><option value="nifty">NIFTY gap continuation</option></select></label>
-  <label>Mode<select id="botMode"><option value="paper">Paper</option><option value="live">Live</option></select></label>
-  <label>Trades a day<input id="botMax" type="number" min="1" max="10" step="1"></label>
-  <label>Lots each<input id="botLots" type="number" min="1" step="1"></label>
-  <label>Stop for the day at a loss of ₹<input id="botLoss" type="number" min="0" step="500"></label>
-  <button class="btn" id="botSave">Save settings</button>
- </div>
- <div class="botctl">
-  <button class="btn go" id="botPlay" title="Start or resume">▶ Play</button>
-  <button class="btn" id="botPause" title="No new trades. Open positions stay managed">⏸ Pause</button>
-  <button class="btn stop" id="botStop" title="Sell everything and switch off">■ Stop</button>
-  <span class="botpill" id="botPill"></span>
- </div>
- <div class="tkmsg" id="botMsg" role="status"></div>
- <div class="wrap"><table id="botTrades"></table></div>
- <div class="sub" id="botLog"></div>
-</div>
+<div id="botHost"></div>
 <div class="wrap"><table id="scTable"></table></div>
 
 </section>
@@ -5497,28 +5488,50 @@ function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=
    <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
    <td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
-let botTimer=null;
+let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: scanner stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY gap continuation"}};
+window.botD={};
+function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
+ <div class="ixrow"><b>${t}</b><span class="sub" id="${p}State"></span></div>
+ <div class="sub" id="${p}Rules"></div>
+ <div class="botrow">
+  <label>Mode<select id="${p}Mode"><option value="paper">Paper</option><option value="live">Live</option></select></label>
+  <label>Trades a day<input id="${p}Max" type="number" min="1" max="10" step="1"></label>
+  <label>Lots each<input id="${p}Lots" type="number" min="1" step="1"></label>
+  <label>Stop for the day at a loss of ₹<input id="${p}Loss" type="number" min="0" step="500"></label>
+  <button class="btn" id="${p}Save">Save settings</button>
+ </div>
+ <div class="botctl">
+  <button class="btn go" id="${p}Play" title="Start or resume">▶ Play</button>
+  <button class="btn" id="${p}Pause" title="No new trades. Open positions stay managed">⏸ Pause</button>
+  <button class="btn stop" id="${p}Stop" title="Sell this autopilot's positions and switch it off">■ Stop</button>
+  <span class="botpill" id="${p}Pill"></span>
+ </div>
+ <div class="tkmsg" id="${p}Msg" role="status"></div>
+ <div class="wrap"><table id="${p}Trades"></table></div>
+ <div class="sub" id="${p}Log"></div>
+</div>`}
 async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
- try{const d=await (await api("/api/optbot")).json();window.botD=d;
-  if(document.activeElement&&["botMode","botStrat","botMax","botLots","botLoss"].includes(document.activeElement.id)){}else{$("botStrat").value=d.strategy;$("botMode").value=d.mode==="off"?d.choice:d.mode;$("botMax").value=d.max_trades;$("botLots").value=d.lots;$("botLoss").value=d.loss_limit}
-  $("botRules").textContent=d.rules+(d.strategy==="nifty"&&d.nifty_note?` Today: ${d.nifty_note}`:"");
-  $("botState").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
-  const pill=$("botPill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";
-  $("botPlay").disabled=d.state==="running";$("botPause").disabled=d.state!=="running";$("botStop").disabled=d.state==="stopped"&&!d.open;$("botMode").disabled=d.state!=="stopped";$("botStrat").disabled=d.state!=="stopped";
-  $("botTrades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
-  $("botLog").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}
+ for(const p in BOTS){try{const d=await (await api("/api/optbot?bot="+BOTS[p].kind)).json();window.botD[p]=d;
+  if(document.activeElement&&[p+"Mode",p+"Max",p+"Lots",p+"Loss"].includes(document.activeElement.id)){}else{$(p+"Mode").value=d.mode==="off"?d.choice:d.mode;$(p+"Max").value=d.max_trades;$(p+"Lots").value=d.lots;$(p+"Loss").value=d.loss_limit}
+  $(p+"Rules").textContent=d.rules+(d.strategy==="nifty"&&d.nifty_note?` Today: ${d.nifty_note}`:"");
+  $(p+"State").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
+  const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";
+  $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
+  $(p+"Trades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
+  $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
  botTimer=setTimeout(botLoad,8000)}
-async function botCtl(action,extra){const D=window.botD||{};const body={action,mode:$("botMode").value,strategy:$("botStrat").value,max_trades:+$("botMax").value,lots:+$("botLots").value,loss_limit:+$("botLoss").value,...extra};
- if(action==="play"&&body.mode==="live"&&!(D.mode==="live"&&D.armed)){const pin=prompt("Order PIN, to arm live autopilot for today");if(pin===null)return;body.pin=pin}
- if(action==="stop"&&!confirm(D.open?`Stop the autopilot and sell ${D.open} open position(s) now?`:"Stop the autopilot?"))return;
- const d=await post("/api/optbot/control",body);$("botMsg").textContent=d.error||({play:"Running.",pause:"Paused. No new trades; open positions are still managed.",stop:d.left?`Stopped, but ${d.left} position(s) could not be closed. Check your broker app.`:"Stopped. All positions closed.",save:"Saved."})[action];botLoad()}
+async function botCtl(p,action,extra){const D=window.botD[p]||{};const body={action,bot:BOTS[p].kind,mode:$(p+"Mode").value,max_trades:+$(p+"Max").value,lots:+$(p+"Lots").value,loss_limit:+$(p+"Loss").value,...extra};
+ if(action==="play"&&body.mode==="live"&&!(D.mode==="live"&&D.armed)){const pin=prompt("Order PIN, to arm this live autopilot for today");if(pin===null)return;body.pin=pin}
+ if(action==="stop"&&!confirm(D.open?`Stop this autopilot and sell ${D.open} open position(s) now?`:"Stop this autopilot?"))return;
+ const d=await post("/api/optbot/control",body);$(p+"Msg").textContent=d.error||({play:"Running.",pause:"Paused. No new trades; open positions are still managed.",stop:d.left?`Stopped, but ${d.left} position(s) could not be closed. Check your broker app.`:"Stopped. All positions closed.",save:"Saved."})[action];botLoad()}
 let installEv=null;
 function initInstall(){const b=$("installBtn"),standalone=matchMedia("(display-mode: standalone)").matches||navigator.standalone;if(standalone)return;
  addEventListener("beforeinstallprompt",e=>{e.preventDefault();installEv=e;b.hidden=false});
  if(/iphone|ipad|ipod/i.test(navigator.userAgent)){b.hidden=false}
  b.onclick=async()=>{if(installEv){installEv.prompt();await installEv.userChoice;installEv=null;b.hidden=true}else alert("On iPhone: tap the Share button in Safari, then Add to Home Screen. On Android: open the browser menu and choose Install app.")};
  addEventListener("appinstalled",()=>{b.hidden=true})}
-function initBot(){$("botSave").onclick=()=>botCtl("save");$("botPlay").onclick=()=>botCtl("play");$("botPause").onclick=()=>botCtl("pause");$("botStop").onclick=()=>botCtl("stop")}
+function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
+ for(const p in BOTS){$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
  $("scOnly").onchange=()=>{scLoad()};
