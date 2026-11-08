@@ -701,9 +701,30 @@ def ist_now():
     return pd.Timestamp.now(tz=IST)
 
 
+def _parse_sessions(text):
+    """'2026-11-08 18:00-19:15; 2026-11-09 09:15-10:00' -> [(date string, start, end)]"""
+    out = []
+    for part in re.split(r"[;,]\s*(?=\d{4}-)", text or ""):
+        m = re.match(r"\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$", part)
+        if m:
+            out.append((m.group(1), dtime(int(m.group(2)), int(m.group(3))), dtime(int(m.group(4)), int(m.group(5)))))
+    return out
+
+
+SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
+SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
+
+
+def special_session_now():
+    n = ist_now()
+    td = n.strftime("%Y-%m-%d")
+    spans = list(SPECIAL_SESSIONS) + ([(SESSION_OVERRIDE["date"], SESSION_OVERRIDE["start"], SESSION_OVERRIDE["end"])] if SESSION_OVERRIDE else [])
+    return any(d == td and a <= n.time() <= b for d, a, b in spans)
+
+
 def market_open_now():
     n = ist_now()
-    return n.weekday() < 5 and dtime(9, 15) <= n.time() <= dtime(15, 30)
+    return (n.weekday() < 5 and dtime(9, 15) <= n.time() <= dtime(15, 30)) or special_session_now()
 
 
 def append_log(o):
@@ -1478,7 +1499,7 @@ def make_order(p, u, dry=False, force=None):
     if qty < 1 or qty > cap:
         return fail(f"Quantity must be between 1 and {cap}" + (" shares." if kind == "equity" else " lots."))
     if mode == "live" and not dry and not market_open_now():
-        return fail("The market is closed. Live orders are accepted 9:15 to 15:30 IST, Monday to Friday.")
+        return fail("The market is closed. Live orders are accepted 9:15 to 15:30 IST, Monday to Friday, and in special sessions an admin has opened (Admin page).")
     if not dry and count_today(u["id"], mode) >= caps["max_orders"]:
         return fail(f"Daily limit of {caps['max_orders']} orders reached.")
 
@@ -5233,6 +5254,34 @@ def api_admin_overview(request: Request):
             "auto": {"last_age": None if not AUTO["last"] else int(time.time() - AUTO["last"]), "error": AUTO["error"]}}
 
 
+@app.get("/api/admin/session")
+def api_admin_session(request: Request):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    o = SESSION_OVERRIDE
+    return {"open_now": market_open_now(), "special": special_session_now(),
+            "override": ({"date": o["date"], "start": o["start"].strftime("%H:%M"), "end": o["end"].strftime("%H:%M")} if o else None),
+            "env": [f"{d} {a.strftime('%H:%M')}-{b.strftime('%H:%M')}" for d, a, b in SPECIAL_SESSIONS]}
+
+
+@app.post("/api/admin/session")
+def api_admin_session_set(request: Request, payload: dict = Body(...)):
+    """Open a special trading session for today (Muhurat trading, weekend session), or clear it."""
+    denied = need_admin(request)
+    if denied:
+        return denied
+    if payload.get("clear"):
+        SESSION_OVERRIDE.clear()
+        return {"ok": True, "open_now": market_open_now(), "override": None}
+    got = _parse_sessions(f"{ist_now().strftime('%Y-%m-%d')} {payload.get('start', '')}-{payload.get('end', '')}")
+    if not got or got[0][1] >= got[0][2]:
+        return {"error": "Enter a start and an end time like 18:00 and 19:15, with the end after the start."}
+    d, a, b = got[0]
+    SESSION_OVERRIDE.update(date=d, start=a, end=b)
+    return {"ok": True, "open_now": market_open_now(), "override": {"date": d, "start": a.strftime("%H:%M"), "end": b.strftime("%H:%M")}}
+
+
 @app.get("/api/admin/users")
 def api_admin_users(request: Request):
     denied = need_admin(request)
@@ -5907,6 +5956,10 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </section>
 <section id="view-admin" hidden>
  <div class="card"><h3>Overview</h3><div class="osum" id="admOv" style="margin-bottom:0"></div></div>
+ <div class="card"><h3>Special trading session</h3>
+  <div class="sub">On a day the exchange opens outside the usual hours (Muhurat trading, a weekend session), live orders stay blocked until you open it here. It lasts for today only and is forgotten on restart. To keep it through restarts, set SPECIAL_SESSIONS (for example 2026-11-08 18:00-19:15) in Render.</div>
+  <div class="botrow"><label>From<input id="ssFrom" value="09:15" size="5"></label><label>To<input id="ssTo" value="15:30" size="5"></label><button class="btn go" id="ssOpen">Open for today</button><button class="btn" id="ssClear">Clear</button></div>
+  <div class="sub" id="ssNote"></div></div>
  <div class="card"><h3>Everyone's orders today</h3><div class="wrap"><table id="admOrd"></table></div></div>
  <div class="card"><h3>Add a user</h3>
   <div class="grid2" style="margin-bottom:0"><label>Username<input id="nuName" autocomplete="off"></label><label>Temporary password (at least 10 characters)<input id="nuPw" type="password" autocomplete="new-password"></label></div>
@@ -6460,7 +6513,9 @@ async function loadOverview(){const d=await (await api("/api/admin/overview")).j
   +st("Signals now",sg);
  const t=$("admOrd");if(!d.orders.length){t.innerHTML=`<tbody><tr><td class="empty" style="text-align:left">No orders have been placed today.</td></tr></tbody>`;return}
  t.innerHTML=`<thead><tr><th>Time</th><th>User</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th><th>Broker</th></tr></thead><tbody>`+d.orders.map(o=>`<tr><td>${esc(o.time)}</td><td>${esc(o.username)}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}</td><td>${esc(o.side)}</td><td>${o.qty}</td><td>${o.order_type==="LIMIT"?f2(o.price):o.avg_price?f2(o.avg_price):"Market"}</td><td>${esc(o.status)}</td><td>${esc(o.broker||"paper")}</td></tr>`).join("")+"</tbody>"}
-async function loadUsers(){loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
+async function loadSession(){try{const d=await (await api("/api/admin/session")).json();if(d.error)return;$("ssNote").textContent=(d.override?`Special session open today ${d.override.start} to ${d.override.end}. `:"")+(d.env.length?`From settings: ${d.env.join(", ")}. `:"")+(d.open_now?"The market counts as open right now.":"The market counts as closed right now.")}catch(e){}}
+async function ssSet(b){const d=await post("/api/admin/session",b);if(d.error)$("ssNote").textContent=d.error;else loadSession()}
+async function loadUsers(){loadSession();loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
 function renderUsers(){const bn=(me&&me.broker_names)||{};
  $("usrTable").innerHTML=`<thead><tr><th>User</th><th>Role</th><th>Active</th><th>Live trading</th><th>Brokers</th><th>Order PIN</th><th></th></tr></thead><tbody>`+users.map(u=>`<tr><td><b>${esc(u.username)}</b></td><td>${u.role}</td><td><input type="checkbox" data-act="active" data-id="${u.id}" ${u.active?"checked":""} aria-label="Active"></td><td><input type="checkbox" data-act="live" data-id="${u.id}" ${u.live_allowed?"checked":""} aria-label="Live trading"></td><td>${u.brokers.map(b=>esc(bn[b]||b)).join(", ")||"–"}</td><td>${u.pin_set?"Set":"Not set"}</td><td><button class="mini" data-act="limits" data-id="${u.id}">Limits</button> <button class="mini" data-act="role" data-id="${u.id}">Make ${u.role==="admin"?"user":"admin"}</button> <button class="mini" data-act="reset" data-id="${u.id}">Reset password</button> <button class="mini" data-act="del" data-id="${u.id}">Delete</button></td></tr>`).join("")+"</tbody>"}
 $("usrTable").onchange=async e=>{const c=e.target.closest("input[data-act]");if(!c)return;
@@ -6473,6 +6528,7 @@ $("usrTable").onclick=async e=>{const b=e.target.closest("button[data-act]");if(
  else if(b.dataset.act==="limits"){limUser=u;const c=u.caps;$("limTitle").textContent="Limits for "+u.username;$("limValue").value=c.max_order_value;$("limQty").value=c.max_qty;$("limOrders").value=c.max_orders;$("limLots").value=c.max_fut_lots;$("limFut").value=c.max_fut_value;$("limSell").value=c.allow_option_selling?"1":"0";$("limMsg").textContent="";$("limDlg").showModal();return}
  if(d)$("admNote").textContent=d.error||"Saved.";loadUsers()};
 $("limClose").onclick=()=>$("limDlg").close();
+$("ssOpen").onclick=()=>ssSet({start:$("ssFrom").value,end:$("ssTo").value});$("ssClear").onclick=()=>ssSet({clear:true});
 $("limSave").onclick=async()=>{const d=await send("PATCH","/api/admin/users/"+limUser.id,{caps:{max_order_value:$("limValue").value,max_qty:$("limQty").value,max_orders:$("limOrders").value,max_fut_lots:$("limLots").value,max_fut_value:$("limFut").value,allow_option_selling:$("limSell").value==="1"}});
  if(d.error){$("limMsg").textContent=d.error;return}$("limDlg").close();loadUsers()};
 $("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{username:$("nuName").value,password:$("nuPw").value,role:$("nuRole").value});$("admNote").textContent=d.error||"User added. Live trading is off for them until you enable it.";if(!d.error){$("nuName").value="";$("nuPw").value=""}loadUsers()};
