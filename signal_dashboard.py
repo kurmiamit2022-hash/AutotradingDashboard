@@ -2654,18 +2654,21 @@ def bt_fetch(symbols, interval, days, progress=None):
             out[s] = hit[1]
         else:
             need.append(s)
-    start = (ist_now().date() - timedelta(days=days + 5)).isoformat()
+    # Yahoo refuses intraday requests that reach back more than 60 days, so those use a period; daily candles use a start date
+    span = {"period": f"{min(days, 58)}d"} if interval != "1d" else {"start": (ist_now().date() - timedelta(days=days + 5)).isoformat()}
+    errs = []
     for i in range(0, len(need), 4):
         part = need[i:i + 4]
         tk = [yf_ticker(s) for s in part]
         data = None
         for attempt in range(2):
             try:
-                data = yf.download(tk, start=start, interval=interval, group_by="ticker", auto_adjust=False, threads=True, progress=False)
+                data = yf.download(tk, interval=interval, group_by="ticker", auto_adjust=False, threads=True, progress=False, **span)
                 if data is not None and not data.empty:
                     break
-            except Exception:
+            except Exception as e:
                 data = None
+                errs.append(f"{type(e).__name__}: {str(e)[:80]}")
             time.sleep(1.0)
         for s, t in zip(part, tk):
             d = None
@@ -2674,6 +2677,15 @@ def bt_fetch(symbols, interval, days, progress=None):
                 d = bt_norm(d) if d is not None else None
             except Exception:
                 d = None
+            if d is None or d.empty:   # one more try for this symbol on its own
+                try:
+                    one = yf.download(t, interval=interval, auto_adjust=False, progress=False, **span)
+                    if one is not None and not one.empty:
+                        if getattr(one.columns, "nlevels", 1) > 1:
+                            one.columns = one.columns.get_level_values(0)
+                        d = bt_norm(one)
+                except Exception as e:
+                    errs.append(f"{type(e).__name__}: {str(e)[:80]}")
             if d is None or d.empty:
                 bad.append(f"{s}: no candles from the data provider")
             else:
@@ -2681,6 +2693,8 @@ def bt_fetch(symbols, interval, days, progress=None):
                 BT_CACHE[(s, interval, days)] = (time.time(), d)
         if progress:
             progress(min(len(need), i + 4), len(need))
+    if errs and not out:
+        bad.append("Data provider said: " + errs[-1])
     return out, bad
 
 
@@ -3050,7 +3064,7 @@ def bt_job(jid, user_id, p):
         job["note"] = "Downloading price history"
         candles, bad = bt_fetch(p["symbols"], p["interval"], p["days"], lambda a, b: job.update(note=f"Downloaded {a} of {b} symbols"))
         if not candles:
-            job.update(state="error", error="The data provider returned no candles. Try again in a minute, or test fewer symbols.")
+            job.update(state="error", error="The data provider returned no candles. Try again in a minute, or test fewer symbols." + ((" " + " ".join(bad[-2:])) if bad else ""))
             return
         job["note"] = "Replaying the trades"
         res = bt_run(p, candles)
