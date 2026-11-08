@@ -19,6 +19,7 @@ Orders are simulated ("paper") unless live trading is on for the server and enab
 Back up the database and the secret.key file together. Without the key, saved broker details cannot be read.
 """
 import csv
+import math
 import hashlib
 import hmac
 import json
@@ -2050,6 +2051,7 @@ OPTBOT_LAST_ENTRY = dtime(*map(int, os.getenv("OPTBOT_LAST_ENTRY", "14:30").spli
 OPTBOT_SQUAREOFF = dtime(*map(int, os.getenv("OPTBOT_SQUAREOFF", "15:15").split(":")))
 OPTBOT_NEAR_ATR = float(os.getenv("OPTBOT_NEAR_ATR", "0.6"))   # price must be within this many ATRs of the 20 EMA
 OPTBOT_MAX_CHG = float(os.getenv("OPTBOT_MAX_CHG", "2"))       # day change limit, percent, each side
+OPTBOT_MAX_LOSS_PCT = float(os.getenv("OPTBOT_MAX_LOSS_PCT", "50"))   # the option stop is never set further than this percent below the price paid
 OPTBOT = {}   # user id -> settings. Kept in memory: after a restart the autopilot is Off until you switch it on again
 OPTBOT_LOG = []
 OPTBOT_DEFAULTS = {"mode": "off", "max_trades": 3, "lots": 1, "loss_limit": 3000.0, "armed_day": None}
@@ -2100,6 +2102,29 @@ def bot_place(u, o, entry_rec=None, exit_px=None):
                    note=f"{bname} did not confirm this order. Check your {bname} app.")
         return None, f"UNSURE: {bname} did not confirm the order ({str(e)[:100]}). Check your {bname} app."
     return new_record(o, oid, "open", is_exit=entry_rec is not None), None
+
+
+def est_delta(spot, strike, right, expiry, iv):
+    """Rough option delta (Black-Scholes, no interest). Used only to turn stock moves into option price moves. 0.5 when IV or the expiry is unknown."""
+    try:
+        t = max(0.5, (datetime.strptime(expiry, EXPIRY_FMT).date() - ist_now().date()).days + 0.5) / 365
+        sig = float(iv) / 100
+        if sig <= 0:
+            raise ValueError
+        d1 = (math.log(spot / strike) + 0.5 * sig * sig * t) / (sig * math.sqrt(t))
+        nd = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
+        return round(min(0.85, max(0.25, nd if right == "CE" else 1 - nd)), 3)
+    except Exception:
+        return 0.5
+
+
+def bot_opt_ltp(pos):
+    try:
+        ch = build_chain(pos["symbol"], pos["bot_expiry"])
+    except Exception:
+        return None
+    leg = next((r.get(pos["bot_right"].lower()) for r in (ch or {}).get("rows", []) if r["strike"] == pos["bot_strike"]), None)
+    return (leg or {}).get("ltp")
 
 
 def bot_candidates(u):
@@ -2172,12 +2197,18 @@ def bot_enter(u, cfg):
                 cfg["mode"] = "off"
             return True  # an order may have reached the broker, so stop for this round
         lv = c["levels"]
+        delta = est_delta(c["px"], row["strike"], right, ch["expiry"], (row.get(right.lower()) or {}).get("iv"))
+        p0 = float(ltp)
+        p_sl = round(max(p0 - delta * abs(c["px"] - lv["sl"]), p0 * (1 - OPTBOT_MAX_LOSS_PCT / 100)), 2)
+        p_t1 = round(p0 + delta * abs(lv["tp1"] - c["px"]), 2)
+        p_t2 = round(p0 + delta * abs(lv["tp2"] - c["px"]), 2)
+        rec.update(bot_p0=p0, bot_delta=delta, bot_p_sl=p_sl, bot_p_t1=p_t1, bot_p_t2=p_t2)
         rec.update(bot=True, bot_right=right, bot_strike=row["strike"], bot_expiry=ch["expiry"], bot_state="open", bot_dir=c["side"], bot_sl=lv["sl"], bot_t1=lv["tp1"], bot_t2=lv["tp2"], bot_entry_under=c["px"],
                    bot_t1_done=False, bot_exit_px=None, bot_reason=None)
         append_log(rec)
         bot_log(u["id"], f"{'LIVE' if mode == 'live' else 'Paper'} BUY {rec['label']} at about {limit:.2f}: stock {c['px']:.2f}, "
-                         f"{c['dist']:.2f} ATR from its 20 EMA, stop {lv['sl']:.2f}, T1 {lv['tp1']:.2f}, T2 {lv['tp2']:.2f}.")
-        notify_user(u["id"], f"Autopilot bought {rec['label']}", f"{mode} order at about {limit:.2f}. Stock stop {lv['sl']:.2f}, target {lv['tp2']:.2f}.")
+                         f"{c['dist']:.2f} ATR from its 20 EMA. Option stop {p_sl:.2f}, T1 {p_t1:.2f}, T2 {p_t2:.2f} (delta {delta:.2f}); stock stop {lv['sl']:.2f}.")
+        notify_user(u["id"], f"Autopilot bought {rec['label']}", f"{mode} order at about {limit:.2f}. Option stop {p_sl:.2f}, target {p_t2:.2f}.")
         return True
     return False
 
@@ -2203,7 +2234,7 @@ def bot_exit(u, pos, reason):
         return
     limit = round(round(ltp * 0.99 / 0.05) * 0.05, 2)
     exit_o = {**pos, "side": "SELL", "order_type": "LIMIT", "price": limit, "ref": ltp, "key": None, "sl": None, "risk": None, "auto_sl": False, "trail": False}
-    for k in ("bot", "bot_state", "bot_dir", "bot_sl", "bot_t1", "bot_t2", "bot_entry_under", "bot_t1_done", "bot_exit_px", "bot_reason", "bot_warned", "bot_right", "bot_strike", "bot_expiry", "avg_price", "filled", "status", "id", "time", "date", "t"):
+    for k in ("bot", "bot_state", "bot_dir", "bot_sl", "bot_t1", "bot_t2", "bot_entry_under", "bot_t1_done", "bot_exit_px", "bot_reason", "bot_warned", "bot_right", "bot_strike", "bot_expiry", "bot_p0", "bot_delta", "bot_p_sl", "bot_p_t1", "bot_p_t2", "bot_entry_under", "avg_price", "filled", "status", "id", "time", "date", "t"):
         exit_o.pop(k, None)
     pos["bot_state"] = "closing"   # recorded first so a crash mid-call is never followed by a second sell
     append_log(pos)
@@ -2227,22 +2258,26 @@ def bot_exit(u, pos, reason):
 
 def bot_manage(u, pos):
     n = ist_now().time()
-    row, _ = row_for(pos["symbol"], "5m")
     if n >= OPTBOT_SQUAREOFF:
         return bot_exit(u, pos, "end of day")
-    if not row:
+    row, _ = row_for(pos["symbol"], "5m")
+    if row:  # backstop: the stock itself went through the signal's stop-loss
+        px = live_price(row)
+        up = pos["bot_dir"] == "BUY"
+        if (up and px <= pos["bot_sl"]) or (not up and px >= pos["bot_sl"]):
+            return bot_exit(u, pos, "stock hit the signal stop-loss")
+    ltp = bot_opt_ltp(pos)
+    if not ltp:
         return
-    px = live_price(row)
-    up = pos["bot_dir"] == "BUY"
-    if (up and px <= pos["bot_sl"]) or (not up and px >= pos["bot_sl"]):
-        return bot_exit(u, pos, "stop-loss on the stock" if not pos["bot_t1_done"] else "back to entry after T1")
-    if (up and px >= pos["bot_t2"]) or (not up and px <= pos["bot_t2"]):
-        return bot_exit(u, pos, "target T2 reached")
-    if not pos["bot_t1_done"] and ((up and px >= pos["bot_t1"]) or (not up and px <= pos["bot_t1"])):
+    if ltp <= pos["bot_p_sl"]:
+        return bot_exit(u, pos, "option stop-loss" if not pos["bot_t1_done"] else "back to entry price after T1")
+    if ltp >= pos["bot_p_t2"]:
+        return bot_exit(u, pos, "option target T2 reached")
+    if not pos["bot_t1_done"] and ltp >= pos["bot_p_t1"]:
         pos["bot_t1_done"] = True
-        pos["bot_sl"] = pos["bot_entry_under"]
+        pos["bot_p_sl"] = max(pos["bot_p_sl"], pos["bot_p0"])
         append_log(pos)
-        bot_log(u["id"], f"{pos['label']}: T1 reached, stop moved to the entry level {pos['bot_entry_under']:.2f}.")
+        bot_log(u["id"], f"{pos['label']}: T1 reached at {ltp:.2f}, option stop moved to the entry price {pos['bot_p0']:.2f}.")
 
 
 def optbot_once():
@@ -3949,13 +3984,13 @@ def bot_view(u):
     trades = []
     for o in sorted(bot_positions(u["id"], open_only=False), key=lambda o: o["time"]):
         trades.append({"time": o["time"], "label": o["label"], "mode": o["mode"], "entry": o.get("avg_price") or o["price"], "state": o.get("bot_state"),
-                       "exit": o.get("bot_exit_px"), "pnl": bot_pnl(o), "reason": o.get("bot_reason"), "stock_sl": o.get("bot_sl"), "t2": o.get("bot_t2"), "dir": o.get("bot_dir")})
+                       "exit": o.get("bot_exit_px"), "pnl": bot_pnl(o), "reason": o.get("bot_reason"), "p_sl": o.get("bot_p_sl"), "p_t1": o.get("bot_p_t1"), "p_t2": o.get("bot_p_t2"), "dir": o.get("bot_dir")})
     pnl = round(sum(t["pnl"] or 0 for t in trades), 2)
     why = live_blocker(u) or ("Switch your account to Live with the toggle at the top first." if user_mode(u)[0] != "live" else None)
     return {"mode": cfg["mode"], "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
             "rules": f"Buys at the money options on the scanner's top stocks from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}. Day change 0 to {OPTBOT_MAX_CHG:g}% buys a CE, 0 to -{OPTBOT_MAX_CHG:g}% buys a PE, "
-                     f"with the 5 min signal in the same direction and price nearest its 20 EMA. Exits at the signal's stop-loss or T2, stop moves to entry at T1, all closed by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
+                     f"with the 5 min signal in the same direction and price nearest its 20 EMA. The stock's stop-loss and targets are converted to option prices using the option's delta: sell at the option stop (never worse than -{OPTBOT_MAX_LOSS_PCT:g}%) or at T2, stop moves to the price paid at T1, all closed by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"]][-25:][::-1]}
 
 
@@ -5126,7 +5161,7 @@ async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
   if(document.activeElement&&["botMode","botMax","botLots","botLoss"].includes(document.activeElement.id)){}else{$("botMode").value=d.mode;$("botMax").value=d.max_trades;$("botLots").value=d.lots;$("botLoss").value=d.loss_limit}
   $("botRules").textContent=d.rules;
   $("botState").textContent=(d.mode==="off"?"Off":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
-  $("botTrades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open (stock stop "+f2(t.stock_sl)+", T2 "+f2(t.t2)+")":esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
+  $("botTrades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
   $("botLog").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}
  botTimer=setTimeout(botLoad,8000)}
 async function botSend(extra){const body={mode:$("botMode").value,max_trades:+$("botMax").value,lots:+$("botLots").value,loss_limit:+$("botLoss").value,...extra};
