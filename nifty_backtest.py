@@ -31,8 +31,8 @@ def load(csv=None):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
     df = df[["Open", "High", "Low", "Close"]].dropna()
-    if df.index.tz is not None:
-        df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
+    # keep the index timezone-aware (India time), exactly as the live autopilot sees it
+    df.index = df.index.tz_localize("Asia/Kolkata") if df.index.tz is None else df.index.tz_convert("Asia/Kolkata")
     return df.sort_index()
 
 

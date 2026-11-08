@@ -2070,7 +2070,7 @@ OPTBOT_MAX_LOSS_PCT = float(os.getenv("OPTBOT_MAX_LOSS_PCT", "50"))   # the opti
 OPTBOT = {}   # (user id, "scanner" or "nifty") -> settings. Two separate autopilots with their own mode, limits and Play/Pause/Stop. Kept in memory: after a restart the autopilot is Off until you switch it on again
 OPTBOT_LOG = []
 OPTBOT_SKIP = {}   # (user id, symbol) -> time until which a stock that could not be traded is left alone
-OPTBOT_DEFAULTS = {"mode": "off", "strategy": "scanner", "paused": False, "last_mode": "paper", "max_trades": 3, "lots": 1, "loss_limit": 3000.0, "armed_day": None}
+OPTBOT_DEFAULTS = {"mode": "off", "strategy": "scanner", "paused": False, "last_mode": "paper", "max_trades": 3, "lots": 1, "loss_limit": 3000.0, "armed_day": None, "entries": "both"}
 
 
 BOT_KINDS = ("scanner", "nifty")
@@ -2082,7 +2082,7 @@ def bot_kind(v):
 
 def bot_cfg(uid, kind="scanner"):
     kind = bot_kind(kind)
-    return OPTBOT.setdefault((uid, kind), dict(OPTBOT_DEFAULTS, strategy=kind, **({"max_trades": 1} if kind == "nifty" else {})))
+    return OPTBOT.setdefault((uid, kind), dict(OPTBOT_DEFAULTS, strategy=kind, **({"max_trades": 2} if kind == "nifty" else {})))
 
 
 def bot_log(uid, text, bot=None):
@@ -2184,7 +2184,7 @@ def bot_candidates(u):
     return out
 
 
-def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False):
+def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False, etype="fresh"):
     """Buy one at-the-money option for candidate c = {symbol, side, px, levels{sl, tp1, tp2}, note}. Returns "skip", "done", "changed" or "stop"."""
     right = "CE" if c["side"] == "BUY" else "PE"
     try:
@@ -2228,7 +2228,7 @@ def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False):
     p_sl = round(max(p0 - delta * abs(c["px"] - lv["sl"]), p0 * (1 - OPTBOT_MAX_LOSS_PCT / 100)), 2)
     p_t1 = round(p0 + delta * abs(lv["tp1"] - c["px"]), 2)
     p_t2 = round(p0 + delta * abs(lv["tp2"] - c["px"]), 2)
-    rec.update(bot_p0=p0, bot_delta=delta, bot_p_sl=p_sl, bot_p_t1=p_t1, bot_p_t2=p_t2, bot_strategy=strategy)
+    rec.update(bot_p0=p0, bot_delta=delta, bot_p_sl=p_sl, bot_p_t1=p_t1, bot_p_t2=p_t2, bot_strategy=strategy, bot_etype=etype)
     rec.update(bot=True, bot_right=right, bot_strike=row["strike"], bot_expiry=ch["expiry"], bot_state="open", bot_dir=c["side"], bot_sl=lv["sl"], bot_t1=lv["tp1"], bot_t2=lv["tp2"], bot_entry_under=c["px"],
                bot_t1_done=False, bot_exit_px=None, bot_reason=None)
     append_log(rec)
@@ -2249,7 +2249,7 @@ def bot_enter(u, cfg):
         if traded:
             continue
         c["note"] = f"{c['dist']:.2f} ATR from its 20 EMA"
-        r = bot_buy(u, cfg, c, mode)
+        r = bot_buy(u, cfg, c, mode, etype="signal")
         if r == "skip":
             continue
         return r != "changed"
@@ -2309,7 +2309,7 @@ def nifty_plan(prev_side, prev, first, params=None):
             "sl_name": sname, "target_name": tname, "pivots": {k: round(v, 2) for k, v in piv.items()}}, None
 
 
-def nifty_inputs(df, today):
+def nifty_inputs(df, today, sym="NIFTY"):
     """From 5 min candles (IST index): yesterday's signal state and range, and today's first candle. Returns (prev_side, prev, first, None) or (..., why not)."""
     days = sorted(set(df.index.date))
     if today not in days:
@@ -2320,7 +2320,7 @@ def nifty_inputs(df, today):
     y = before[-1]
     dy = df[df.index.date == y]
     prev = (float(dy["High"].max()), float(dy["Low"].min()), float(dy["Close"].iloc[-1]))
-    row = analyse("NIFTY", df[df.index.date <= y].copy(), "5m")
+    row = analyse(sym, df[df.index.date <= y].copy(), "5m")
     side = row["side"] if row and row["signal"] != "–" else None
     dt = df[df.index.date == today]
     f = dt.iloc[0]
@@ -2379,11 +2379,118 @@ def nifty_enter(u, cfg):
         return False
     c = {"symbol": "NIFTY", "side": plan["side"], "px": plan["entry"], "levels": {"sl": plan["sl"], "tp1": plan["tp1"], "tp2": plan["tp2"]},
          "note": f"gap {plan['gap']:+.2f}% with yesterday's {plan['side']} signal open; stop at {plan['sl_name']}, target pivot {plan['target_name']}, reward/risk {plan['rr']:.1f}"}
-    r = bot_buy(u, cfg, c, "live" if cfg["mode"] == "live" else "paper", strategy="nifty", skip_expiry_day=True)
+    r = bot_buy(u, cfg, c, "live" if cfg["mode"] == "live" else "paper", strategy="nifty", skip_expiry_day=True, etype="gap")
     if r == "skip":
         return False   # chain or price missing: try again for the rest of the window
     st.update(day=today, done=True, why="Traded.")
     return r != "changed"
+
+
+NIFTY_FRESH_MAX_AGE = int(os.getenv("NIFTY_FRESH_MAX_AGE", "1"))   # a fresh signal is used only while it is at most this many candles old
+STOCK_GAP_STATE = {}   # user id -> {"day": date string, "cands": [...], "done": True}
+
+
+def nifty_fresh(u, cfg):
+    """A fresh NIFTY 5 min signal (the indicator's own entry and levels) during the day: buy a CE or PE once per signal."""
+    now = ist_now()
+    st = NIFTY_STATE.setdefault(u["id"], {})
+    if now.time() < dtime(9, 20, 10):
+        return False
+    row = next((r for r in STATES["5m"]["rows"] if r.get("symbol") == "NIFTY"), None)
+    if not row or row.get("signal") not in ("BUY", "SELL") or row.get("bars_ago") is None or row["bars_ago"] > NIFTY_FRESH_MAX_AGE or not row.get("sl") or not row.get("tp1"):
+        return False
+    key = f"{now.strftime('%Y-%m-%d')} {row.get('signal_time')} {row['signal']}"
+    if st.get("fresh_seen") == key:
+        return False
+    st["fresh_seen"] = key   # one look at each signal, whether or not it ends in a trade
+    px, side = float(row["close"]), row["signal"]
+    lv = {"sl": row["sl"], "tp1": row["tp1"], "tp2": row["tp2"]}
+    if (side == "BUY" and not (lv["sl"] < px < lv["tp1"])) or (side == "SELL" and not (lv["tp1"] < px < lv["sl"])):
+        bot_log(u["id"], f"NIFTY fresh {side}: price already past the first target or the stop, skipped.", bot="nifty")
+        return False
+    it = INTERNAL.get(("NIFTY", "5m"))
+    if it and it.get("ema") and ((side == "BUY" and px < it["ema"]) or (side == "SELL" and px > it["ema"])):
+        bot_log(u["id"], f"NIFTY fresh {side}: price is on the wrong side of the 20 EMA, skipped.", bot="nifty")
+        return False
+    c = {"symbol": "NIFTY", "side": side, "px": px, "levels": lv, "note": f"fresh 5 min {side} signal at {row.get('signal_time')}"}
+    r = bot_buy(u, cfg, c, "live" if cfg["mode"] == "live" else "paper", strategy="nifty", skip_expiry_day=True, etype="fresh")
+    if r == "skip":
+        st.pop("fresh_seen", None)   # chain or price missing: look again next tick while the signal is fresh
+        return False
+    return r != "changed"
+
+
+STOCK_GAP_MAX = float(os.getenv("STOCK_GAP_MAX", str(OPTBOT_MAX_CHG)))
+
+
+def stock_frames(symbols):
+    import yfinance as yf
+    out = {}
+    tk = [yf_ticker(s) for s in symbols]
+    df = yf.download(" ".join(tk), period="7d", interval="5m", auto_adjust=False, progress=False, group_by="ticker", threads=True)
+    if df is None or df.empty:
+        return out
+    for s, t in zip(symbols, tk):
+        try:
+            d = df[t] if getattr(df.columns, "nlevels", 1) > 1 else df
+            d = d.dropna(subset=["Close", "High", "Low", "Open"]).copy()
+            if d.empty:
+                continue
+            d.index = d.index.tz_localize("UTC").tz_convert(IST) if d.index.tz is None else d.index.tz_convert(IST)
+            out[s] = d
+        except Exception:
+            continue
+    return out
+
+
+def stock_gap_enter(u, cfg):
+    """Continuation for scanner stocks: from 9:20 to 9:45, a stock whose 5 min signal from yesterday is still open and which gapped the same way
+    (and whose first candle confirmed it) is bought as a CE or PE. Target is the next pivot level. At most one purchase a tick."""
+    now = ist_now()
+    today = now.strftime("%Y-%m-%d")
+    st = STOCK_GAP_STATE.setdefault(u["id"], {})
+    if st.get("day") != today:
+        st.clear()
+        st["day"] = today
+    if now.time() > NIFTY_LAST_ENTRY or now.time() < dtime(9, 20, 10):
+        return False
+    mode = "live" if cfg["mode"] == "live" else "paper"
+    if "cands" not in st and not st.get("done"):
+        d = api_scanner("5m", 0)
+        syms = [r["symbol"] for r in (d.get("rows", []) if isinstance(d, dict) else []) if r.get("symbol")]
+        if not syms:
+            return False
+        frames = stock_frames(syms)
+        if not frames:
+            return False   # data late: try again next tick
+        cands, whys = [], []
+        for sym, df in frames.items():
+            side, prev, first, why = nifty_inputs(df, now.date(), sym)
+            if first is None and why:
+                whys.append(f"{sym}: {why}")
+                continue
+            plan, why = nifty_plan(side, prev, first, {"gap_max": STOCK_GAP_MAX, "min_tgt": 0.3, "min_sl": 0.2})
+            if not plan:
+                whys.append(f"{sym}: {why}")
+                continue
+            cands.append({"symbol": sym, "side": plan["side"], "px": plan["entry"], "rr": plan["rr"],
+                          "levels": {"sl": plan["sl"], "tp1": plan["tp1"], "tp2": plan["tp2"]},
+                          "note": f"gap {plan['gap']:+.2f}% with yesterday's {plan['side']} signal open; stop at {plan['sl_name']}, target pivot {plan['target_name']}, reward/risk {plan['rr']:.1f}"})
+        cands.sort(key=lambda c: -c["rr"])
+        st["cands"] = cands
+        bot_log(u["id"], f"Stock gap continuation: {len(cands)} of {len(frames)} stocks qualify." + (f" Skipped: {'; '.join(whys[:3])}." if whys else ""), bot="scanner")
+    while st.get("cands"):
+        c = st["cands"].pop(0)
+        with ORDER_LOCK:
+            traded = any(o.get("user") == u["id"] and o.get("bot") and o["symbol"] == c["symbol"] and o.get("date") == today for o in ORDERS)
+        if traded or OPTBOT_SKIP.get((u["id"], c["symbol"]), 0) > time.time():
+            continue
+        r = bot_buy(u, cfg, c, mode, strategy="scanner", etype="gap")
+        if r == "skip":
+            continue
+        return r != "changed"
+    st["done"] = True
+    return False
 
 
 def bot_exit(u, pos, reason):
@@ -2490,10 +2597,18 @@ def optbot_once():
                     notify_user(uid, "Autopilot stopped: loss limit", f"The daily loss limit of {cfg['loss_limit']:.0f} was reached.")
                     continue
                 cfg["last_scan"] = now_t.strftime("%H:%M:%S")
+                ent = cfg.get("entries", "both")
+                room = lambda: len(bot_positions(uid, open_only=False, kind=kind)) < cfg["max_trades"] and len(bot_positions(uid, kind=kind)) < 2
                 if kind == "nifty":
-                    nifty_enter(u, cfg)
+                    if ent in ("both", "gap"):
+                        nifty_enter(u, cfg)
+                    if ent in ("both", "fresh") and room():
+                        nifty_fresh(u, cfg)
                 else:
-                    bot_enter(u, cfg)
+                    if ent in ("both", "gap"):
+                        stock_gap_enter(u, cfg)
+                    if ent in ("both", "fresh") and room():
+                        bot_enter(u, cfg)
             except Exception as e:
                 bot_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}", bot=kind)
 
@@ -4253,14 +4368,14 @@ def bot_view(u, kind="scanner"):
     trades = []
     for o in sorted(bot_positions(u["id"], open_only=False, kind=kind), key=lambda o: o["time"]):
         trades.append({"time": o["time"], "label": o["label"], "mode": o["mode"], "entry": o.get("avg_price") or o["price"], "state": o.get("bot_state"),
-                       "exit": o.get("bot_exit_px"), "pnl": bot_pnl(o), "reason": o.get("bot_reason"), "p_sl": o.get("bot_p_sl"), "p_t1": o.get("bot_p_t1"), "p_t2": o.get("bot_p_t2"), "dir": o.get("bot_dir")})
+                       "exit": o.get("bot_exit_px"), "pnl": bot_pnl(o), "reason": o.get("bot_reason"), "p_sl": o.get("bot_p_sl"), "p_t1": o.get("bot_p_t1"), "p_t2": o.get("bot_p_t2"), "dir": o.get("bot_dir"), "etype": o.get("bot_etype") or "signal"})
     pnl = round(sum(t["pnl"] or 0 for t in trades), 2)
     why = live_blocker(u) or ("Switch your account to Live with the toggle at the top first." if user_mode(u)[0] != "live" else None)
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
-    return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "nifty_note": (NIFTY_STATE.get(u["id"]) or {}).get("why") if (NIFTY_STATE.get(u["id"]) or {}).get("day") == today else None, "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
+    return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "nifty_note": (NIFTY_STATE.get(u["id"]) or {}).get("why") if (NIFTY_STATE.get(u["id"]) or {}).get("day") == today else None, "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
-            "rules": NIFTY_RULES if kind == "nifty" else f"Buys at the money options on the scanner's top stocks from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}. Day change 0 to {OPTBOT_MAX_CHG:g}% buys a CE, 0 to -{OPTBOT_MAX_CHG:g}% buys a PE, "
-                     f"with the 5 min signal in the same direction and price nearest its 20 EMA. The stock's stop-loss and targets are converted to option prices using the option's delta: sell at the option stop (never worse than -{OPTBOT_MAX_LOSS_PCT:g}%) or at T2, stop moves to the price paid at T1, all closed by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
+            "rules": ((NIFTY_RULES + " Also buys on a fresh 5 min NIFTY signal during the day, once per signal, using the signal's own stop and targets.") if kind == "nifty" else "Gap continuation (9:20 to 9:45): a stock whose 5 min signal from yesterday is still open and which gapped the same way is bought, target the next pivot. Otherwise, ") + ("" if kind == "nifty" else f"Buys at the money options on the scanner's top stocks from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}. Day change 0 to {OPTBOT_MAX_CHG:g}% buys a CE, 0 to -{OPTBOT_MAX_CHG:g}% buys a PE, "
+                     f"with the 5 min signal in the same direction and price nearest its 20 EMA. The stock's stop-loss and targets are converted to option prices using the option's delta: sell at the option stop (never worse than -{OPTBOT_MAX_LOSS_PCT:g}%) or at T2, stop moves to the price paid at T1, all closed by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."),
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
 
 
@@ -4286,7 +4401,10 @@ def bot_apply(u, payload, mode, kind="scanner"):
         if err:
             return err
         cfg["armed_day"] = ist_now().strftime("%Y-%m-%d")
-    cfg.update(max_trades=mt, lots=lots, loss_limit=ll)
+    ent = payload.get("entries", cfg.get("entries", "both"))
+    if ent not in ("both", "fresh", "gap"):
+        return "Choose both entry types, fresh signals only, or gap continuation only."
+    cfg.update(max_trades=mt, lots=lots, loss_limit=ll, entries=ent)
     return None
 
 
@@ -5495,6 +5613,7 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="sub" id="${p}Rules"></div>
  <div class="botrow">
   <label>Mode<select id="${p}Mode"><option value="paper">Paper</option><option value="live">Live</option></select></label>
+  <label>Entries<select id="${p}Ent"><option value="both">Fresh + continuation</option><option value="fresh">Fresh signals only</option><option value="gap">Gap continuation only</option></select></label>
   <label>Trades a day<input id="${p}Max" type="number" min="1" max="10" step="1"></label>
   <label>Lots each<input id="${p}Lots" type="number" min="1" step="1"></label>
   <label>Stop for the day at a loss of ₹<input id="${p}Loss" type="number" min="0" step="500"></label>
@@ -5512,15 +5631,15 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
 </div>`}
 async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
  for(const p in BOTS){try{const d=await (await api("/api/optbot?bot="+BOTS[p].kind)).json();window.botD[p]=d;
-  if(document.activeElement&&[p+"Mode",p+"Max",p+"Lots",p+"Loss"].includes(document.activeElement.id)){}else{$(p+"Mode").value=d.mode==="off"?d.choice:d.mode;$(p+"Max").value=d.max_trades;$(p+"Lots").value=d.lots;$(p+"Loss").value=d.loss_limit}
+  if(document.activeElement&&[p+"Mode",p+"Ent",p+"Max",p+"Lots",p+"Loss"].includes(document.activeElement.id)){}else{$(p+"Mode").value=d.mode==="off"?d.choice:d.mode;$(p+"Ent").value=d.entries;$(p+"Max").value=d.max_trades;$(p+"Lots").value=d.lots;$(p+"Loss").value=d.loss_limit}
   $(p+"Rules").textContent=d.rules+(d.strategy==="nifty"&&d.nifty_note?` Today: ${d.nifty_note}`:"");
   $(p+"State").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
   const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";
   $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
-  $(p+"Trades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
+  $(p+"Trades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"?"Gap":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
   $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
  botTimer=setTimeout(botLoad,8000)}
-async function botCtl(p,action,extra){const D=window.botD[p]||{};const body={action,bot:BOTS[p].kind,mode:$(p+"Mode").value,max_trades:+$(p+"Max").value,lots:+$(p+"Lots").value,loss_limit:+$(p+"Loss").value,...extra};
+async function botCtl(p,action,extra){const D=window.botD[p]||{};const body={action,bot:BOTS[p].kind,mode:$(p+"Mode").value,entries:$(p+"Ent").value,max_trades:+$(p+"Max").value,lots:+$(p+"Lots").value,loss_limit:+$(p+"Loss").value,...extra};
  if(action==="play"&&body.mode==="live"&&!(D.mode==="live"&&D.armed)){const pin=prompt("Order PIN, to arm this live autopilot for today");if(pin===null)return;body.pin=pin}
  if(action==="stop"&&!confirm(D.open?`Stop this autopilot and sell ${D.open} open position(s) now?`:"Stop this autopilot?"))return;
  const d=await post("/api/optbot/control",body);$(p+"Msg").textContent=d.error||({play:"Running.",pause:"Paused. No new trades; open positions are still managed.",stop:d.left?`Stopped, but ${d.left} position(s) could not be closed. Check your broker app.`:"Stopped. All positions closed.",save:"Saved."})[action];botLoad()}
