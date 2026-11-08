@@ -1184,6 +1184,23 @@ class AngelAccount:
                     time.sleep(1.1)  # Angel One limits market data calls to about one a second
         return out
 
+    def funds(self):
+        d = (self._read("rmsLimit") or {}).get("data") or {}
+        return _num(d.get("availablecash")) if d.get("availablecash") is not None else _num(d.get("net"))
+
+    def margin_for(self, o, qty):
+        return None  # Angel One's margin calculator is not used; the estimate falls back to the full order value
+
+    def positions(self):
+        out = []
+        for x_ in (self._read("position") or {}).get("data") or []:
+            net = _num(x_.get("netqty")) or 0
+            avg = _num(x_.get("buyavgprice")) if net > 0 else _num(x_.get("sellavgprice")) if net < 0 else None
+            un, re_ = _num(x_.get("unrealised")) or 0, _num(x_.get("realised")) or 0
+            out.append({"label": str(x_.get("tradingsymbol") or x_.get("symbolname")), "qty": net, "avg": avg, "ltp": _num(x_.get("ltp")),
+                        "realized": re_, "unrealized": un, "product": str(x_.get("producttype") or "")})
+        return out
+
     def modify_stop(self, o, rec, trigger):
         """Move the trigger of a stop-loss order that is already placed. Safe to repeat: it sets the trigger, it does not add to it."""
         params = {"variety": rec.get("variety", "STOPLOSS"), "orderid": str(rec["id"]), "ordertype": "STOPLOSS_MARKET", "producttype": o["product"],
@@ -1257,6 +1274,30 @@ class DhanAccount:
                 price = _num((v or {}).get("last_price"))
                 if price:
                     out[(seg, str(sid))] = price
+        return out
+
+    def funds(self):
+        res = self.request("GET", "/fundlimit") or {}
+        v = res.get("availabelBalance", res.get("availableBalance"))  # Dhan spells it "availabel"
+        return _num(v)
+
+    def margin_for(self, o, qty):
+        """Margin Dhan wants for this order, or None when it cannot say."""
+        body = {"dhanClientId": self.c["client_id"], "exchangeSegment": o["exchange"], "transactionType": o["side"], "quantity": int(qty),
+                "productType": DHAN_PRODUCT[o["product"]], "securityId": str(o["token"]), "price": float(o["price"] or o["ref"]), "triggerPrice": 0}
+        res = self.request("POST", "/margincalculator", body) or {}
+        return _num(res.get("totalMargin"))
+
+    def positions(self):
+        out = []
+        for x_ in self.request("GET", "/positions") or []:
+            net = _num(x_.get("netQty")) or 0
+            un, re_ = _num(x_.get("unrealizedProfit")) or 0, _num(x_.get("realizedProfit")) or 0
+            cost = _num(x_.get("costPrice")) or 0
+            ltp = cost + un / net if net and cost else None
+            label = str(x_.get("tradingSymbol") or x_.get("securityId"))
+            out.append({"label": label, "qty": net, "avg": cost or (_num(x_.get("buyAvg")) or _num(x_.get("sellAvg"))), "ltp": ltp,
+                        "realized": re_, "unrealized": un, "product": str(x_.get("productType") or "")})
         return out
 
     def modify_stop(self, o, rec, trigger):
@@ -1393,7 +1434,7 @@ def inr(x):
     return "₹" + f"{x:,.2f}"
 
 
-def make_order(p, u):
+def make_order(p, u, dry=False):
     """Check an order request against every limit. Returns (order, error, warnings, lines)."""
     kind = p.get("kind")
     symbol = str(p.get("symbol", "")).upper().strip()
@@ -1428,9 +1469,9 @@ def make_order(p, u):
     cap = caps["max_fut_lots"] if (kind == "future" or (kind == "option" and side == "SELL")) else caps["max_qty"]
     if qty < 1 or qty > cap:
         return fail(f"Quantity must be between 1 and {cap}" + (" shares." if kind == "equity" else " lots."))
-    if mode == "live" and not market_open_now():
+    if mode == "live" and not dry and not market_open_now():
         return fail("The market is closed. Live orders are accepted 9:15 to 15:30 IST, Monday to Friday.")
-    if count_today(u["id"], mode) >= caps["max_orders"]:
+    if not dry and count_today(u["id"], mode) >= caps["max_orders"]:
         return fail(f"Daily limit of {caps['max_orders']} orders reached.")
 
     row, _ = row_for(symbol, tf)
@@ -1521,8 +1562,8 @@ def make_order(p, u):
     key = (kind, symbol, side, strike, right)
     now = time.time()
     with ORDER_LOCK:
-        if any(o.get("user") == u["id"] and o.get("key") == key and not o.get("is_exit") and now - o["t"] < 60 for o in ORDERS):
-            return fail("An identical order was sent less than a minute ago. Check the Orders tab before sending another.")
+        if not dry and any(o.get("user") == u["id"] and o.get("key") == key and not o.get("is_exit") and now - o["t"] < 60 for o in ORDERS):
+            return fail("An identical order was sent less than a minute ago. Check the Portfolio tab before sending another.")
 
     sl = risk = None
     signal_row = next((r for r in STATES[tf]["rows"] if r["symbol"] == symbol), None) if tf in STATES else None
@@ -1550,7 +1591,7 @@ def make_order(p, u):
         auto_sl = False
     trail = bool(p.get("trail")) and auto_sl
     if kind == "future" and not auto_sl:
-        warnings.append("Futures are leveraged and the stop-loss is not automatic. Place it from the Orders tab once the entry fills.")
+        warnings.append("Futures are leveraged and the stop-loss is not automatic. Place it from the Portfolio tab once the entry fills.")
     if selling_opt:
         warnings.append("Selling an option can lose far more than the premium you receive. It needs margin, and no stop-loss is placed for you. "
                         "If you are closing an option you bought, this is a sell to close.")
@@ -1562,13 +1603,13 @@ def make_order(p, u):
     if auto_sl:
         lines.append(["Automatic stop-loss", "ON: placed for you as soon as the entry fills" + (", and trailed as targets are reached" if trail else "")])
         if mode == "live":
-            warnings.append("Automatic stop-loss is switched on. The dashboard server places it for you after the fill, so it must be running. Check the Orders tab and your broker app.")
+            warnings.append("Automatic stop-loss is switched on. The dashboard server places it for you after the fill, so it must be running. Check the Portfolio tab and your broker app.")
     if kind == "equity" and sl and not auto_sl:
-        lines.append(["Stop-loss from the signal", inr(sl) + " (placed from the Orders tab once filled)"])
+        lines.append(["Stop-loss from the signal", inr(sl) + " (placed from the Portfolio tab once filled)"])
     if selling_opt:
         lines.append(["Exposure (strike x units)", inr(exposure)])
     if kind == "future" and risk:
-        lines.append(["Stop-loss distance", f"{risk:.2f} points from your fill price" + ("" if auto_sl else " (placed from the Orders tab)")])
+        lines.append(["Stop-loss distance", f"{risk:.2f} points from your fill price" + ("" if auto_sl else " (placed from the Portfolio tab)")])
     order = {"kind": kind, "symbol": symbol, "label": label, "tradingsymbol": tsym, "token": token, "exchange": exch,
              "side": side, "qty": units, "lots": qty, "order_type": otype, "price": price, "ref": ref, "product": product,
              "expiry": expiry, "strike": strike, "right": right, "sl": sl, "risk": risk, "key": key, "broker": broker_id, "mode": mode, "user": u["id"],
@@ -3422,7 +3463,7 @@ def cap_classes():
 SCANNER_RANK = os.getenv("SCANNER_RANK", "value").strip().lower()
 SCANNER_RANK = SCANNER_RANK if SCANNER_RANK in ("value", "volume") else "value"
 SCANNER_MIN_PRICE = float(os.getenv("SCANNER_MIN_PRICE", "150") or 0)
-SCANNER_TOP = 10   # the scanner follows the day's ten most active F&O stocks by volume
+SCANNER_TOP = max(1, int(os.getenv("SCANNER_TOP", "15") or 15))   # how many of the day's most active F&O stocks the scanner follows
 
 
 def nse_most_active(by):
@@ -3448,7 +3489,7 @@ def nse_most_active(by):
 
 @app.get("/api/scanner")
 def api_scanner(tf: str = "15m", only: int = 0):
-    """Today's ten most active large and mid cap stocks by traded value, priced above the minimum, with their signal on 5 min or 15 min."""
+    """Today's most active large and mid cap stocks by traded value, priced above the minimum, with their signal on 5 min or 15 min."""
     if tf not in ("5m", "15m"):
         return JSONResponse({"error": "Choose 5 min or 15 min."}, status_code=400)
     by, n = SCANNER_RANK, SCANNER_TOP
@@ -3491,7 +3532,7 @@ def api_scanner(tf: str = "15m", only: int = 0):
                     "levels": {k: r[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")} if r.get("entry") is not None else None})
         if len(out) >= n:
             break
-    return {"tf": tf, "by": by, "source": source, "cap_source": "nse" if caps is not None else "approx", "rows": out, "skipped": skipped, "cheap": len(set(cheap)), "min_price": SCANNER_MIN_PRICE, "rank": by, "scanning": busy, "updated": upd,
+    return {"tf": tf, "by": by, "source": source, "cap_source": "nse" if caps is not None else "approx", "rows": out, "skipped": skipped, "top": n, "cheap": len(set(cheap)), "min_price": SCANNER_MIN_PRICE, "rank": by, "scanning": busy, "updated": upd,
             "note": (f"Today's ten most active large-cap and mid-cap F&O stocks by traded {by}, from NSE's most active list. Large cap = NIFTY 100, mid cap = NIFTY MIDCAP 150. Stocks priced under ₹{SCANNER_MIN_PRICE:g} are left out. Only F&O stocks are shown, because those are the ones that can be traded as futures or options."
                      if source == "nse" else
                      f"NSE's list did not load, so today's ten highest-{by} large-cap and mid-cap F&O stocks above ₹{SCANNER_MIN_PRICE:g} are taken from the candle data instead. Open this page again later to use NSE's own list.") +
@@ -3565,6 +3606,92 @@ def api_trading_check(request: Request, which: str = ""):
     return {"ok": bool(loaded and m["eq"]), "broker": name, "message": msg}
 
 
+@app.post("/api/orders/funds")
+def api_order_funds(request: Request, payload: dict = Body(...)):
+    """Broker balance and what one share or lot costs, so the ticket can show how much can be bought. Places nothing."""
+    u = request.state.user
+    if user_mode(u)[0] != "live":
+        return {"live": False}
+    one = {**payload, "qty": 1}
+    order, err, _, _ = make_order(one, u, dry=True)
+    if err:
+        return {"live": True, "error": err}
+    acct = get_account(u["id"], order["broker"])
+    out = {"live": True, "broker": BROKER_NAMES.get(order["broker"], order["broker"])}
+    try:
+        out["balance"] = acct.funds()
+    except Exception as e:
+        return {**out, "error": f"Could not read your {out['broker']} balance ({str(e)[:120]})."}
+    value = (order["price"] or order["ref"]) * order["qty"]
+    per, basis = value, "full order value"
+    if order["product"] != "DELIVERY" or order["kind"] != "equity":
+        try:
+            m = acct.margin_for(order, order["qty"])
+            if m:
+                per, basis = m, f"{out['broker']} margin"
+        except Exception:
+            pass
+    caps = u["caps"]
+    cap_qty = caps["max_fut_lots"] if (order["kind"] == "future" or (order["kind"] == "option" and order["side"] == "SELL")) else caps["max_qty"]
+    vcap = caps["max_fut_value"] if order["kind"] == "future" else caps["max_order_value"]
+    by_value = int(vcap // value) if value and order["kind"] != "future" and not (order["kind"] == "option" and order["side"] == "SELL") else cap_qty
+    out.update(per_qty=round(per, 2), basis=basis, unit="lot" if order["kind"] != "equity" else "share",
+               max_qty=max(0, int(min(out["balance"] // per if per else 0, cap_qty, by_value))) if out["balance"] is not None else None)
+    return out
+
+
+@app.get("/api/portfolio")
+def api_portfolio(request: Request):
+    """Positions with live profit and loss, and the broker balance. Live mode reads the broker; paper mode is worked out from paper orders."""
+    u = request.state.user
+    mode = user_mode(u)[0]
+    pos, funds, errors = [], [], []
+    if mode == "live":
+        for b in u["brokers"]:
+            try:
+                acct = get_account(u["id"], b)
+                for r in acct.positions():
+                    pos.append({**r, "broker": BROKER_NAMES.get(b, b)})
+                try:
+                    funds.append({"broker": BROKER_NAMES.get(b, b), "balance": acct.funds()})
+                except Exception:
+                    pass
+            except Exception as e:
+                errors.append(f"{BROKER_NAMES.get(b, b)}: {str(e)[:140]}")
+    else:
+        with ORDER_LOCK:
+            recs = [o for o in ORDERS if o.get("user") == u["id"] and o["mode"] == "paper" and o["status"] == "complete" and not o.get("is_exit")]
+        groups = {}
+        for o in recs:
+            g = groups.setdefault(o["label"], {"o": o, "bq": 0, "bv": 0.0, "sq": 0, "sv": 0.0})
+            px = o.get("avg_price") or o["price"]
+            if o["side"] == "BUY":
+                g["bq"] += o["qty"]; g["bv"] += o["qty"] * px
+            else:
+                g["sq"] += o["qty"]; g["sv"] += o["qty"] * px
+        for label, g in groups.items():
+            o = g["o"]
+            matched = min(g["bq"], g["sq"])
+            ba = g["bv"] / g["bq"] if g["bq"] else 0
+            sa = g["sv"] / g["sq"] if g["sq"] else 0
+            real = matched * (sa - ba)
+            net = g["bq"] - g["sq"]
+            avg = ba if net > 0 else sa if net < 0 else None
+            ltp = None
+            if o["kind"] in ("equity", "future"):
+                row, _ = row_for(o["symbol"], DEFAULT_INTERVAL)
+                ltp = live_price(row) if row else None
+            unreal = net * (ltp - avg) if net and ltp is not None else 0.0
+            pos.append({"label": label, "qty": net, "avg": avg, "ltp": ltp, "realized": round(real, 2), "unrealized": round(unreal, 2),
+                        "product": o["product"], "broker": "Paper"})
+    for r in pos:
+        r["pnl"] = round((r["realized"] or 0) + (r["unrealized"] or 0), 2)
+    pos.sort(key=lambda r: (r["qty"] == 0, -abs(r["pnl"])))
+    tot = {"realized": round(sum(r["realized"] or 0 for r in pos), 2), "unrealized": round(sum(r["unrealized"] or 0 for r in pos), 2)}
+    tot["pnl"] = round(tot["realized"] + tot["unrealized"], 2)
+    return {"mode": mode, "positions": pos, "totals": tot, "funds": funds, "errors": errors}
+
+
 @app.post("/api/orders/preview")
 def api_preview(request: Request, payload: dict = Body(...)):
     u = request.state.user
@@ -3588,8 +3715,6 @@ def api_confirm(request: Request, payload: dict = Body(...)):
         item = PENDING.get(token)
     if not item or item["exp"] < time.time() or item["user"] != u["id"]:
         return {"error": "This review expired or was already used. Review the order again."}
-    if str(payload.get("confirm", "")).strip().upper() != "YES":
-        return {"error": "Type YES to confirm."}
     live = item["order"]["mode"] == "live"
     err = pin_error(u, payload.get("pin"), live)
     if err:
@@ -3603,7 +3728,7 @@ def api_confirm(request: Request, payload: dict = Body(...)):
     with ORDER_LOCK:
         item = PENDING.pop(token, None)  # single use: a double click cannot send two orders
     if not item:
-        return {"error": "This review was already used. Check the Orders tab."}
+        return {"error": "This review was already used. Check the Portfolio tab."}
     o = item["order"]
     if not live:
         status = "complete" if o["order_type"] == "MARKET" else "open"
@@ -4203,6 +4328,10 @@ td.act{white-space:nowrap}
 .tk label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute)}
 .tk input,.tk select{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 9px}
 .tkreview{border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:10px}
+.tkfunds{border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:10px}
+.tkfunds div{display:flex;justify-content:space-between;gap:12px;padding:3px 0}.tkfunds span{color:var(--mute)}.tkfunds p{margin:6px 0 0}
+.tkfunds.bad{border-color:var(--sell)}.tkfunds.bad b{color:var(--sell)}
+.pnlup{color:var(--buy)!important}.pnldn{color:var(--sell)!important}
 .tkreview div{display:flex;justify-content:space-between;gap:12px;padding:3px 0}
 .tkreview span{color:var(--mute)}
 .warn{color:var(--sell);margin:6px 0 0;font-size:13px}
@@ -4318,7 +4447,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="history">History</button><button data-m="orders">Orders</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="history">History</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -4352,10 +4481,10 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </section>
 <section id="view-scanner" hidden>
 <div class="ixrow"><div class="seg" id="scTfs" role="group" aria-label="Timeframe"></div>
- <b class="scttl" id="scTtl">Top 10 by traded value today</b>
+ <b class="scttl" id="scTtl">Top 15 by traded value today</b>
  <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label><span class="sub" id="scMeta"></span></div>
 <div class="wrap"><table id="scTable"></table></div>
-<div class="note" id="scNote"></div>
+
 </section>
 <section id="view-history" hidden>
 <div class="hbar">
@@ -4378,6 +4507,11 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="note" id="hFoot">How to read this: each signal is followed from its candle's close. It counts as a win for a target if price reached that target before the stop-loss. If the stop and a target are touched in the same candle, the stop is counted first. Signals that have reached neither yet are open and left out of that target's rate. "R per trade" is the average result if you always exited at that target: a win is worth that many R, a loss is minus 1R. Slippage, brokerage and gaps are not included, signals that overlap are each counted on their own, and the history only goes as far back as Yahoo's candles (about 30 days on 5 min, 60 days on 15 min, 2 years on Daily). Past results do not promise future ones.</div>
 </section>
 <section id="view-orders" hidden>
+<div class="hkpi" id="pfKpi"></div>
+<div class="note" id="pfNote" style="margin:0 0 10px"></div>
+<h3 style="margin:14px 0 6px">Positions</h3>
+<div class="wrap"><table id="pfTable"></table></div>
+<h3 style="margin:18px 0 6px">Orders today</h3>
 <div class="note" id="ordNote" style="margin:0 0 10px">Orders placed from this dashboard today.</div>
 <div class="wrap"><table id="ordTable"></table></div>
 <div style="margin-top:12px"><button class="mini" id="chk">Check broker connection</button> <span class="sub" id="chkMsg"></span></div>
@@ -4466,9 +4600,9 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <label class="chk"><input type="checkbox" id="tkAuto"> Place the stop-loss automatically after the fill</label>
   <label class="chk" id="tkTrailL"><input type="checkbox" id="tkTrail"> Trail it up as targets are reached</label>
  </div>
+ <div class="tkfunds" id="tkFunds" hidden></div>
  <div class="tkreview" id="tkReview" hidden></div>
  <div class="tkgrid" id="tkConfirm" hidden>
-  <label>Type YES to confirm<input id="tkYes" autocomplete="off"></label>
   <label id="tkPinL" hidden>Order PIN<input id="tkPin" type="password" autocomplete="off"></label>
  </div>
  <div class="tkmsg" id="tkMsg" role="status"></div>
@@ -4651,9 +4785,8 @@ async function scLoad(){clearTimeout(scTimer);if(mode!=="scanner")return;const m
  scTimer=setTimeout(scLoad,scData&&scData.scanning?3000:20000)}
 function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=`<tbody><tr><td class="empty">${d?esc(d.error):""}</td></tr></tbody>`;return}
  $("scMeta").textContent=(d.source==="nse"?"NSE most active":"Computed from candle data")+(d.updated?` · candles updated ${d.updated}`:"")+(d.scanning?" · scanning…":"");
- $("scNote").textContent=d.note+(d.skipped?` ${d.skipped} active stocks outside your symbol list were left out.`:"")+(d.cheap?` ${d.cheap} cheap stocks were left out.`:"");
  const cols=["#","Symbol","Signal","Status","Signal candle","","Price","Day %","Volume","Value ₹ Cr","Entry","SL","T1","T2","T3","T4"];
- $("scTtl").textContent=`Top 10 by traded ${d.rank||"value"} today · large and mid caps · price ₹${d.min_price||0}+`;
+ $("scTtl").textContent=`Top ${d.top||15} by traded ${d.rank||"value"} today · large and mid caps · price ₹${d.min_price||0}+`;
  const head="<thead><tr>"+cols.map(c=>`<th>${c}</th>`).join("")+"</tr></thead>";
  if(!d.rows.length){tb.innerHTML=head+`<tbody><tr><td colspan="${cols.length}" class="empty">${d.scanning?"First scan is running. This page updates on its own.":"Nothing matches."}</td></tr></tbody>`;return}
  tb.innerHTML=head+"<tbody>"+d.rows.map(r=>{const L=r.levels,fr=r.signal==="BUY"||r.signal==="SELL",lv=(k,i)=>L?`<td class="${r.status&&r.status.startsWith("T")&&+r.status[1]>i?"up":""}">${f2(L[k])}</td>`:"<td>–</td>";
@@ -4773,6 +4906,19 @@ const ltpBtn=(r,s)=>{const l=r[s.toLowerCase()].ltp;if(l==null)return "–";cons
  return `<span class="px">${f2(l)}</span><button class="ob b" ${d} data-side="BUY" title="Buy ${s}" aria-label="Buy ${r.strike} ${s}">B</button><button class="ob s" ${d} data-side="SELL" title="Sell ${s}" aria-label="Sell ${r.strike} ${s}">S</button>`};
 async function loadTrading(){try{tradeInfo=await (await api("/api/trading")).json();const b=$("banner");b.className="banner "+tradeInfo.mode;paintMode();
  b.textContent=tradeInfo.mode==="live"?`LIVE trading is on. Orders go to your ${(tradeInfo.brokers||[]).map(x=>tradeInfo.broker_names[x]).join(" or ")} account. Limits: ₹${tradeInfo.caps.max_value.toLocaleString("en-IN")} per order and ${tradeInfo.caps.max_orders} orders a day. Futures: up to ${tradeInfo.caps.max_fut_lots} lot(s) and ₹${tradeInfo.caps.max_fut_value.toLocaleString("en-IN")} notional.`:tradeInfo.note}catch(e){}}
+let fundsInfo=null,fundsTimer=null;
+function fundsBody(){return {kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right}}
+async function fundsLoad(){fundsInfo=null;const b=$("tkFunds");if(!tradeInfo||tradeInfo.mode!=="live"){b.hidden=true;return}
+ b.hidden=false;b.textContent="Reading your broker balance…";
+ try{const d=await post("/api/orders/funds",fundsBody());fundsInfo=d;fundsPaint()}catch(e){b.textContent="Could not read the balance."}}
+function fundsPaint(){const b=$("tkFunds"),d=fundsInfo;if(!d||!d.live){b.hidden=true;return}
+ if(d.error){b.className="tkfunds bad";b.textContent=d.error;return}
+ const q=Math.max(0,+$("tkQty").value||0),need=q*d.per_qty,left=d.balance-need,u=d.unit+(d.max_qty===1?"":"s");
+ b.className="tkfunds"+(need>d.balance||q>d.max_qty?" bad":"");
+ b.innerHTML=`<div><span>${esc(d.broker)} balance</span><b>${inr0(d.balance)}</b></div><div><span>This order needs about</span><b>${inr0(need)}</b></div>`+
+  `<div><span>${need>d.balance?"Short by":"Left after"}</span><b>${inr0(Math.abs(left))}</b></div><div><span>You can buy up to</span><b>${d.max_qty} ${u} <button class="mini" id="tkMax" type="button">Use max</button></b></div>`+
+  `${q>d.max_qty&&need<=d.balance?`<p class="sub" style="color:var(--sell)">This is above your per-order limit.</p>`:""}<p class="sub">Estimated from ${esc(d.basis)}, ${inr0(d.per_qty)} per ${d.unit}. Your broker makes the final call.</p>`}
+const inr0=v=>"₹"+Number(v).toLocaleString("en-IN",{maximumFractionDigits:0});
 function resetReview(){tkToken=null;$("tkReview").hidden=true;$("tkConfirm").hidden=true;$("tkPlace").hidden=true;$("tkReviewBtn").hidden=false;$("tkMsg").textContent=""}
 function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
  $("tkTitle").textContent=opt?"Option order":fut?"Futures order":"Order ticket";$("tkInst").value=s.label;
@@ -4785,8 +4931,11 @@ function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
  const bl=tradeInfo.brokers||[];$("tkBroker").innerHTML=bl.map(x=>`<option value="${x}">${tradeInfo.broker_names[x]}</option>`).join("");
  $("tkBrokerL").hidden=bl.length<2;if(tradeInfo.default_broker&&bl.length)$("tkBroker").value=tradeInfo.default_broker;
  $("tkAutoBox").hidden=opt;$("tkAuto").checked=!opt;$("tkTrail").checked=false;$("tkTrailL").hidden=false;
- $("tkYes").value="";$("tkPin").value="";resetReview();$("ticket").showModal()}
+ $("tkPin").value="";resetReview();$("ticket").showModal();fundsLoad()}
 ["tkSide","tkQty","tkType","tkPrice","tkProd","tkBroker","tkAuto","tkTrail"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
+$("tkQty").addEventListener("input",fundsPaint);
+["tkSide","tkType","tkPrice","tkProd","tkBroker"].forEach(id=>$(id).addEventListener("change",()=>{clearTimeout(fundsTimer);fundsTimer=setTimeout(fundsLoad,300)}));
+$("tkFunds").onclick=e=>{if(e.target.id==="tkMax"&&fundsInfo&&fundsInfo.max_qty!=null){$("tkQty").value=Math.max(1,fundsInfo.max_qty);resetReview();fundsPaint()}};
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
 initChart();initFlash();initModes();initIndex();initScanner();
@@ -4797,13 +4946,13 @@ $("tkReviewBtn").onclick=async()=>{
  if(d.error){$("tkMsg").textContent=d.error;return}
  tkToken=d.token;$("tkReview").hidden=false;
  $("tkReview").innerHTML=d.lines.map(l=>`<div><span>${esc(l[0])}</span><b>${esc(l[1])}</b></div>`).join("")+d.warnings.map(w=>`<p class="warn">${esc(w)}</p>`).join("");
- $("tkConfirm").hidden=false;$("tkPinL").hidden=d.mode!=="live";$("tkPlace").hidden=false;$("tkReviewBtn").hidden=true;
- $("tkMsg").textContent="Check the details, type YES and place the order. This review is valid for 90 seconds."};
+ $("tkConfirm").hidden=d.mode!=="live";$("tkPinL").hidden=d.mode!=="live";$("tkPlace").hidden=false;$("tkReviewBtn").hidden=true;
+ $("tkMsg").textContent=(d.mode==="live"?"Check the details, enter your PIN and place the order. This review is valid for 90 seconds.":"Check the details and place the order. This review is valid for 90 seconds.")};
 $("tkPlace").onclick=async()=>{const b=$("tkPlace");b.disabled=true;
- try{const d=await post("/api/orders/confirm",{token:tkToken,confirm:$("tkYes").value.trim(),pin:$("tkPin").value});
+ try{const d=await post("/api/orders/confirm",{token:tkToken,pin:$("tkPin").value});
   if(d.error){$("tkMsg").textContent=d.error;return}
-  $("tkMsg").textContent=`Order sent. ID ${d.order.id}, status ${d.order.status}.`+(d.order.sl?" Place the stop-loss from the Orders tab once it is filled.":"");
-  tkToken=null;$("tkPlace").hidden=true;$("tkConfirm").hidden=true;$("tkYes").value="";$("tkPin").value="";loadOrders()}
+  $("tkMsg").textContent=`Order sent. ID ${d.order.id}, status ${d.order.status}.`+(d.order.sl?" Place the stop-loss from the Portfolio tab once it is filled.":"");
+  tkToken=null;$("tkPlace").hidden=true;$("tkConfirm").hidden=true;$("tkPin").value="";loadOrders()}
  finally{b.disabled=false}};
 $("body").onclick=e=>{const cb=e.target.closest("[data-chart]");if(cb){openChart(cb.dataset.chart);return}
  const b=e.target.closest("[data-trade]");if(!b||!data)return;const r=data.rows.find(x=>x.symbol===b.dataset.trade);if(!r)return;
@@ -4814,7 +4963,16 @@ $("otable").onclick=e=>{const b=e.target.closest(".ob");if(!b||!lastChain)return
 $("chk").onclick=async()=>{$("chkMsg").textContent="Checking…";const bs=(tradeInfo.brokers||[]).length?tradeInfo.brokers:[""];const out=[];
  try{for(const b of bs){out.push((await (await api("/api/trading/check?which="+b)).json()).message)}$("chkMsg").textContent=out.join(" ")}catch(e){$("chkMsg").textContent="Cannot reach the server."}};
 const cancelable=new Set(["open","trigger pending","open pending","validation pending","put order req received","modified","after market order req received"]);
-async function loadOrders(){try{renderOrders(await (await api("/api/orders")).json())}catch(e){}}
+async function loadOrders(){try{renderOrders(await (await api("/api/orders")).json())}catch(e){}loadPortfolio()}
+const pnlCls=v=>v>0?"pnlup":v<0?"pnldn":"";const money=v=>(v<0?"-":v>0?"+":"")+"₹"+Math.abs(v).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+async function loadPortfolio(){try{const d=await (await api("/api/portfolio")).json(),t=d.totals;
+ const bal=(d.funds||[]).map(f=>`<div><span class="l">${esc(f.broker)} balance</span><span class="v">${f.balance==null?"–":"₹"+Number(f.balance).toLocaleString("en-IN",{maximumFractionDigits:0})}</span></div>`).join("");
+ const open=d.positions.filter(r=>r.qty).length;
+ $("pfKpi").innerHTML=`<div><span class="l">Today's P&amp;L</span><span class="v ${pnlCls(t.pnl)}">${money(t.pnl)}</span><span class="s">${d.mode==="live"?"From your broker":"Paper, simulated"}</span></div>`+
+  `<div><span class="l">Unrealised (open)</span><span class="v ${pnlCls(t.unrealized)}">${money(t.unrealized)}</span><span class="s">${open} open position${open===1?"":"s"}</span></div>`+
+  `<div><span class="l">Realised (closed)</span><span class="v ${pnlCls(t.realized)}">${money(t.realized)}</span></div>`+bal;
+ $("pfNote").textContent=(d.errors||[]).join(" ")||(d.mode==="live"?"Live positions and profit from your broker. Refreshes every few seconds.":"Paper positions are worked out from your simulated orders, priced at the latest price on this dashboard. Option positions show no live price in paper mode.");
+ $("pfTable").innerHTML=d.positions.length?`<thead><tr><th>Instrument</th><th>Side</th><th>Net qty</th><th>Avg price</th><th>Last price</th><th>Unrealised</th><th>Realised</th><th>Total P&amp;L</th></tr></thead><tbody>`+d.positions.map(r=>`<tr><td>${esc(r.label)}${r.broker&&r.broker!=="Paper"?`<span class="tag">${esc(r.broker)}</span>`:""}</td><td>${r.qty>0?"LONG":r.qty<0?"SHORT":"Closed"}</td><td>${r.qty}</td><td>${r.avg?f2(r.avg):"–"}</td><td>${r.ltp?f2(r.ltp):"–"}</td><td class="${pnlCls(r.unrealized)}">${money(r.unrealized)}</td><td class="${pnlCls(r.realized)}">${money(r.realized)}</td><td class="${pnlCls(r.pnl)}"><b>${money(r.pnl)}</b></td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="empty">No positions today.</td></tr></tbody>`}catch(e){}}
 function renderOrders(d){const t=$("ordTable");
  if(!d.orders.length){t.innerHTML="";$("ordNote").textContent="No orders have been placed from this dashboard today.";return}
  $("ordNote").textContent=(d.mode==="live"?"Live orders, with status copied from Angel One.":"Paper orders, simulated.")+" A stop-loss can be placed once its entry order shows complete.";
@@ -4829,7 +4987,7 @@ $("ordTable").onclick=async e=>{const c=e.target.closest("[data-cancel]"),p=e.ta
  const live=tradeInfo.mode==="live",pin=live?prompt("Order PIN"):"";if(live&&pin===null)return;
  const d=await post(c?"/api/orders/cancel":"/api/orders/protect",{order_id:c?c.dataset.cancel:p.dataset.protect,pin});
  if(d.error)alert(d.error);loadOrders()};
-setInterval(()=>{if(mode==="orders")loadOrders()},10000);
+setInterval(()=>{if(mode==="orders")loadOrders()},8000);
 loadTrading();
 // ── Account and admin ──
 const send=async(m,u,b)=>(await api(u,{method:m,headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)})).json();
