@@ -2613,6 +2613,454 @@ def optbot_once():
                 bot_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}", bot=kind)
 
 
+# ── Backtest: replay the signals (or the gap-continuation rule) over past candles, then size the trades with the user's funds ──
+BT_MAX_SYMBOLS = 10
+BT_MAX_DAYS = {"5m": 58, "15m": 58, "1d": 3650}
+BT_CACHE = {}   # (symbol, interval, days) -> (time, candles)
+BT_JOBS = {}    # job id -> {"user", "state", "result", "error", "t"}
+BT_LOT_FALLBACK = {"NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 65, "MIDCPNIFTY": 140, "SENSEX": 20, "BANKEX": 30, "NIFTYNXT50": 25}
+BT_LOT_MAP = {"day": None, "lots": {}}
+
+
+def bt_lot_for(symbol):
+    """Lot size from a loaded broker instrument master when there is one, else a built-in value for the indices, else None."""
+    today = ist_now().date()
+    if BT_LOT_MAP["day"] != today:
+        lots = {}
+        for name in ("dhan", "angel"):
+            m = MASTERS.get(name) or {}
+            for k, v in list((m.get("opt") or {}).items()):
+                try:
+                    lots.setdefault(k[0], int(v[2]))
+                except Exception:
+                    pass
+        BT_LOT_MAP.update(day=today, lots=lots)
+    return BT_LOT_MAP["lots"].get(symbol) or BT_LOT_FALLBACK.get(symbol)
+
+
+def bt_norm(df):
+    df = df.dropna(subset=["Close", "High", "Low", "Open"]).copy()
+    df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
+    return df
+
+
+def bt_fetch(symbols, interval, days, progress=None):
+    """Candles per symbol from Yahoo, 10 minutes of caching. Returns ({symbol: candles}, [problems])."""
+    import yfinance as yf
+    out, bad, need, now = {}, [], [], time.time()
+    for s in symbols:
+        hit = BT_CACHE.get((s, interval, days))
+        if hit and now - hit[0] < 600:
+            out[s] = hit[1]
+        else:
+            need.append(s)
+    start = (ist_now().date() - timedelta(days=days + 5)).isoformat()
+    for i in range(0, len(need), 4):
+        part = need[i:i + 4]
+        tk = [yf_ticker(s) for s in part]
+        data = None
+        for attempt in range(2):
+            try:
+                data = yf.download(tk, start=start, interval=interval, group_by="ticker", auto_adjust=False, threads=True, progress=False)
+                if data is not None and not data.empty:
+                    break
+            except Exception:
+                data = None
+            time.sleep(1.0)
+        for s, t in zip(part, tk):
+            d = None
+            try:
+                d = _one(data, t, len(tk)) if data is not None and not data.empty else None
+                d = bt_norm(d) if d is not None else None
+            except Exception:
+                d = None
+            if d is None or d.empty:
+                bad.append(f"{s}: no candles from the data provider")
+            else:
+                out[s] = d
+                BT_CACHE[(s, interval, days)] = (time.time(), d)
+        if progress:
+            progress(min(len(need), i + 4), len(need))
+    return out, bad
+
+
+def bt_arrays(df):
+    """The signal series, computed exactly as the live scanner does it."""
+    close = df["Close"]
+    c, hi, lo = close.to_numpy(float), df["High"].to_numpy(float), df["Low"].to_numpy(float)
+    ls, ss, d, atr = chandelier(df)
+    ema = close.ewm(span=EMA_LEN, adjust=False).mean().to_numpy()
+    green, red = qqe_states(close)
+    n = len(c)
+    up, dn = np.zeros(n, bool), np.zeros(n, bool)
+    up[1:] = (d[1:] == 1) & (d[:-1] == -1)
+    dn[1:] = (d[1:] == -1) & (d[:-1] == 1)
+    buy = up & (c > ema) & within_lookback(green)
+    sell = dn & (c < ema) & within_lookback(red)
+    return {"c": c, "o": df["Open"].to_numpy(float), "h": hi, "l": lo, "atr": atr, "ls": ls, "ss": ss, "buy": buy, "sell": sell}
+
+
+def bt_levels(a, j):
+    side = 1 if a["buy"][j] else -1
+    entry = float(a["c"][j])
+    raw = a["ls"][j] if side == 1 else a["ss"][j]
+    risk = float(max(MIN_RISK_ATR * a["atr"][j], min(abs(entry - raw), MAX_RISK_ATR * a["atr"][j])))
+    return side, entry, risk
+
+
+def bt_walk(a, idx, j, k0, side, entry, sl, tp, intraday, sq):
+    """Candles k0 onward: stop first, then target; intraday trades are closed at the square-off time. Returns (exit index, exit price, reason)."""
+    n = len(a["c"])
+    day = idx[j].date()
+    for k in range(k0, n):
+        if intraday and (idx[k].date() != day or idx[k].time() >= sq):
+            if idx[k].date() != day:
+                return k - 1, float(a["c"][k - 1]), "square-off"
+            return k, float(a["o"][k]), "square-off"
+        if side == 1:
+            if a["l"][k] <= sl:
+                return k, float(min(sl, a["o"][k])), "stop-loss"
+            if a["h"][k] >= tp:
+                return k, tp, "target"
+        else:
+            if a["h"][k] >= sl:
+                return k, float(max(sl, a["o"][k])), "stop-loss"
+            if a["l"][k] <= tp:
+                return k, tp, "target"
+    return n - 1, float(a["c"][n - 1]), "still open at the end of the data"
+
+
+def bt_signal_trades(sym, df, interval, p):
+    """Every signal in the period as one trade: entry at the signal candle's close, stop and target from the signal."""
+    df = bt_norm(df) if df.index.tz is None else df
+    if CONFIRMED_ONLY:
+        df = drop_forming(df, interval)
+    if len(df) < MIN_BARS:
+        return [], f"{sym}: only {len(df)} candles, at least {MIN_BARS} are needed"
+    a, idx = bt_arrays(df), df.index
+    intraday = bool(p.get("intraday")) and interval != "1d"
+    t_from, t_to, sq = p["entry_from"], p["entry_to"], p["squareoff"]
+    out, free = [], -1
+    for j in np.nonzero(a["buy"] | a["sell"])[0]:
+        j = int(j)
+        if j <= free or j >= len(idx) - 1:
+            continue
+        side, entry, risk = bt_levels(a, j)
+        if side == -1 and not p.get("sell_ok", True):
+            continue
+        if intraday and not (t_from <= idx[j].time() <= t_to):
+            continue
+        sl, tp = entry - side * risk, entry + side * risk * p["target"]
+        k, px, why = bt_walk(a, idx, j, j + 1, side, entry, sl, tp, intraday, sq)
+        free = k
+        out.append({"sym": sym, "side": side, "t_in": idx[j], "t_out": idx[k], "entry": entry, "exit": px, "risk": risk, "sl": sl, "tp": tp, "why": why, "kind": "signal"})
+    return out, None
+
+
+def bt_open_after(a, j, last):
+    """Is the signal at candle j still alive at candle `last` (no stop-loss, not all four targets yet)? Same walk as the scanner's status."""
+    side, entry, risk = bt_levels(a, j)
+    sl, tps, hits = entry - side * risk, [entry + side * risk * r for r in R_MULTIPLES], 0
+    for k in range(j + 1, last + 1):
+        if (a["l"][k] <= sl) if side == 1 else (a["h"][k] >= sl):
+            return False, side
+        hits = max(hits, sum(1 for t in tps if ((a["h"][k] >= t) if side == 1 else (a["l"][k] <= t))))
+        if hits == 4:
+            return False, side
+    return True, side
+
+
+def bt_gap_trades(sym, df, interval, p):
+    """Gap continuation: yesterday's signal still open, today gaps the same way and the first candle confirms: enter at its close, target the next pivot."""
+    df = bt_norm(df) if df.index.tz is None else df
+    if interval == "1d":
+        return [], f"{sym}: gap continuation needs 5 or 15 minute candles"
+    if len(df) < MIN_BARS:
+        return [], f"{sym}: only {len(df)} candles, at least {MIN_BARS} are needed"
+    a, idx = bt_arrays(df), df.index
+    days = sorted(set(idx.date))
+    sig = np.nonzero(a["buy"] | a["sell"])[0]
+    params = {"gap_max": p["gap_max"], "min_tgt": p["min_tgt"], "min_sl": p["min_sl"]}
+    out, whys = [], {}
+    for d in days[1:]:
+        before = [x for x in days if x < d]
+        y = before[-1]
+        iy = np.nonzero(idx.date == y)[0]
+        idd = np.nonzero(idx.date == d)[0]
+        if not len(iy) or not len(idd) or idx[idd[0]].time() != dtime(9, 15):
+            continue
+        last = int(iy[-1])
+        js = sig[sig <= last]
+        side = None
+        if len(js):
+            alive, sd_ = bt_open_after(a, int(js[-1]), last)
+            if alive or last - int(js[-1]) <= FRESH_BARS:
+                side = "BUY" if sd_ == 1 else "SELL"
+        prev = (float(a["h"][iy].max()), float(a["l"][iy].min()), float(a["c"][last]))
+        f = int(idd[0])
+        plan, why = nifty_plan(side, prev, (float(a["o"][f]), float(a["h"][f]), float(a["l"][f]), float(a["c"][f])), params)
+        if not plan:
+            whys[re.sub(r"[-+]?\d+(\.\d+)?", "#", why)] = whys.get(re.sub(r"[-+]?\d+(\.\d+)?", "#", why), 0) + 1
+            continue
+        sd_ = 1 if plan["side"] == "BUY" else -1
+        k, px, w = bt_walk(a, idx, f, f + 1, sd_, plan["entry"], plan["sl"], plan["tp2"], True, p["squareoff"])
+        out.append({"sym": sym, "side": sd_, "t_in": idx[f], "t_out": idx[k], "entry": plan["entry"], "exit": px, "risk": abs(plan["entry"] - plan["sl"]),
+                    "sl": plan["sl"], "tp": plan["tp2"], "why": w, "kind": "gap"})
+    return out, (f"{sym}: {sum(whys.values())} days had no trade, mostly: " + max(whys, key=whys.get) if whys and not out else None)
+
+
+def bs_price(S, K, T, sig, right):
+    if T <= 0 or sig <= 0:
+        return max(0.0, S - K) if right == "CE" else max(0.0, K - S)
+    d1 = (math.log(S / K) + 0.5 * sig * sig * T) / (sig * math.sqrt(T))
+    d2 = d1 - sig * math.sqrt(T)
+    N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
+    return S * N(d1) - K * N(d2) if right == "CE" else K * N(-d2) - S * N(-d1)
+
+
+def bt_strike_step(sym, px):
+    if sym in ("NIFTY", "FINNIFTY", "NIFTYNXT50"):
+        return 50
+    if sym in ("BANKNIFTY", "BANKEX"):
+        return 100
+    if sym == "SENSEX":
+        return 100
+    return 2.5 if px < 250 else 5 if px < 500 else 10 if px < 1000 else 20 if px < 2500 else 50 if px < 5000 else 100
+
+
+def bt_money(trades, kind, p):
+    """Size and cost every trade with the user's funds, in time order. Returns (closed trades with P&L, skipped reasons, notes)."""
+    cap = p["capital"]
+    trades = sorted(trades, key=lambda t: t["t_in"])
+    cash, openp, done, skipped, notes = cap, [], [], {}, []
+    slip, other, brk = p["slippage"] / 100, p["other_pct"] / 100, p["brokerage"]
+    lots_note = set()
+    over_risk = 0
+
+    def settle(upto):
+        nonlocal cash
+        for o in sorted([o for o in openp if o["t_out"] <= upto], key=lambda o: o["t_out"]):
+            openp.remove(o)
+            cash += o["pnl"]
+            done.append(o)
+
+    for t in trades:
+        settle(t["t_in"])
+        used = sum(o["margin"] for o in openp)
+        free = cash - used
+        risk_amt = cash * p["risk_pct"] / 100
+        side, S0, S1, sym = t["side"], t["entry"], t["exit"], t["sym"]
+        label, lot = sym, 1
+        if kind in ("futures", "options"):
+            lot = p.get("lot_size") if (p.get("lot_size") and len(p["symbols"]) == 1) else bt_lot_for(sym)
+            if not lot:
+                lot = p.get("lot_size") or 1
+                lots_note.add(sym)
+        if kind == "stock":
+            risk_u = t["risk"]
+            qty = int(risk_amt // risk_u) if risk_u > 0 else 0
+            qty = min(qty, int(free * p["leverage"] // S0))
+            if qty < 1:
+                skipped["not enough funds for one share"] = skipped.get("not enough funds for one share", 0) + 1
+                continue
+            margin = S0 * qty / p["leverage"]
+            ein, eout = S0 * (1 + side * slip), S1 * (1 - side * slip)
+            gross = side * (eout - ein) * qty
+            turn = (ein + eout) * qty
+        elif kind == "futures":
+            lots = int(risk_amt // (t["risk"] * lot)) if t["risk"] > 0 else 0
+            per = S0 * lot * p["margin_pct"] / 100
+            if per > free:
+                skipped["not enough margin for one lot"] = skipped.get("not enough margin for one lot", 0) + 1
+                continue
+            if lots < 1:
+                lots, over_risk = 1, over_risk + 1
+            lots = min(lots, int(free // per))
+            qty = lots * lot
+            margin = per * lots
+            ein, eout = S0 * (1 + side * slip), S1 * (1 - side * slip)
+            gross = side * (eout - ein) * qty
+            turn = (ein + eout) * qty
+            label = f"{sym} futures"
+        else:
+            right = "CE" if side == 1 else "PE"
+            step = bt_strike_step(sym, S0)
+            K = round(S0 / step) * step
+            sig = p["iv"] / 100
+            T0 = p["dte"] / 365
+            hold = max(0.0, (t["t_out"] - t["t_in"]).total_seconds() / 86400)
+            T1 = max(p["dte"] - hold, 0.25) / 365
+            p0 = max(0.05, bs_price(S0, K, T0, sig, right))
+            p1 = max(0.0, bs_price(S1, K, T1, sig, right))
+            p_sl = max(0.0, bs_price(t["sl"], K, T0, sig, right))
+            buy_px, sell_px = p0 * (1 + slip), p1 * (1 - slip)
+            loss_lot = max(buy_px - p_sl, 0.05 * buy_px) * lot
+            lots = int(risk_amt // loss_lot)
+            cost_lot = buy_px * lot
+            if cost_lot > free:
+                skipped["not enough funds for one lot"] = skipped.get("not enough funds for one lot", 0) + 1
+                continue
+            if lots < 1:
+                lots, over_risk = 1, over_risk + 1
+            lots = min(lots, int(free // cost_lot))
+            qty = lots * lot
+            margin = cost_lot * lots
+            gross = (sell_px - buy_px) * qty
+            turn = (buy_px + sell_px) * qty
+            label = f"{sym} {int(K) if K == int(K) else K} {right}"
+            ein, eout = buy_px, sell_px
+        cost = 2 * brk + turn * other
+        pnl = gross - cost
+        slipc = (abs(ein - (p0 if kind == "options" else S0)) + abs(eout - (p1 if kind == "options" else S1))) * qty
+        openp.append({**t, "qty": qty, "margin": margin, "pnl": pnl, "cost": cost + slipc, "label": label, "p_in": ein, "p_out": eout})
+    if openp:
+        settle(max(o["t_out"] for o in openp))
+    if lots_note:
+        notes.append("Lot size is not known for " + ", ".join(sorted(lots_note)) + ", so the lot size you entered (or 1) was used.")
+    if over_risk:
+        notes.append(f"{over_risk} trade(s) risked more than your limit because one lot was already bigger than it (a lot is the smallest you can trade).")
+    return sorted(done, key=lambda o: o["t_out"]), skipped, notes
+
+
+def bt_stats(done, p):
+    cap = p["capital"]
+    eq, peak, mdd, mdd_pct, curve, streak, worst_streak = cap, cap, 0.0, 0.0, [], 0, 0
+    wins, losses = [], []
+    months, by_sym = {}, {}
+    for o in done:
+        eq += o["pnl"]
+        peak = max(peak, eq)
+        dd = peak - eq
+        mdd = max(mdd, dd)
+        mdd_pct = max(mdd_pct, dd / peak * 100 if peak else 0)
+        o["equity"] = eq
+        curve.append([int(o["t_out"].timestamp()), round(eq, 2), round(dd / peak * 100 if peak else 0, 2)])
+        (wins if o["pnl"] > 0 else losses).append(o["pnl"])
+        streak = 0 if o["pnl"] > 0 else streak + 1
+        worst_streak = max(worst_streak, streak)
+        m = o["t_out"].strftime("%Y-%m")
+        months[m] = months.get(m, 0) + o["pnl"]
+        b = by_sym.setdefault(o["sym"], {"trades": 0, "wins": 0, "pnl": 0.0})
+        b["trades"] += 1
+        b["wins"] += 1 if o["pnl"] > 0 else 0
+        b["pnl"] += o["pnl"]
+    n = len(done)
+    net = eq - cap
+    span = (done[-1]["t_out"] - done[0]["t_in"]).days if n else 0
+    gw, gl = sum(wins), -sum(losses)
+    if len(curve) > 400:
+        step = len(curve) / 400
+        curve = [curve[int(i * step)] for i in range(400)] + [curve[-1]]
+    return {"capital": cap, "final": round(eq, 2), "net": round(net, 2), "growth_pct": round(net / cap * 100, 2),
+            "cagr_pct": round(((eq / cap) ** (365 / span) - 1) * 100, 1) if span >= 60 and eq > 0 else None, "days": span,
+            "max_dd": round(mdd, 2), "max_dd_pct": round(mdd_pct, 2), "trades": n, "win_rate": round(len(wins) / n * 100, 1) if n else 0,
+            "avg_win": round(gw / len(wins), 2) if wins else 0, "avg_loss": round(-gl / len(losses), 2) if losses else 0,
+            "profit_factor": round(gw / gl, 2) if gl else None, "expectancy": round(net / n, 2) if n else 0,
+            "best": round(max((o["pnl"] for o in done), default=0), 2), "worst": round(min((o["pnl"] for o in done), default=0), 2),
+            "losing_streak": worst_streak, "costs": round(sum(o["cost"] for o in done), 2), "curve": curve,
+            "months": [{"m": k, "pnl": round(v, 2), "pct": round(v / cap * 100, 2)} for k, v in sorted(months.items())],
+            "by_symbol": [{"sym": k, "trades": v["trades"], "win_rate": round(v["wins"] / v["trades"] * 100, 1), "pnl": round(v["pnl"], 2)} for k, v in sorted(by_sym.items(), key=lambda kv: -kv[1]["pnl"])]}
+
+
+def bt_run(params, candles):
+    """candles: {symbol: DataFrame}. Returns the full result."""
+    p = params
+    trades, problems = [], []
+    for sym, df in candles.items():
+        try:
+            tr, why = (bt_gap_trades if p["strategy"] == "gap" else bt_signal_trades)(sym, df, p["interval"], p)
+        except Exception as e:
+            tr, why = [], f"{sym}: could not be tested ({type(e).__name__})"
+        trades += tr
+        if why:
+            problems.append(why)
+    done, skipped, notes = bt_money(trades, p["kind"], p)
+    res = bt_stats(done, p)
+    res["found"] = len(trades)
+    res["skipped"] = [{"why": k, "n": v} for k, v in skipped.items()]
+    res["problems"] = problems
+    res["notes"] = notes
+    res["list"] = [{"in": o["t_in"].strftime("%d %b %Y %H:%M"), "out": o["t_out"].strftime("%d %b %Y %H:%M"), "label": o["label"], "side": "BUY" if o["side"] == 1 else "SELL",
+                    "qty": o["qty"], "entry": round(o["p_in"], 2), "exit": round(o["p_out"], 2), "why": o["why"], "kind": o["kind"], "pnl": round(o["pnl"], 2), "equity": round(o["equity"], 2)}
+                   for o in done[-300:]][::-1]
+    res["listed_of"] = len(done)
+    return res
+
+
+def bt_params(payload):
+    """Validate the request. Returns (params, None) or (None, error)."""
+    def num(k, lo, hi, d):
+        try:
+            v = float(payload.get(k, d))
+        except (TypeError, ValueError):
+            raise ValueError(f"{k} must be a number")
+        if not (lo <= v <= hi):
+            raise ValueError(f"{k} must be between {lo:g} and {hi:g}")
+        return v
+    def tm(k, d):
+        try:
+            h, m = str(payload.get(k, d)).split(":")
+            return dtime(int(h), int(m))
+        except Exception:
+            raise ValueError(f"{k} must look like 09:20")
+    try:
+        interval = str(payload.get("interval", "15m"))
+        if interval not in BT_MAX_DAYS:
+            raise ValueError("Choose a timeframe of 5m, 15m or 1d")
+        kind = str(payload.get("kind", "stock"))
+        if kind not in ("stock", "futures", "options"):
+            raise ValueError("Choose stock, futures or options")
+        strategy = str(payload.get("strategy", "signal"))
+        if strategy not in ("signal", "gap"):
+            raise ValueError("Choose the signal or the gap continuation strategy")
+        raw = payload.get("symbols", "")
+        syms = [s.strip().upper() for s in (raw.split(",") if isinstance(raw, str) else raw) if str(s).strip()]
+        syms = list(dict.fromkeys(syms))
+        if not syms:
+            raise ValueError("Enter at least one symbol, for example NIFTY or RELIANCE")
+        if len(syms) > BT_MAX_SYMBOLS:
+            raise ValueError(f"Test at most {BT_MAX_SYMBOLS} symbols at a time")
+        unknown = [s for s in syms if s not in UNIVERSE]
+        if unknown:
+            raise ValueError("Not in the list of tracked symbols: " + ", ".join(unknown[:5]))
+        mx = BT_MAX_DAYS[interval]
+        days = int(num("days", 10 if interval != "1d" else 200, mx, min(mx, 58 if interval != "1d" else 730)))
+        p = {"interval": interval, "kind": kind, "strategy": strategy, "symbols": syms, "days": days,
+             "capital": num("capital", 10000, 1e9, 500000), "risk_pct": num("risk_pct", 0.1, 10, 1.0), "target": int(num("target", 1, 4, 2)),
+             "intraday": bool(payload.get("intraday", interval != "1d")), "sell_ok": bool(payload.get("sell_ok", True)),
+             "entry_from": tm("entry_from", "09:20"), "entry_to": tm("entry_to", "14:30"), "squareoff": tm("squareoff", "15:15"),
+             "leverage": num("leverage", 1, 20, 5 if interval != "1d" else 1), "margin_pct": num("margin_pct", 3, 100, 12),
+             "lot_size": int(num("lot_size", 0, 100000, 0)) or None, "iv": num("iv", 5, 150, 15), "dte": num("dte", 1, 60, 4 if "NIFTY" in "".join(syms) else 15),
+             "brokerage": num("brokerage", 0, 500, 20), "other_pct": num("other_pct", 0, 1, 0.05), "slippage": num("slippage", 0, 2, 0.03),
+             "gap_max": num("gap_max", 0.2, 5, 1.5 if all(s in INDEX_YF for s in syms) else 2.0), "min_tgt": NIFTY_MIN_TARGET_PCT, "min_sl": NIFTY_MIN_SL_PCT}
+        if strategy == "gap" and interval == "1d":
+            raise ValueError("Gap continuation needs a 5 or 15 minute timeframe")
+        if interval == "1d" and p["intraday"]:
+            p["intraday"] = False
+        if strategy == "gap":
+            p["intraday"] = True
+        return p, None
+    except ValueError as e:
+        return None, str(e)
+
+
+def bt_job(jid, user_id, p):
+    job = BT_JOBS[jid]
+    try:
+        job["note"] = "Downloading price history"
+        candles, bad = bt_fetch(p["symbols"], p["interval"], p["days"], lambda a, b: job.update(note=f"Downloaded {a} of {b} symbols"))
+        if not candles:
+            job.update(state="error", error="The data provider returned no candles. Try again in a minute, or test fewer symbols.")
+            return
+        job["note"] = "Replaying the trades"
+        res = bt_run(p, candles)
+        res["problems"] = bad + res["problems"]
+        res["params"] = {k: (v.strftime("%H:%M") if isinstance(v, dtime) else v) for k, v in p.items()}
+        job.update(state="done", result=res)
+    except Exception as e:
+        job.update(state="error", error=f"The backtest failed ({type(e).__name__}). Try again.")
+
+
 # ── Web app ──
 app = FastAPI(title="SignalDesk", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -4479,6 +4927,36 @@ def api_optbot_exit(request: Request, payload: dict = Body(default={})):
     return {"ok": True, "closed": n}
 
 
+BT_LOCK = threading.Lock()
+
+
+@app.post("/api/backtest")
+def api_backtest(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    p, err = bt_params(payload)
+    if err:
+        return {"error": err}
+    with BT_LOCK:
+        if any(j["user"] == u["id"] and j["state"] == "running" for j in BT_JOBS.values()):
+            return {"error": "A backtest of yours is still running. Wait for it to finish."}
+        if sum(1 for j in BT_JOBS.values() if j["state"] == "running") >= 3:
+            return {"error": "Several backtests are running right now. Try again in a minute."}
+        for k in sorted(BT_JOBS, key=lambda k: BT_JOBS[k]["t"])[:-30]:
+            BT_JOBS.pop(k, None)
+        jid = secrets.token_urlsafe(9)
+        BT_JOBS[jid] = {"user": u["id"], "state": "running", "t": time.time(), "note": "Starting"}
+    threading.Thread(target=bt_job, args=(jid, u["id"], p), daemon=True).start()
+    return {"ok": True, "id": jid}
+
+
+@app.get("/api/backtest/{jid}")
+def api_backtest_get(jid: str, request: Request):
+    j = BT_JOBS.get(jid)
+    if not j or j["user"] != request.state.user["id"]:
+        return {"error": "That backtest was not found. Run it again."}
+    return {"state": j["state"], "note": j.get("note"), "error": j.get("error"), "result": j.get("result")}
+
+
 @app.post("/api/orders/preview")
 def api_preview(request: Request, payload: dict = Body(...)):
     u = request.state.user
@@ -5068,6 +5546,7 @@ table.gt{min-width:0;width:100%;font-size:13px}table.gt th,table.gt td{padding:7
 .hbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
 .hbar input,.hbar select{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font:inherit}
 .hbar input{flex:1;min-width:160px;max-width:260px}
+.btgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px;margin-bottom:6px}.btgrid>.card,#btOut{min-width:0}#btOut .wrap{max-width:100%}.btadv{margin:6px 0}.btadv summary{cursor:pointer;color:var(--mute);font-size:13px;margin-bottom:6px}.btsvg{width:100%;height:auto;display:block}.btsvg .eq{fill:none;stroke:var(--buy);stroke-width:2}.btsvg .ar{fill:var(--buy);opacity:.12}.btsvg .dd{fill:var(--sell);opacity:.35}.btsvg .base{stroke:var(--mute);stroke-dasharray:4 4;fill:none}.btsvg text{fill:var(--mute);font-size:11px}
 .hkpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px}
 .hkpi div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;display:flex;flex-direction:column;gap:2px}
 .hkpi .l{font-size:13px;color:var(--mute)}.hkpi .v{font-size:24px;font-weight:700}.hkpi .s{font-size:12px;color:var(--mute)}
@@ -5256,7 +5735,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="history">History</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -5315,6 +5794,53 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </div>
 <div class="card"><h3>Every signal</h3><div class="wrap"><table id="hList"></table></div></div>
 <div class="note" id="hFoot">How to read this: each signal is followed from its candle's close. It counts as a win for a target if price reached that target before the stop-loss. If the stop and a target are touched in the same candle, the stop is counted first. Signals that have reached neither yet are open and left out of that target's rate. "R per trade" is the average result if you always exited at that target: a win is worth that many R, a loss is minus 1R. Slippage, brokerage and gaps are not included, signals that overlap are each counted on their own, and the history only goes as far back as Yahoo's candles (about 30 days on 5 min, 60 days on 15 min, 2 years on Daily). Past results do not promise future ones.</div>
+</section>
+<section id="view-backtest" hidden>
+<div class="card botbox">
+ <div class="ixrow"><b>Backtest</b><span class="sub">See how a strategy would have grown your funds on past candles. Results are estimates, not promises.</span></div>
+ <div class="botrow">
+  <label>Strategy<select id="btStrategy"><option value="signal">Signals (fresh and ongoing)</option><option value="gap">Gap continuation at the open</option></select></label>
+  <label>Trade<select id="btKind"><option value="stock">Stocks / index (cash)</option><option value="futures">Futures</option><option value="options">Options (buying)</option></select></label>
+  <label>Symbols (up to 10, comma separated)<input id="btSyms" value="NIFTY" placeholder="NIFTY, RELIANCE, TCS"></label>
+  <label>Timeframe<select id="btTf"><option value="5m">5 minute (last ~2 months)</option><option value="15m" selected>15 minute (last ~2 months)</option><option value="1d">Daily (years)</option></select></label>
+  <label>Days of history<input id="btDays" type="number" min="10" step="1" value="58"></label>
+ </div>
+ <div class="botrow">
+  <label>Starting funds ₹<input id="btCap" type="number" min="10000" step="10000" value="500000"></label>
+  <label>Risk per trade (% of funds)<input id="btRisk" type="number" min="0.1" max="10" step="0.1" value="1"></label>
+  <label>Exit at<select id="btTarget"><option value="1">1R target</option><option value="2" selected>2R target</option><option value="3">3R target</option><option value="4">4R target</option></select></label>
+  <label class="chk"><input type="checkbox" id="btIntra" checked> Close at 15:15 (intraday)</label>
+  <label class="chk"><input type="checkbox" id="btSell" checked> Include SELL signals</label>
+ </div>
+ <details class="btadv"><summary>More settings: costs, margin, options</summary>
+  <div class="botrow">
+   <label>Leverage (stocks)<input id="btLev" type="number" min="1" max="20" step="1" value="5"></label>
+   <label>Futures margin %<input id="btMargin" type="number" min="3" max="100" step="1" value="12"></label>
+   <label>Lot size (blank = automatic)<input id="btLot" type="number" min="0" step="1" placeholder="auto"></label>
+   <label>Option IV % (assumed)<input id="btIv" type="number" min="5" max="150" step="1" value="15"></label>
+   <label>Days to expiry (options)<input id="btDte" type="number" min="1" max="60" step="1" value="4"></label>
+   <label>Brokerage ₹ per order<input id="btBrk" type="number" min="0" step="1" value="20"></label>
+   <label>Taxes and charges % of turnover<input id="btOth" type="number" min="0" max="1" step="0.01" value="0.05"></label>
+   <label>Slippage % each side<input id="btSlip" type="number" min="0" max="2" step="0.01" value="0.03"></label>
+   <label>Entries from<input id="btFrom" value="09:20" size="5"></label>
+   <label>to<input id="btTo" value="14:30" size="5"></label>
+   <label>Gap: largest gap %<input id="btGap" type="number" min="0.2" max="5" step="0.1" value="1.5"></label>
+  </div>
+ </details>
+ <div class="botctl"><button class="btn go" id="btRun">▶ Run backtest</button><span class="sub" id="btNote"></span></div>
+ <div class="tkmsg" id="btMsg" role="status"></div>
+</div>
+<div id="btOut" hidden>
+ <div class="hkpi" id="btKpi"></div>
+ <div class="card"><h3 style="margin:0 0 6px">Your funds over time</h3><div id="btChart"></div></div>
+ <div class="note" id="btNotes" style="margin:10px 0"></div>
+ <div class="btgrid">
+  <div class="card"><h3>By month</h3><div class="wrap"><table id="btMonths"></table></div></div>
+  <div class="card"><h3>By symbol</h3><div class="wrap"><table id="btSymT"></table></div></div>
+ </div>
+ <h3 style="margin:14px 0 6px">Trades <span class="sub" id="btListNote"></span></h3>
+ <div class="wrap"><table id="btTrades"></table></div>
+</div>
 </section>
 <section id="view-orders" hidden>
 <div class="hkpi" id="pfKpi"></div>
@@ -5507,8 +6033,8 @@ const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
 function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",options:"options",index:"options",scanner:"scanner",history:"history",orders:"orders",account:"account",admin:"admin"};
- ["stocks","options","scanner","history","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ const vm={stocks:"stocks",futures:"stocks",options:"options",index:"options",scanner:"scanner",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","options","scanner","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
  $("ogrid").classList.toggle("ix",m==="index");$("ixbar").hidden=m!=="index";
  if(m==="index"){if(!["NIFTY","BANKNIFTY","SENSEX"].includes(osym)){osym="NIFTY";oexp=""}ixPaint();ixLoad();loadChain()}
@@ -5651,6 +6177,53 @@ function initInstall(){const b=$("installBtn"),standalone=matchMedia("(display-m
  addEventListener("appinstalled",()=>{b.hidden=true})}
 function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
  for(const p in BOTS){$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
+let btTimer=null;
+const inr=x=>(x<0?"-":"")+"₹"+Math.abs(Math.round(x)).toLocaleString("en-IN");
+function btChart(curve,cap){if(!curve.length)return "<div class='sub'>No trades to draw.</div>";
+ const W=800,H=230,D=60,pad=44,t0=curve[0][0],t1=curve[curve.length-1][0]||t0+1;const ys=curve.map(c=>c[1]).concat([cap]);let lo=Math.min(...ys),hi=Math.max(...ys);if(hi===lo){hi+=1;lo-=1}
+ const X=t=>pad+(t1===t0?0:(t-t0)/(t1-t0))*(W-pad-8),Y=v=>8+(hi-v)/(hi-lo)*(H-22);
+ const pts=curve.map(c=>X(c[0]).toFixed(1)+","+Y(c[1]).toFixed(1)).join(" ");
+ const mdd=Math.max(1,...curve.map(c=>c[2]));
+ const dd=curve.map(c=>X(c[0]).toFixed(1)+","+(D*(c[2]/mdd)).toFixed(1)).join(" ");
+ const d0=new Date(t0*1000).toLocaleDateString("en-IN",{day:"numeric",month:"short"}),d1=new Date(t1*1000).toLocaleDateString("en-IN",{day:"numeric",month:"short",year:"2-digit"});
+ return `<svg class="btsvg" viewBox="0 0 ${W} ${H+D+30}" role="img" aria-label="Funds over time and drawdown">
+  <polygon class="ar" points="${X(t0)},${Y(lo)} ${pts} ${X(t1)},${Y(lo)}"/><line class="base" x1="${pad}" x2="${W-8}" y1="${Y(cap)}" y2="${Y(cap)}"/><polyline class="eq" points="${pts}"/>
+  <text x="2" y="${Y(hi)+8}">${inr(hi)}</text><text x="2" y="${Y(lo)}">${inr(lo)}</text><text x="${pad+4}" y="${Y(cap)-4}">start ${inr(cap)}</text>
+  <text x="${pad}" y="${H+4}">${d0}</text><text x="${W-8}" y="${H+4}" text-anchor="end">${d1}</text>
+  <g transform="translate(0,${H+12})"><polygon class="dd" points="${pad},0 ${dd} ${W-8},0"/><text x="2" y="12">drawdown</text><text x="2" y="${D}">-${mdd.toFixed(1)}%</text></g></svg>`}
+function btPaint(r){$("btOut").hidden=false;
+ const k=(l,v,s,c)=>`<div><span class="l">${l}</span><span class="v ${c||""}">${v}</span><span class="s">${s||""}</span></div>`;
+ $("btKpi").innerHTML=k("Starting funds",inr(r.capital),"")+k("Ending funds",inr(r.final),r.days?`after ${r.days} days`:"",r.net>=0?"pnlup":"pnldn")+
+  k("Growth",(r.growth_pct>=0?"+":"")+r.growth_pct+"%",inr(r.net),r.net>=0?"pnlup":"pnldn")+(r.cagr_pct!=null?k("Per year (if it repeated)",(r.cagr_pct>=0?"+":"")+r.cagr_pct+"%","not a forecast"):"")+
+  k("Max drawdown",r.max_dd_pct+"%",inr(-r.max_dd)+" from a peak","pnldn")+k("Win rate",r.win_rate+"%",`${r.trades} trades`)+
+  k("Profit factor",r.profit_factor==null?"–":r.profit_factor,"gains ÷ losses")+k("Average win / loss",inr(r.avg_win),"/ "+inr(-r.avg_loss))+
+  k("Best / worst trade",inr(r.best),"/ "+inr(r.worst))+k("Longest losing streak",r.losing_streak,"trades in a row")+k("Costs and slippage",inr(r.costs),"already deducted");
+ $("btChart").innerHTML=btChart(r.curve,r.capital);
+ const notes=[...(r.notes||[]),...(r.skipped||[]).map(x=>`${x.n} trade(s) skipped: ${x.why}.`),...(r.problems||[]),
+  `${r.found} trades found in the period${r.trades<r.found?`, ${r.trades} taken with your funds`:""}.`,
+  r.trades<30?"Fewer than 30 trades is too few to judge a strategy. Treat this as a first look only.":"",
+  r.params&&r.params.kind==="options"?"Option prices are estimated from the index or stock move with an assumed volatility. Real prices, spreads and expiry-day moves will differ.":"",
+  r.params&&r.params.kind==="futures"?"Futures are priced as the underlying (no basis or roll cost).":"",
+  "Past results do not predict future ones. Orders fill at the signal candle's close, with the slippage you set."].filter(Boolean);
+ $("btNotes").innerHTML=notes.map(esc).join("<br>");
+ $("btMonths").innerHTML=r.months.length?`<thead><tr><th>Month</th><th>P&amp;L</th><th>% of start</th></tr></thead><tbody>`+r.months.map(m=>`<tr><td>${m.m}</td><td class="${pnlCls(m.pnl)}">${inr(m.pnl)}</td><td class="${pnlCls(m.pnl)}">${m.pct}%</td></tr>`).join("")+"</tbody>":"";
+ $("btSymT").innerHTML=r.by_symbol.length?`<thead><tr><th>Symbol</th><th>Trades</th><th>Win rate</th><th>P&amp;L</th></tr></thead><tbody>`+r.by_symbol.map(m=>`<tr><td><b>${esc(m.sym)}</b></td><td>${m.trades}</td><td>${m.win_rate}%</td><td class="${pnlCls(m.pnl)}">${inr(m.pnl)}</td></tr>`).join("")+"</tbody>":"";
+ $("btListNote").textContent=r.listed_of>r.list.length?`(latest ${r.list.length} of ${r.listed_of})`:"";
+ $("btTrades").innerHTML=r.list.length?`<thead><tr><th>In</th><th>Out</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Why</th><th>P&amp;L</th><th>Funds after</th></tr></thead><tbody>`+r.list.map(t=>`<tr><td>${t.in}</td><td>${t.out}</td><td>${esc(t.label)}</td><td>${t.side}</td><td>${t.qty}</td><td>${f2(t.entry)}</td><td>${f2(t.exit)}</td><td>${esc(t.why)}</td><td class="${pnlCls(t.pnl)}">${inr(t.pnl)}</td><td>${inr(t.equity)}</td></tr>`).join("")+"</tbody>":""}
+async function btRun(){clearTimeout(btTimer);
+ const b={strategy:$("btStrategy").value,kind:$("btKind").value,symbols:$("btSyms").value,interval:$("btTf").value,days:+$("btDays").value,capital:+$("btCap").value,risk_pct:+$("btRisk").value,target:+$("btTarget").value,
+  intraday:$("btIntra").checked,sell_ok:$("btSell").checked,leverage:+$("btLev").value,margin_pct:+$("btMargin").value,lot_size:+$("btLot").value||0,iv:+$("btIv").value,dte:+$("btDte").value,
+  brokerage:+$("btBrk").value,other_pct:+$("btOth").value,slippage:+$("btSlip").value,entry_from:$("btFrom").value,entry_to:$("btTo").value,gap_max:+$("btGap").value};
+ $("btRun").disabled=true;$("btMsg").textContent="";$("btNote").textContent="Starting…";
+ const d=await post("/api/backtest",b);if(d.error){$("btMsg").textContent=d.error;$("btRun").disabled=false;$("btNote").textContent="";return}
+ const poll=async()=>{try{const g=await (await api("/api/backtest/"+d.id)).json();
+  if(g.state==="running"){$("btNote").textContent=g.note||"Working…";btTimer=setTimeout(poll,1200);return}
+  $("btRun").disabled=false;$("btNote").textContent="";
+  if(g.state==="done")btPaint(g.result);else $("btMsg").textContent=g.error||"The backtest failed."}catch(e){$("btRun").disabled=false;$("btMsg").textContent="Lost contact with the server. Try again."}};
+ poll()}
+function initBacktest(){$("btRun").onclick=btRun;
+ $("btTf").onchange=()=>{const dly=$("btTf").value==="1d";$("btDays").value=dly?730:58;$("btIntra").checked=!dly;$("btIntra").disabled=dly;$("btLev").value=dly?1:5};
+ $("btStrategy").onchange=()=>{const g=$("btStrategy").value==="gap";if(g&&$("btTf").value==="1d"){$("btTf").value="5m";$("btTf").onchange()}$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true}}
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
  $("scOnly").onchange=()=>{scLoad()};
@@ -5795,7 +6368,7 @@ $("tkQty").addEventListener("input",fundsPaint);
 $("tkFunds").onclick=e=>{if(e.target.id==="tkMax"&&fundsInfo&&fundsInfo.max_qty!=null){$("tkQty").value=Math.max(1,fundsInfo.max_qty);resetReview();fundsPaint()}};
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-initChart();initFlash();initModes();initIndex();initScanner();initBot();initInstall();
+initChart();initFlash();initModes();initIndex();initScanner();initBot();initBacktest();initInstall();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
