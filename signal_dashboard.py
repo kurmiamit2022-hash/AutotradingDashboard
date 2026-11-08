@@ -3417,6 +3417,11 @@ def cap_classes():
     return out
 
 
+# Intraday focus: rank by traded value (what NSE's most-active page sorts by) and skip cheap shares. Raw volume is dominated by low-priced
+# stocks such as IDEA, YESBANK and SUZLON, which are hard to trade as futures or options. Both can be changed with environment variables.
+SCANNER_RANK = os.getenv("SCANNER_RANK", "value").strip().lower()
+SCANNER_RANK = SCANNER_RANK if SCANNER_RANK in ("value", "volume") else "value"
+SCANNER_MIN_PRICE = float(os.getenv("SCANNER_MIN_PRICE", "150") or 0)
 SCANNER_TOP = 10   # the scanner follows the day's ten most active F&O stocks by volume
 
 
@@ -3443,18 +3448,24 @@ def nse_most_active(by):
 
 @app.get("/api/scanner")
 def api_scanner(tf: str = "15m", only: int = 0):
-    """Today's ten most active stocks by traded volume, with their signal on 5 min or 15 min."""
+    """Today's ten most active large and mid cap stocks by traded value, priced above the minimum, with their signal on 5 min or 15 min."""
     if tf not in ("5m", "15m"):
         return JSONResponse({"error": "Choose 5 min or 15 min."}, status_code=400)
-    by, n = "volume", SCANNER_TOP
+    by, n = SCANNER_RANK, SCANNER_TOP
     ensure_fresh(tf)
     with LOCK:
         rows = [r for r in apply_live(list(STATES[tf]["rows"])) if r.get("type") != "index"]
         upd, busy = STATES[tf]["updated"], STATES[tf]["refreshing"] or not STATES[tf]["updated"]
     by_sym = {r["symbol"]: r for r in rows}
     caps = cap_classes()
+    cheap = []
+
     def allowed(sym):
         if sym in SCANNER_EXCLUDE:
+            return False
+        r_ = by_sym.get(sym)
+        if r_ is not None and SCANNER_MIN_PRICE and r_.get("ltp", r_["close"]) < SCANNER_MIN_PRICE:
+            cheap.append(sym)
             return False
         if sym in SCANNER_INCLUDE:
             return True
@@ -3466,7 +3477,8 @@ def api_scanner(tf: str = "15m", only: int = 0):
         skipped = len([x for x in names if x not in by_sym])
     else:
         source = "computed"
-        ranked = [r["symbol"] for r in sorted((r for r in rows if r.get("vol") and allowed(r["symbol"])), key=lambda r: -r["vol"])]
+        key = "val_cr" if by == "value" else "vol"
+        ranked = [r["symbol"] for r in sorted((r for r in rows if r.get(key) and allowed(r["symbol"])), key=lambda r: -r[key])]
     out = []
     for sym in ranked:
         r = by_sym[sym]
@@ -3479,10 +3491,10 @@ def api_scanner(tf: str = "15m", only: int = 0):
                     "levels": {k: r[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")} if r.get("entry") is not None else None})
         if len(out) >= n:
             break
-    return {"tf": tf, "by": by, "source": source, "cap_source": "nse" if caps is not None else "approx", "rows": out, "skipped": skipped, "scanning": busy, "updated": upd,
-            "note": ("Today's ten most active large-cap and mid-cap F&O stocks by volume, from NSE's most active list. Large cap = NIFTY 100, mid cap = NIFTY MIDCAP 150. Only F&O stocks are shown, because those are the ones that can be traded as futures or options."
+    return {"tf": tf, "by": by, "source": source, "cap_source": "nse" if caps is not None else "approx", "rows": out, "skipped": skipped, "cheap": len(set(cheap)), "min_price": SCANNER_MIN_PRICE, "rank": by, "scanning": busy, "updated": upd,
+            "note": (f"Today's ten most active large-cap and mid-cap F&O stocks by traded {by}, from NSE's most active list. Large cap = NIFTY 100, mid cap = NIFTY MIDCAP 150. Stocks priced under ₹{SCANNER_MIN_PRICE:g} are left out. Only F&O stocks are shown, because those are the ones that can be traded as futures or options."
                      if source == "nse" else
-                     "NSE's list did not load, so today's ten highest-volume large-cap and mid-cap F&O stocks are taken from the candle data instead. Open this page again later to use NSE's own list.") +
+                     f"NSE's list did not load, so today's ten highest-{by} large-cap and mid-cap F&O stocks above ₹{SCANNER_MIN_PRICE:g} are taken from the candle data instead. Open this page again later to use NSE's own list.") +
                     ("" if caps is not None else " NSE's NIFTY 100 / MIDCAP 150 lists did not load either, so the smaller F&O stocks are dropped using a built-in list that may be a little out of date.")}
 
 
@@ -4335,7 +4347,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </section>
 <section id="view-scanner" hidden>
 <div class="ixrow"><div class="seg" id="scTfs" role="group" aria-label="Timeframe"></div>
- <b class="scttl">Top 10 by volume today · large and mid caps</b>
+ <b class="scttl" id="scTtl">Top 10 by traded value today</b>
  <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label><span class="sub" id="scMeta"></span></div>
 <div class="wrap"><table id="scTable"></table></div>
 <div class="note" id="scNote"></div>
@@ -4633,9 +4645,10 @@ async function scLoad(){clearTimeout(scTimer);if(mode!=="scanner")return;const m
  catch(e){$("scMeta").textContent="Cannot reach the server."}
  scTimer=setTimeout(scLoad,scData&&scData.scanning?3000:20000)}
 function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=`<tbody><tr><td class="empty">${d?esc(d.error):""}</td></tr></tbody>`;return}
- $("scMeta").textContent=(d.source==="nse"?"NSE most active by volume":"Highest volume from candle data")+(d.updated?` · candles updated ${d.updated}`:"")+(d.scanning?" · scanning…":"");
- $("scNote").textContent=d.note+(d.skipped?` ${d.skipped} active stocks outside F&O were left out.`:"");
- const cols=["#","Symbol","Signal","Status","Signal candle","","Price","Day %","Volume","Entry","SL","T1","T2","T3","T4"];
+ $("scMeta").textContent=(d.source==="nse"?"NSE most active":"Computed from candle data")+(d.updated?` · candles updated ${d.updated}`:"")+(d.scanning?" · scanning…":"");
+ $("scNote").textContent=d.note+(d.skipped?` ${d.skipped} active stocks outside your symbol list were left out.`:"")+(d.cheap?` ${d.cheap} cheap stocks were left out.`:"");
+ const cols=["#","Symbol","Signal","Status","Signal candle","","Price","Day %","Volume","Value ₹ Cr","Entry","SL","T1","T2","T3","T4"];
+ $("scTtl").textContent=`Top 10 by traded ${d.rank||"value"} today · large and mid caps · price ₹${d.min_price||0}+`;
  const head="<thead><tr>"+cols.map(c=>`<th>${c}</th>`).join("")+"</tr></thead>";
  if(!d.rows.length){tb.innerHTML=head+`<tbody><tr><td colspan="${cols.length}" class="empty">${d.scanning?"First scan is running. This page updates on its own.":"Nothing matches."}</td></tr></tbody>`;return}
  tb.innerHTML=head+"<tbody>"+d.rows.map(r=>{const L=r.levels,fr=r.signal==="BUY"||r.signal==="SELL",lv=(k,i)=>L?`<td class="${r.status&&r.status.startsWith("T")&&+r.status[1]>i?"up":""}">${f2(L[k])}</td>`:"<td>–</td>";
@@ -4644,7 +4657,7 @@ function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=
   return `<tr${fr?` class="fresh ${r.signal==="BUY"?"buy":"sell"}"`:""}><td>${r.rank}</td><td><b>${esc(r.symbol)}</b>${r.cap?`<span class="tag">${r.cap}</span>`:""}${fr?'<span class="newb">NEW</span>':""}</td>
    <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
-   <td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
+   <td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
  $("scOnly").onchange=()=>{scLoad()};
