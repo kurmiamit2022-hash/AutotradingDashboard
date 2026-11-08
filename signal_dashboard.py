@@ -1811,7 +1811,7 @@ def feed_once():
 
 def market_window():
     n = ist_now()
-    return n.weekday() < 5 and dtime(9, 0) <= n.time() <= dtime(15, 45)
+    return (n.weekday() < 5 and dtime(9, 0) <= n.time() <= dtime(15, 45)) or special_session_now()
 
 
 def feed_loop():
@@ -2091,7 +2091,7 @@ OPTBOT_MAX_LOSS_PCT = float(os.getenv("OPTBOT_MAX_LOSS_PCT", "50"))   # the opti
 OPTBOT = {}   # (user id, "scanner" or "nifty") -> settings. Two separate autopilots with their own mode, limits and Play/Pause/Stop. Kept in memory: after a restart the autopilot is Off until you switch it on again
 OPTBOT_LOG = []
 OPTBOT_SKIP = {}   # (user id, symbol) -> time until which a stock that could not be traded is left alone
-OPTBOT_DEFAULTS = {"mode": "off", "strategy": "scanner", "paused": False, "last_mode": "paper", "max_trades": 3, "lots": 1, "loss_limit": 3000.0, "armed_day": None, "entries": "both"}
+OPTBOT_DEFAULTS = {"mode": "off", "strategy": "scanner", "paused": False, "last_mode": "paper", "max_trades": 3, "lots": 1, "loss_limit": 3000.0, "armed_day": None, "entries": "both", "min_grade": "any"}
 
 
 BOT_KINDS = ("scanner", "nifty")
@@ -2200,7 +2200,7 @@ def bot_candidates(u):
             continue
         if (side == "BUY" and not (lv["sl"] < px < lv["tp1"])) or (side == "SELL" and not (lv["tp1"] < px < lv["sl"])):
             continue  # already past a level, so the signal levels no longer fit
-        out.append({"symbol": r["symbol"], "side": side, "px": px, "dist": dist, "levels": lv, "chg": chg})
+        out.append({"symbol": r["symbol"], "side": side, "px": px, "dist": dist, "levels": lv, "chg": chg, "grade": (r.get("conf") or {}).get("g"), "score": (r.get("conf") or {}).get("s")})
     out.sort(key=lambda c: c["dist"])
     return out
 
@@ -2269,7 +2269,9 @@ def bot_enter(u, cfg):
             traded = any(o.get("user") == u["id"] and o.get("bot") and o["symbol"] == c["symbol"] and o.get("date") == td for o in ORDERS)
         if traded:
             continue
-        c["note"] = f"{c['dist']:.2f} ATR from its 20 EMA"
+        if not grade_ok(cfg, c.get("grade")):
+            continue
+        c["note"] = f"{c['dist']:.2f} ATR from its 20 EMA" + (f", grade {c['grade']} ({c['score']})" if c.get("grade") else "")
         r = bot_buy(u, cfg, c, mode, etype="signal")
         if r == "skip":
             continue
@@ -2433,7 +2435,11 @@ def nifty_fresh(u, cfg):
     if it and it.get("ema") and ((side == "BUY" and px < it["ema"]) or (side == "SELL" and px > it["ema"])):
         bot_log(u["id"], f"NIFTY fresh {side}: price is on the wrong side of the 20 EMA, skipped.", bot="nifty")
         return False
-    c = {"symbol": "NIFTY", "side": side, "px": px, "levels": lv, "note": f"fresh 5 min {side} signal at {row.get('signal_time')}"}
+    cf = (add_conf([row], "5m")[0].get("conf") or {})
+    if not grade_ok(cfg, cf.get("g")):
+        bot_log(u["id"], f"NIFTY fresh {side}: grade {cf.get('g') or 'none'} is below your minimum ({cfg.get('min_grade')}), skipped.", bot="nifty")
+        return False
+    c = {"symbol": "NIFTY", "side": side, "px": px, "levels": lv, "note": f"fresh 5 min {side} signal at {row.get('signal_time')}" + (f", grade {cf['g']} ({cf['s']})" if cf.get("g") else "")}
     r = bot_buy(u, cfg, c, "live" if cfg["mode"] == "live" else "paper", strategy="nifty", skip_expiry_day=True, etype="fresh")
     if r == "skip":
         st.pop("fresh_seen", None)   # chain or price missing: look again next tick while the signal is fresh
@@ -2634,6 +2640,213 @@ def optbot_once():
                 bot_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}", bot=kind)
 
 
+# ── Confidence grade: how many independent checks agree with a signal. A, B or C. Never a promise: compare it with the History and Backtest win rates ──
+CONF_A = float(os.getenv("CONF_A", "75"))
+CONF_B = float(os.getenv("CONF_B", "55"))
+CONF_MAX = {"htf": 20, "mkt": 15, "fresh": 15, "stretch": 15, "liq": 10, "stop": 10, "time": 10, "record": 5}
+GRADE_RANK = {"A": 2, "B": 1, "C": 0, None: 0}
+GRADE_NEED = {"any": 0, "B": 1, "A": 2}
+
+
+def cf_htf(side, others):
+    """others: {timeframe name: 'agree' | 'against' | None}"""
+    pts = sum(10 if v == "agree" else 0 if v == "against" else 4 for v in others.values())
+    agree = [k for k, v in others.items() if v == "agree"]
+    against = [k for k, v in others.items() if v == "against"]
+    if against:
+        return pts, "Against it on " + " and ".join(against), False
+    if agree:
+        return pts, "Agrees on " + " and ".join(agree), len(agree) == len(others)
+    return pts, "No signal on the other timeframes", False
+
+
+def cf_mkt(side, idx_chg, sec_chg):
+    def lean(c):
+        if c is None:
+            return None
+        return "agree" if (c > 0.1 if side == "BUY" else c < -0.1) else "against" if (c < -0.1 if side == "BUY" else c > 0.1) else "flat"
+    a, b = lean(idx_chg), lean(sec_chg)
+    pts = {"agree": 1.0, "flat": 0.4, "against": 0.0, None: 0.4}
+    total = round(7 * pts[a] + 8 * pts[b])
+    word = "up" if side == "BUY" else "down"
+    if a == "agree" and b == "agree":
+        return total, f"NIFTY and its sector are both {word}", True
+    if a == "against" or b == "against":
+        who = "NIFTY" if a == "against" else "Its sector"
+        return total, f"{who} is moving the other way", False
+    return total, "NIFTY and the sector are flat or mixed", False
+
+
+def cf_fresh(bars_ago):
+    if bars_ago is None:
+        return None
+    if bars_ago <= 1:
+        return 15, "Brand new signal" if bars_ago == 0 else "Signal is 1 candle old", True
+    if bars_ago <= FRESH_BARS:
+        return 10, f"Signal is {bars_ago} candles old", True
+    if bars_ago <= 10:
+        return 5, f"Signal is {bars_ago} candles old, the move has started", False
+    return 0, f"Signal is {bars_ago} candles old", False
+
+
+def cf_stretch(dist_atr, chg, side):
+    pts, bits, ok = 0, [], True
+    if dist_atr is None:
+        pts += 5
+    elif dist_atr <= 0.6:
+        pts += 10
+        bits.append("close to its 20 EMA")
+    elif dist_atr <= 1.2:
+        pts += 6
+        bits.append("a little away from its 20 EMA")
+        ok = False
+    else:
+        pts += 2
+        bits.append("stretched from its 20 EMA")
+        ok = False
+    if chg is not None:
+        m = chg if side == "BUY" else -chg
+        if 0 <= m <= 2:
+            pts += 5
+        elif m <= 3.5 and m > 2:
+            pts += 3
+            ok = False
+            bits.append("already moved a lot today")
+        elif m > 3.5:
+            pts += 1
+            ok = False
+            bits.append("already moved a lot today")
+        else:
+            pts += 1
+            ok = False
+            bits.append("day is moving against it")
+    return pts, ("Not stretched, " + ", ".join(bits) if ok and bits else "Not stretched" if ok else (", ".join(bits)[:1].upper() + ", ".join(bits)[1:])), ok
+
+
+def cf_liq(val_cr, is_index):
+    if is_index:
+        return 8, "Index, always liquid", True
+    if val_cr is None:
+        return None
+    if val_cr >= 100:
+        return 10, f"High traded value (₹{val_cr:.0f} Cr so far)", True
+    if val_cr >= 25:
+        return 7, f"Good traded value (₹{val_cr:.0f} Cr so far)", True
+    if val_cr >= 5:
+        return 4, f"Modest traded value (₹{val_cr:.0f} Cr so far)", False
+    return 1, f"Thin traded value (₹{val_cr:.1f} Cr so far)", False
+
+
+def cf_stop(risk_pct):
+    if risk_pct is None:
+        return None
+    if risk_pct <= 0.6:
+        return 10, f"Small stop ({risk_pct:.2f}% of price)", True
+    if risk_pct <= 1.2:
+        return 7, f"Reasonable stop ({risk_pct:.2f}% of price)", True
+    if risk_pct <= 2.5:
+        return 4, f"Wide stop ({risk_pct:.2f}% of price)", False
+    return 1, f"Very wide stop ({risk_pct:.2f}% of price)", False
+
+
+def cf_time(hour, minute):
+    if hour is None:
+        return None
+    t = hour * 60 + minute
+    if t < 570:
+        return 4, "Opening minutes are choppy", False
+    if t < 690:
+        return 10, "Good time of day (9:30 to 11:30)", True
+    if t < 840:
+        return 6, "Midday is usually slow", False
+    if t < 900:
+        return 7, "Afternoon session", True
+    return 3, "Close to the end of the day", False
+
+
+def cf_record(wins, total):
+    if total < 5:
+        return 2, "Too little history on this stock yet", False
+    wr = wins / total
+    if wr >= 0.55:
+        return 5, f"Its past signals worked {wr * 100:.0f}% of the time ({total} signals)", True
+    if wr >= 0.40:
+        return 3, f"Its past signals worked {wr * 100:.0f}% of the time ({total} signals)", False
+    return 1, f"Its past signals worked only {wr * 100:.0f}% of the time ({total} signals)", False
+
+
+def conf_assemble(parts):
+    """parts: {factor: (points, text, ok) or None}. Score is scaled to the factors that could be checked."""
+    got = {k: v for k, v in parts.items() if v}
+    avail = sum(CONF_MAX[k] for k in got)
+    if not avail:
+        return None
+    score = round(sum(v[0] for v in got.values()) / avail * 100)
+    return {"s": score, "g": "A" if score >= CONF_A else "B" if score >= CONF_B else "C", "w": [[bool(v[2]), v[1]] for v in got.values()], "n": len(got)}
+
+
+def conf_context(tf):
+    with LOCK:
+        snaps = {t: list(STATES[t]["rows"]) for t in INTERVALS}
+        hist = list(HIST.get(tf, []))
+    cur = snaps[tf]
+    nifty = next((r for r in cur if r["symbol"] == "NIFTY"), None)
+    sec = {}
+    for r in cur:
+        if r.get("type") != "index" and r.get("chg") is not None:
+            sec.setdefault(r.get("sector"), []).append(r["chg"])
+    rec = {}
+    for h in hist:
+        if h.get("hits") or h.get("sl_hit"):
+            b = rec.setdefault(h["symbol"], [0, 0])
+            b[1] += 1
+            b[0] += 1 if h.get("hits") else 0
+    return {"others": {t: {r["symbol"]: r for r in snaps[t]} for t in INTERVALS if t != tf}, "nifty": (nifty or {}).get("chg"),
+            "sec": {k: sum(v) / len(v) for k, v in sec.items() if v}, "rec": rec}
+
+
+def conf_row(r, tf, ctx):
+    side = r.get("side")
+    if side not in ("BUY", "SELL") or not r.get("entry") or not r.get("sl"):
+        return None
+    others = {}
+    for t, rows in ctx["others"].items():
+        sg = (rows.get(r["symbol"]) or {}).get("signal") or "–"
+        others[t] = "agree" if sg.endswith(side) else "against" if sg.endswith("BUY") or sg.endswith("SELL") else None
+    it = INTERNAL.get((r["symbol"], tf)) or {}
+    dist = abs(r["close"] - it["ema"]) / it["atr"] if it.get("ema") and it.get("atr") else None
+    chg = r.get("ltp_chg", r.get("chg"))
+    hh = mm = None
+    try:
+        if tf != "1d":
+            hh, mm = map(int, r["signal_time"][-5:].split(":"))
+    except Exception:
+        hh = mm = None
+    w, t = ctx["rec"].get(r["symbol"], [0, 0])
+    idx = r.get("type") == "index"
+    parts = {"htf": cf_htf(side, others), "mkt": cf_mkt(side, ctx["nifty"], None if idx else ctx["sec"].get(r.get("sector"))),
+             "fresh": cf_fresh(r.get("bars_ago")), "stretch": cf_stretch(dist, chg, side), "liq": cf_liq(r.get("val_cr"), idx),
+             "stop": cf_stop(abs(r["entry"] - r["sl"]) / r["entry"] * 100), "time": cf_time(hh, mm), "record": cf_record(w, t)}
+    return conf_assemble(parts)
+
+
+def add_conf(rows, tf):
+    """Copies of the rows with a 'conf' grade on every row that has a signal."""
+    ctx = conf_context(tf)
+    out = []
+    for r in rows:
+        try:
+            c = conf_row(r, tf, ctx)
+        except Exception:
+            c = None
+        out.append({**r, "conf": c} if c else r)
+    return out
+
+
+def grade_ok(cfg, grade):
+    return GRADE_RANK.get(grade, 0) >= GRADE_NEED.get(cfg.get("min_grade", "any"), 0)
+
+
 # ── Backtest: replay the signals (or the gap-continuation rule) over past candles, then size the trades with the user's funds ──
 BT_MAX_SYMBOLS = 10
 BT_MAX_DAYS = {"5m": 58, "15m": 58, "1d": 3650}
@@ -2732,7 +2945,8 @@ def bt_arrays(df):
     dn[1:] = (d[1:] == -1) & (d[:-1] == 1)
     buy = up & (c > ema) & within_lookback(green)
     sell = dn & (c < ema) & within_lookback(red)
-    return {"c": c, "o": df["Open"].to_numpy(float), "h": hi, "l": lo, "atr": atr, "ls": ls, "ss": ss, "buy": buy, "sell": sell}
+    vol = df["Volume"].to_numpy(float) if "Volume" in df else np.zeros(n)
+    return {"c": c, "ema": ema, "v": np.nan_to_num(vol), "o": df["Open"].to_numpy(float), "h": hi, "l": lo, "atr": atr, "ls": ls, "ss": ss, "buy": buy, "sell": sell}
 
 
 def bt_levels(a, j):
@@ -2776,11 +2990,27 @@ def bt_signal_trades(sym, df, interval, p):
     intraday = bool(p.get("intraday")) and interval != "1d"
     t_from, t_to, sq = p["entry_from"], p["entry_to"], p["squareoff"]
     out, free = [], -1
+    dates = np.array([t.date() for t in idx])
+    last_close = {}
+    for k_ in range(len(idx)):
+        last_close[dates[k_]] = a["c"][k_]
+    ordered = sorted(last_close)
+    prev_of = {d_: last_close[ordered[i_ - 1]] for i_, d_ in enumerate(ordered) if i_ > 0}
+    day_val = pd.Series(a["c"] * a["v"], index=idx).groupby(dates).cumsum().to_numpy() / 1e7
+    is_idx = sym in INDEX_YF
+    need = GRADE_NEED.get(p.get("min_grade", "any"), 0)
     for j in np.nonzero(a["buy"] | a["sell"])[0]:
         j = int(j)
         if j <= free or j >= len(idx) - 1:
             continue
         side, entry, risk = bt_levels(a, j)
+        sname = "BUY" if side == 1 else "SELL"
+        pc = prev_of.get(dates[j])
+        cf = conf_assemble({"fresh": cf_fresh(0), "stretch": cf_stretch(abs(a["c"][j] - a["ema"][j]) / a["atr"][j] if a["atr"][j] else None, (a["c"][j] / pc - 1) * 100 if pc else None, sname),
+                            "liq": cf_liq(float(day_val[j]) if day_val[j] > 0 else None, is_idx), "stop": cf_stop(risk / entry * 100),
+                            "time": cf_time(idx[j].hour, idx[j].minute) if interval != "1d" else None})
+        if need and GRADE_RANK.get((cf or {}).get("g"), 0) < need:
+            continue
         if side == -1 and not p.get("sell_ok", True):
             continue
         if intraday and not (t_from <= idx[j].time() <= t_to):
@@ -2788,7 +3018,7 @@ def bt_signal_trades(sym, df, interval, p):
         sl, tp = entry - side * risk, entry + side * risk * p["target"]
         k, px, why = bt_walk(a, idx, j, j + 1, side, entry, sl, tp, intraday, sq)
         free = k
-        out.append({"sym": sym, "side": side, "t_in": idx[j], "t_out": idx[k], "entry": entry, "exit": px, "risk": risk, "sl": sl, "tp": tp, "why": why, "kind": "signal"})
+        out.append({"sym": sym, "side": side, "t_in": idx[j], "t_out": idx[k], "entry": entry, "exit": px, "risk": risk, "sl": sl, "tp": tp, "why": why, "kind": "signal", "grade": (cf or {}).get("g"), "score": (cf or {}).get("s")})
     return out, None
 
 
@@ -2961,7 +3191,7 @@ def bt_stats(done, p):
     cap = p["capital"]
     eq, peak, mdd, mdd_pct, curve, streak, worst_streak = cap, cap, 0.0, 0.0, [], 0, 0
     wins, losses = [], []
-    months, by_sym = {}, {}
+    months, by_sym, by_grade = {}, {}, {}
     for o in done:
         eq += o["pnl"]
         peak = max(peak, eq)
@@ -2975,6 +3205,10 @@ def bt_stats(done, p):
         worst_streak = max(worst_streak, streak)
         m = o["t_out"].strftime("%Y-%m")
         months[m] = months.get(m, 0) + o["pnl"]
+        gb = by_grade.setdefault(o.get("grade") or "–", {"trades": 0, "wins": 0, "pnl": 0.0})
+        gb["trades"] += 1
+        gb["wins"] += 1 if o["pnl"] > 0 else 0
+        gb["pnl"] += o["pnl"]
         b = by_sym.setdefault(o["sym"], {"trades": 0, "wins": 0, "pnl": 0.0})
         b["trades"] += 1
         b["wins"] += 1 if o["pnl"] > 0 else 0
@@ -2994,6 +3228,7 @@ def bt_stats(done, p):
             "best": round(max((o["pnl"] for o in done), default=0), 2), "worst": round(min((o["pnl"] for o in done), default=0), 2),
             "losing_streak": worst_streak, "costs": round(sum(o["cost"] for o in done), 2), "curve": curve,
             "months": [{"m": k, "pnl": round(v, 2), "pct": round(v / cap * 100, 2)} for k, v in sorted(months.items())],
+            "by_grade": [{"grade": k, "trades": v["trades"], "win_rate": round(v["wins"] / v["trades"] * 100, 1), "pnl": round(v["pnl"], 2)} for k, v in sorted(by_grade.items())],
             "by_symbol": [{"sym": k, "trades": v["trades"], "win_rate": round(v["wins"] / v["trades"] * 100, 1), "pnl": round(v["pnl"], 2)} for k, v in sorted(by_sym.items(), key=lambda kv: -kv[1]["pnl"])]}
 
 
@@ -3012,11 +3247,13 @@ def bt_run(params, candles):
     done, skipped, notes = bt_money(trades, p["kind"], p)
     res = bt_stats(done, p)
     res["found"] = len(trades)
+    if p.get("min_grade") != "any":
+        notes.append("Grades in the backtest use only what a past candle can show (freshness, stretch from the 20 EMA, stop size, traded value, time of day). The live badge also checks NIFTY, the sector and higher timeframes, which a backtest cannot replay." if p["strategy"] == "signal" else "Grades do not apply to gap continuation trades, so the minimum grade was ignored.")
     res["skipped"] = [{"why": k, "n": v} for k, v in skipped.items()]
     res["problems"] = problems
     res["notes"] = notes
     res["list"] = [{"in": o["t_in"].strftime("%d %b %Y %H:%M"), "out": o["t_out"].strftime("%d %b %Y %H:%M"), "label": o["label"], "side": "BUY" if o["side"] == 1 else "SELL",
-                    "qty": o["qty"], "entry": round(o["p_in"], 2), "exit": round(o["p_out"], 2), "why": o["why"], "kind": o["kind"], "pnl": round(o["pnl"], 2), "equity": round(o["equity"], 2)}
+                    "qty": o["qty"], "entry": round(o["p_in"], 2), "exit": round(o["p_out"], 2), "why": o["why"], "kind": o["kind"], "grade": o.get("grade"), "pnl": round(o["pnl"], 2), "equity": round(o["equity"], 2)}
                    for o in done[-300:]][::-1]
     res["listed_of"] = len(done)
     return res
@@ -3067,6 +3304,7 @@ def bt_params(payload):
              "leverage": num("leverage", 1, 20, 5 if interval != "1d" else 1), "margin_pct": num("margin_pct", 3, 100, 12),
              "lot_size": int(num("lot_size", 0, 100000, 0)) or None, "iv": num("iv", 5, 150, 15), "dte": num("dte", 1, 60, 4 if "NIFTY" in "".join(syms) else 15),
              "brokerage": num("brokerage", 0, 500, 20), "other_pct": num("other_pct", 0, 1, 0.05), "slippage": num("slippage", 0, 2, 0.03),
+             "min_grade": str(payload.get("min_grade", "any")) if str(payload.get("min_grade", "any")) in GRADE_NEED else "any",
              "gap_max": num("gap_max", 0.2, 5, 1.5 if all(s in INDEX_YF for s in syms) else 2.0), "min_tgt": NIFTY_MIN_TARGET_PCT, "min_sl": NIFTY_MIN_SL_PCT}
         if strategy == "gap" and interval == "1d":
             raise ValueError("Gap continuation needs a 5 or 15 minute timeframe")
@@ -3717,15 +3955,16 @@ def api_signals(tf: str = DEFAULT_INTERVAL):
     with LOCK:
         snap = dict(STATES[tf])
         snap["rows"] = apply_live(snap["rows"])
-        return JSONResponse({
-            **snap,
-            "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"]},
-            "interval": tf,
-            "intervals": INTERVALS,
-            "fresh_bars": FRESH_BARS,
-            "symbols": SYMBOLS,
-            "indices": INDICES,
-        })
+    snap["rows"] = add_conf(snap["rows"], tf)
+    return JSONResponse({
+        **snap,
+        "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"]},
+        "interval": tf,
+        "intervals": INTERVALS,
+        "fresh_bars": FRESH_BARS,
+        "symbols": SYMBOLS,
+        "indices": INDICES,
+    })
 
 
 @app.post("/api/refresh")
@@ -4642,6 +4881,8 @@ def api_scanner(tf: str = "15m", only: int = 0):
     ensure_fresh(tf)
     with LOCK:
         rows = [r for r in apply_live(list(STATES[tf]["rows"])) if r.get("type") != "index"]
+    rows = add_conf(rows, tf)
+    with LOCK:
         upd, busy = STATES[tf]["updated"], STATES[tf]["refreshing"] or not STATES[tf]["updated"]
     by_sym = {r["symbol"]: r for r in rows}
     caps = cap_classes()
@@ -4674,7 +4915,7 @@ def api_scanner(tf: str = "15m", only: int = 0):
             continue
         out.append({"rank": len(out) + 1, "symbol": sym, "cap": (caps or {}).get(sym), "sector": r.get("sector"), "price": r.get("ltp", r["close"]),
                     "chg": r.get("ltp_chg", r.get("chg")), "vol": r.get("vol"), "val_cr": r.get("val_cr"), "signal": sg, "status": r["status"],
-                    "signal_time": r["signal_time"], "bars_ago": r["bars_ago"], "side": r.get("side"),
+                    "signal_time": r["signal_time"], "bars_ago": r["bars_ago"], "side": r.get("side"), "conf": r.get("conf"),
                     "levels": {k: r[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")} if r.get("entry") is not None else None})
         if len(out) >= n:
             break
@@ -4855,7 +5096,7 @@ def bot_view(u, kind="scanner"):
     pnl = round(sum(t["pnl"] or 0 for t in trades), 2)
     why = live_blocker(u) or ("Switch your account to Live with the toggle at the top first." if user_mode(u)[0] != "live" else None)
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
-    return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "nifty_note": (NIFTY_STATE.get(u["id"]) or {}).get("why") if (NIFTY_STATE.get(u["id"]) or {}).get("day") == today else None, "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
+    return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "nifty_note": (NIFTY_STATE.get(u["id"]) or {}).get("why") if (NIFTY_STATE.get(u["id"]) or {}).get("day") == today else None, "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
             "rules": ((NIFTY_RULES + " Also buys on a fresh 5 min NIFTY signal during the day, once per signal, using the signal's own stop and targets.") if kind == "nifty" else "Gap continuation (9:20 to 9:45): a stock whose 5 min signal from yesterday is still open and which gapped the same way is bought, target the next pivot. Otherwise, ") + ("" if kind == "nifty" else f"Buys at the money options on the scanner's top stocks from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}. Day change 0 to {OPTBOT_MAX_CHG:g}% buys a CE, 0 to -{OPTBOT_MAX_CHG:g}% buys a PE, "
                      f"with the 5 min signal in the same direction and price nearest its 20 EMA. The stock's stop-loss and targets are converted to option prices using the option's delta: sell at the option stop (never worse than -{OPTBOT_MAX_LOSS_PCT:g}%) or at T2, stop moves to the price paid at T1, all closed by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."),
@@ -4887,7 +5128,10 @@ def bot_apply(u, payload, mode, kind="scanner"):
     ent = payload.get("entries", cfg.get("entries", "both"))
     if ent not in ("both", "fresh", "gap"):
         return "Choose both entry types, fresh signals only, or gap continuation only."
-    cfg.update(max_trades=mt, lots=lots, loss_limit=ll, entries=ent)
+    mg = payload.get("min_grade", cfg.get("min_grade", "any"))
+    if mg not in GRADE_NEED:
+        return "Choose any grade, B or better, or A only."
+    cfg.update(max_trades=mt, lots=lots, loss_limit=ll, entries=ent, min_grade=mg)
     return None
 
 
@@ -5612,7 +5856,7 @@ table.gt{min-width:0;width:100%;font-size:13px}table.gt th,table.gt td{padding:7
 .hbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
 .hbar input,.hbar select{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font:inherit}
 .hbar input{flex:1;min-width:160px;max-width:260px}
-.btgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px;margin-bottom:6px}.btgrid>.card,#btOut{min-width:0}#btOut .wrap{max-width:100%}.btadv{margin:6px 0}.btadv summary{cursor:pointer;color:var(--mute);font-size:13px;margin-bottom:6px}.btsvg{width:100%;height:auto;display:block}.btsvg .eq{fill:none;stroke:var(--buy);stroke-width:2}.btsvg .ar{fill:var(--buy);opacity:.12}.btsvg .dd{fill:var(--sell);opacity:.35}.btsvg .base{stroke:var(--mute);stroke-dasharray:4 4;fill:none}.btsvg text{fill:var(--mute);font-size:11px}
+.cg{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:700;cursor:help;border:1px solid var(--line);vertical-align:middle}.cgA{background:rgba(34,197,94,.18);color:var(--buy);border-color:var(--buy)}.cgB{background:rgba(234,179,8,.15);color:#d4a017;border-color:#d4a017}.cgC{color:var(--mute)}.btgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px;margin-bottom:6px}.btgrid>.card,#btOut{min-width:0}#btOut .wrap{max-width:100%}.btadv{margin:6px 0}.btadv summary{cursor:pointer;color:var(--mute);font-size:13px;margin-bottom:6px}.btsvg{width:100%;height:auto;display:block}.btsvg .eq{fill:none;stroke:var(--buy);stroke-width:2}.btsvg .ar{fill:var(--buy);opacity:.12}.btsvg .dd{fill:var(--sell);opacity:.35}.btsvg .base{stroke:var(--mute);stroke-dasharray:4 4;fill:none}.btsvg text{fill:var(--mute);font-size:11px}
 .hkpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px}
 .hkpi div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;display:flex;flex-direction:column;gap:2px}
 .hkpi .l{font-size:13px;color:var(--mute)}.hkpi .v{font-size:24px;font-weight:700}.hkpi .s{font-size:12px;color:var(--mute)}
@@ -5807,7 +6051,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
 <div class="sectors" id="sectors"></div>
 <div class="tally" id="tally"></div>
-<div class="bar"><input id="q" placeholder="Search symbol" aria-label="Search symbol"></div>
+<div class="bar"><input id="q" placeholder="Search symbol" aria-label="Search symbol"><label class="chk" title="Show only signals where most checks agree. Hover a grade badge to see why."><input type="checkbox" id="confOnly"> Grade A only</label></div>
 <div class="wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
 <div class="note" id="note"></div>
 </section>
@@ -5836,7 +6080,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <section id="view-scanner" hidden>
 <div class="ixrow"><div class="seg" id="scTfs" role="group" aria-label="Timeframe"></div>
  <b class="scttl" id="scTtl">Top 15 by traded value today</b>
- <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label><span class="sub" id="scMeta"></span></div>
+ <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label> <label class="chk"><input type="checkbox" id="scConf"> Grade A only</label><span class="sub" id="scMeta"></span></div>
 <div id="botHost"></div>
 <div class="wrap"><table id="scTable"></table></div>
 
@@ -5875,6 +6119,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <label>Starting funds ₹<input id="btCap" type="number" min="10000" step="10000" value="500000"></label>
   <label>Risk per trade (% of funds)<input id="btRisk" type="number" min="0.1" max="10" step="0.1" value="1"></label>
   <label>Exit at<select id="btTarget"><option value="1">1R target</option><option value="2" selected>2R target</option><option value="3">3R target</option><option value="4">4R target</option></select></label>
+  <label>Only trade grade<select id="btGrade"><option value="any">Any (A, B or C)</option><option value="B">B or better</option><option value="A">A only</option></select></label>
   <label class="chk"><input type="checkbox" id="btIntra" checked> Close at 15:15 (intraday)</label>
   <label class="chk"><input type="checkbox" id="btSell" checked> Include SELL signals</label>
  </div>
@@ -5902,6 +6147,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div class="note" id="btNotes" style="margin:10px 0"></div>
  <div class="btgrid">
   <div class="card"><h3>By month</h3><div class="wrap"><table id="btMonths"></table></div></div>
+  <div class="card"><h3>By grade</h3><div class="wrap"><table id="btGradeT"></table></div></div>
   <div class="card"><h3>By symbol</h3><div class="wrap"><table id="btSymT"></table></div></div>
  </div>
  <h3 style="margin:14px 0 6px">Trades <span class="sub" id="btListNote"></span></h3>
@@ -6046,7 +6292,7 @@ function cellFor(r,k){
   case "symbol":return `<td><b>${esc(r.symbol)}</b>${r.type==="index"?'<span class="tag">Index</span>':""}${r.signal==="BUY"||r.signal==="SELL"?'<span class="newb">NEW</span>':""}</td>`;
   case "sector":return `<td class="sub">${esc(r.sector||"")}</td>`;
   case "chg":{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?"<td>–</td>":`<td class="${c>=0?"up":"dn"}">${c>0?"+":""}${c.toFixed(2)}%</td>`}
-  case "signal":return `<td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td>`;
+  case "signal":return `<td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span>${confBadge(r)}</td>`;
   case "close":return `<td>${r.ltp!=null?`<b title="Live broker price. Candle close ${fmt(r.close)}">${fmt(r.ltp)}</b>`:fmt(r.close)}</td>`;
   case "entry":return `<td>${fmt(r[k])}</td>`;
   case "sl":return `<td class="${r.sl_hit?"dn":""}">${fmt(r.sl)}${r.sl_hit?" ✖":""}</td>`;
@@ -6085,7 +6331,7 @@ function render(){
  t.innerHTML=tabs.map(x=>`<button class="${x[3]}" data-f="${x[0]}" aria-pressed="${filter===x[0]}"><b>${x[2]}</b><span>${x[1]}</span></button>`).join("");
  t.onclick=e=>{const b=e.target.closest("button");if(b){filter=b.dataset.f;render()}};
  document.getElementById("meta").innerHTML=`<span class="ai">✦ AI-Powered Trade Scanner</span> · `+(data.updated?`Updated ${esc(data.updated)} · `:"")+`${tfName[data.interval]} candles`+(data.refreshing?(data.progress?` · scanning ${data.progress[0]} of ${data.progress[1]}…`:" · scanning…"):"");
- let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q))&&(sector==="ALL"||(r.sector||"Others")===sector));
+ let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q))&&(!$("confOnly").checked||(r.conf&&r.conf.g==="A"))&&(sector==="ALL"||(r.sector||"Others")===sector));
  v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
   if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
  const cs=curCols();
@@ -6111,6 +6357,7 @@ function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mod
  if(m==="scanner"){scPaint();scLoad();botLoad()}else{clearTimeout(scTimer);clearTimeout(botTimer)}
  if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
+function initConf(){$("confOnly").onchange=()=>render()}
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
 function renderChips(){
  if(!data)return;
@@ -6195,11 +6442,11 @@ function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=
  $("scTtl").textContent=`Top ${d.top||15} by traded ${d.rank||"value"} today · large and mid caps · price ₹${d.min_price||0}+`;
  const head="<thead><tr>"+cols.map(c=>`<th>${c}</th>`).join("")+"</tr></thead>";
  if(!d.rows.length){tb.innerHTML=head+`<tbody><tr><td colspan="${cols.length}" class="empty">${d.scanning?"First scan is running. This page updates on its own.":"Nothing matches."}</td></tr></tbody>`;return}
- tb.innerHTML=head+"<tbody>"+d.rows.map(r=>{const L=r.levels,fr=r.signal==="BUY"||r.signal==="SELL",lv=(k,i)=>L?`<td class="${r.status&&r.status.startsWith("T")&&+r.status[1]>i?"up":""}">${f2(L[k])}</td>`:"<td>–</td>";
+ tb.innerHTML=head+"<tbody>"+d.rows.filter(r=>!$("scConf").checked||(r.conf&&r.conf.g==="A")).map(r=>{const L=r.levels,fr=r.signal==="BUY"||r.signal==="SELL",lv=(k,i)=>L?`<td class="${r.status&&r.status.startsWith("T")&&+r.status[1]>i?"up":""}">${f2(L[k])}</td>`:"<td>–</td>";
   const c=r.chg==null?"<td>–</td>":`<td class="${r.chg>=0?"up":"dn"}">${r.chg>0?"+":""}${r.chg.toFixed(2)}%</td>`;
   const side=r.signal.endsWith("SELL")?"SELL":"BUY",has=r.signal!=="–"&&L;
   return `<tr${fr?` class="fresh ${r.signal==="BUY"?"buy":"sell"}"`:""}><td>${r.rank}</td><td><b>${esc(r.symbol)}</b>${r.cap?`<span class="tag">${r.cap}</span>`:""}${fr?'<span class="newb">NEW</span>':""}</td>
-   <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
+   <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span>${confBadge(r)}</td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
    <td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
 let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: scanner stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY gap continuation"}};
@@ -6209,6 +6456,7 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="sub" id="${p}Rules"></div>
  <div class="botrow">
   <label>Mode<select id="${p}Mode"><option value="paper">Paper</option><option value="live">Live</option></select></label>
+  <label>Only trade grade<select id="${p}Grade"><option value="any">Any (A, B or C)</option><option value="B">B or better</option><option value="A">A only</option></select></label>
   <label>Entries<select id="${p}Ent"><option value="both">Fresh + continuation</option><option value="fresh">Fresh signals only</option><option value="gap">Gap continuation only</option></select></label>
   <label>Trades a day<input id="${p}Max" type="number" min="1" max="10" step="1"></label>
   <label>Lots each<input id="${p}Lots" type="number" min="1" step="1"></label>
@@ -6227,7 +6475,7 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
 </div>`}
 async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
  for(const p in BOTS){try{const d=await (await api("/api/optbot?bot="+BOTS[p].kind)).json();window.botD[p]=d;
-  if(document.activeElement&&[p+"Mode",p+"Ent",p+"Max",p+"Lots",p+"Loss"].includes(document.activeElement.id)){}else{$(p+"Mode").value=d.mode==="off"?d.choice:d.mode;$(p+"Ent").value=d.entries;$(p+"Max").value=d.max_trades;$(p+"Lots").value=d.lots;$(p+"Loss").value=d.loss_limit}
+  if(document.activeElement&&[p+"Mode",p+"Ent",p+"Grade",p+"Max",p+"Lots",p+"Loss"].includes(document.activeElement.id)){}else{$(p+"Mode").value=d.mode==="off"?d.choice:d.mode;$(p+"Ent").value=d.entries;$(p+"Grade").value=d.min_grade;$(p+"Max").value=d.max_trades;$(p+"Lots").value=d.lots;$(p+"Loss").value=d.loss_limit}
   $(p+"Rules").textContent=d.rules+(d.strategy==="nifty"&&d.nifty_note?` Today: ${d.nifty_note}`:"");
   $(p+"State").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
   const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";
@@ -6235,7 +6483,7 @@ async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
   $(p+"Trades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"?"Gap":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
   $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
  botTimer=setTimeout(botLoad,8000)}
-async function botCtl(p,action,extra){const D=window.botD[p]||{};const body={action,bot:BOTS[p].kind,mode:$(p+"Mode").value,entries:$(p+"Ent").value,max_trades:+$(p+"Max").value,lots:+$(p+"Lots").value,loss_limit:+$(p+"Loss").value,...extra};
+async function botCtl(p,action,extra){const D=window.botD[p]||{};const body={action,bot:BOTS[p].kind,mode:$(p+"Mode").value,entries:$(p+"Ent").value,min_grade:$(p+"Grade").value,max_trades:+$(p+"Max").value,lots:+$(p+"Lots").value,loss_limit:+$(p+"Loss").value,...extra};
  if(action==="play"&&body.mode==="live"&&!(D.mode==="live"&&D.armed)){const pin=prompt("Order PIN, to arm this live autopilot for today");if(pin===null)return;body.pin=pin}
  if(action==="stop"&&!confirm(D.open?`Stop this autopilot and sell ${D.open} open position(s) now?`:"Stop this autopilot?"))return;
  const d=await post("/api/optbot/control",body);$(p+"Msg").textContent=d.error||({play:"Running.",pause:"Paused. No new trades; open positions are still managed.",stop:d.left?`Stopped, but ${d.left} position(s) could not be closed. Check your broker app.`:"Stopped. All positions closed.",save:"Saved."})[action];botLoad()}
@@ -6247,6 +6495,7 @@ function initInstall(){const b=$("installBtn"),standalone=matchMedia("(display-m
  addEventListener("appinstalled",()=>{b.hidden=true})}
 function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
  for(const p in BOTS){$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
+function confBadge(r){const c=r&&r.conf;if(!c)return "";const tip=`Grade ${c.g}, score ${c.s} of 100\n`+c.w.map(x=>(x[0]?"✓ ":"✗ ")+x[1]).join("\n")+(c.n<8?"\n(Some checks could not be made)":"");return `<span class="cg cg${c.g}" title="${esc(tip)}">${c.g}<small> ${c.s}</small></span>`}
 let btTimer=null;
 const inr=x=>(x<0?"-":"")+"₹"+Math.abs(Math.round(x)).toLocaleString("en-IN");
 function btChart(curve,cap){if(!curve.length)return "<div class='sub'>No trades to draw.</div>";
@@ -6277,12 +6526,13 @@ function btPaint(r){$("btOut").hidden=false;
   "Past results do not predict future ones. Orders fill at the signal candle's close, with the slippage you set."].filter(Boolean);
  $("btNotes").innerHTML=notes.map(esc).join("<br>");
  $("btMonths").innerHTML=r.months.length?`<thead><tr><th>Month</th><th>P&amp;L</th><th>% of start</th></tr></thead><tbody>`+r.months.map(m=>`<tr><td>${m.m}</td><td class="${pnlCls(m.pnl)}">${inr(m.pnl)}</td><td class="${pnlCls(m.pnl)}">${m.pct}%</td></tr>`).join("")+"</tbody>":"";
+ $("btGradeT").innerHTML=r.by_grade&&r.by_grade.some(g=>g.grade!=="–")?`<thead><tr><th>Grade</th><th>Trades</th><th>Win rate</th><th>P&amp;L</th></tr></thead><tbody>`+r.by_grade.map(m=>`<tr><td><b>${m.grade}</b></td><td>${m.trades}</td><td>${m.win_rate}%</td><td class="${pnlCls(m.pnl)}">${inr(m.pnl)}</td></tr>`).join("")+"</tbody>":"<tbody><tr><td class='empty'>Grades apply to signal strategies.</td></tr></tbody>";
  $("btSymT").innerHTML=r.by_symbol.length?`<thead><tr><th>Symbol</th><th>Trades</th><th>Win rate</th><th>P&amp;L</th></tr></thead><tbody>`+r.by_symbol.map(m=>`<tr><td><b>${esc(m.sym)}</b></td><td>${m.trades}</td><td>${m.win_rate}%</td><td class="${pnlCls(m.pnl)}">${inr(m.pnl)}</td></tr>`).join("")+"</tbody>":"";
  $("btListNote").textContent=r.listed_of>r.list.length?`(latest ${r.list.length} of ${r.listed_of})`:"";
- $("btTrades").innerHTML=r.list.length?`<thead><tr><th>In</th><th>Out</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Why</th><th>P&amp;L</th><th>Funds after</th></tr></thead><tbody>`+r.list.map(t=>`<tr><td>${t.in}</td><td>${t.out}</td><td>${esc(t.label)}</td><td>${t.side}</td><td>${t.qty}</td><td>${f2(t.entry)}</td><td>${f2(t.exit)}</td><td>${esc(t.why)}</td><td class="${pnlCls(t.pnl)}">${inr(t.pnl)}</td><td>${inr(t.equity)}</td></tr>`).join("")+"</tbody>":""}
+ $("btTrades").innerHTML=r.list.length?`<thead><tr><th>In</th><th>Out</th><th>Instrument</th><th>Side</th><th>Grade</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Why</th><th>P&amp;L</th><th>Funds after</th></tr></thead><tbody>`+r.list.map(t=>`<tr><td>${t.in}</td><td>${t.out}</td><td>${esc(t.label)}</td><td>${t.side}</td><td>${t.grade||"–"}</td><td>${t.qty}</td><td>${f2(t.entry)}</td><td>${f2(t.exit)}</td><td>${esc(t.why)}</td><td class="${pnlCls(t.pnl)}">${inr(t.pnl)}</td><td>${inr(t.equity)}</td></tr>`).join("")+"</tbody>":""}
 async function btRun(){clearTimeout(btTimer);
  const b={strategy:$("btStrategy").value,kind:$("btKind").value,symbols:$("btSyms").value,interval:$("btTf").value,days:+$("btDays").value,capital:+$("btCap").value,risk_pct:+$("btRisk").value,target:+$("btTarget").value,
-  intraday:$("btIntra").checked,sell_ok:$("btSell").checked,leverage:+$("btLev").value,margin_pct:+$("btMargin").value,lot_size:+$("btLot").value||0,iv:+$("btIv").value,dte:+$("btDte").value,
+  intraday:$("btIntra").checked,sell_ok:$("btSell").checked,min_grade:$("btGrade").value,leverage:+$("btLev").value,margin_pct:+$("btMargin").value,lot_size:+$("btLot").value||0,iv:+$("btIv").value,dte:+$("btDte").value,
   brokerage:+$("btBrk").value,other_pct:+$("btOth").value,slippage:+$("btSlip").value,entry_from:$("btFrom").value,entry_to:$("btTo").value,gap_max:+$("btGap").value};
  $("btRun").disabled=true;$("btMsg").textContent="";$("btNote").textContent="Starting…";
  const d=await post("/api/backtest",b);if(d.error){$("btMsg").textContent=d.error;$("btRun").disabled=false;$("btNote").textContent="";return}
@@ -6296,7 +6546,7 @@ function initBacktest(){$("btRun").onclick=btRun;
  $("btStrategy").onchange=()=>{const g=$("btStrategy").value==="gap";if(g&&$("btTf").value==="1d"){$("btTf").value="5m";$("btTf").onchange()}$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true}}
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
- $("scOnly").onchange=()=>{scLoad()};
+ $("scOnly").onchange=()=>{scLoad()};$("scConf").onchange=()=>{scRender()};
  $("scTable").onclick=e=>{const b=e.target.closest("[data-sc]");if(!b)return;const sy=b.dataset.s;
   if(b.dataset.sc==="chart")openChart(sy,scTf);
   else if(b.dataset.sc==="fut")openTicket({kind:"future",symbol:sy,label:sy+" futures, nearest month",side:b.dataset.side,price:+b.dataset.p,tf:scTf});
@@ -6438,7 +6688,7 @@ $("tkQty").addEventListener("input",fundsPaint);
 $("tkFunds").onclick=e=>{if(e.target.id==="tkMax"&&fundsInfo&&fundsInfo.max_qty!=null){$("tkQty").value=Math.max(1,fundsInfo.max_qty);resetReview();fundsPaint()}};
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-initChart();initFlash();initModes();initIndex();initScanner();initBot();initBacktest();initInstall();
+initChart();initFlash();initModes();initIndex();initScanner();initBot();initBacktest();initConf();initInstall();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
