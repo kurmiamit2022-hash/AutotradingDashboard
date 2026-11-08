@@ -303,6 +303,9 @@ def eval_signals(symbol, df, interval, idxs, buy, c, hi, lo, atr, ls, ss):
     return out
 
 
+INTERNAL = {}   # (symbol, timeframe) -> values the options autopilot needs; never sent to the browser
+
+
 def analyse(symbol, df, interval):
     df = df.dropna(subset=["Close", "High", "Low"]).copy()
     if df.empty:
@@ -357,6 +360,7 @@ def analyse(symbol, df, interval):
 
     hist = eval_signals(symbol, df, interval, sig_idx, buy, c, hi, lo, atr, ls, ss)
 
+    INTERNAL[(symbol, interval)] = {"ema": float(ema[-1]), "atr": float(atr[-1]) if len(atr) and atr[-1] == atr[-1] else None}
     base = {"symbol": symbol, "hist": hist, "type": "index" if symbol in INDEX_YF else "stock", "close": round(float(c[-1]), 2), "signal": "–", "entry": None, "sl": None,
             "sector": sector_of(symbol), "chg": None if chg is None else round(float(chg), 2),
             "prev_close": None if prev_close is None else round(prev_close, 2), "vol": vol, "val_cr": val_cr,
@@ -1434,7 +1438,7 @@ def inr(x):
     return "₹" + f"{x:,.2f}"
 
 
-def make_order(p, u, dry=False):
+def make_order(p, u, dry=False, force=None):
     """Check an order request against every limit. Returns (order, error, warnings, lines)."""
     kind = p.get("kind")
     symbol = str(p.get("symbol", "")).upper().strip()
@@ -1444,6 +1448,8 @@ def make_order(p, u, dry=False):
     tf = p.get("tf") if p.get("tf") in INTERVALS else DEFAULT_INTERVAL
     fail = lambda m: (None, m, [], [])
     mode, _ = user_mode(u)
+    if force:
+        mode = force
     caps = u["caps"]
     broker_id = str(p.get("broker") or u["default_broker"]).lower() if mode == "live" else "paper"
     if mode == "live" and broker_id not in u["brokers"]:
@@ -1937,6 +1943,10 @@ def autopilot_loop():
             autopilot_once()
         except Exception as e:
             AUTO["error"] = f"{type(e).__name__}: {str(e)[:100]}"
+        try:
+            optbot_once()
+        except Exception as e:
+            AUTO["error"] = f"optbot {type(e).__name__}: {str(e)[:100]}"
         time.sleep(AUTOPILOT_SECONDS)
 
 
@@ -2028,6 +2038,247 @@ def broker_chain(symbol, expiry, u):
 
 def chain_for(symbol, expiry, u):
     return broker_chain(symbol, expiry, u) if symbol in BSE_INDICES else build_chain(symbol, expiry)
+
+
+# ── Options autopilot: buys an at-the-money option on the Intraday Scanner's stocks, in paper or live mode ──
+# Entry (from 9:20 until OPTBOT_LAST_ENTRY): a stock in the scanner's top list whose day change is 0 to +2% (buy a CE) or 0 to -2% (buy a PE),
+# whose latest 5 min signal agrees, and whose price is close to its 20 EMA, nearest first. The stop-loss and targets are the signal's own levels
+# on the stock. At T1 the stop moves to the entry price; at T2 the option is sold. Everything is closed by OPTBOT_SQUAREOFF.
+# Live mode must be armed with the order PIN each day. Orders are never retried. Positions are kept in the order records, so a restart keeps managing them.
+OPTBOT_FIRST_ENTRY = dtime(9, 20)
+OPTBOT_LAST_ENTRY = dtime(*map(int, os.getenv("OPTBOT_LAST_ENTRY", "14:30").split(":")))
+OPTBOT_SQUAREOFF = dtime(*map(int, os.getenv("OPTBOT_SQUAREOFF", "15:15").split(":")))
+OPTBOT_NEAR_ATR = float(os.getenv("OPTBOT_NEAR_ATR", "0.6"))   # price must be within this many ATRs of the 20 EMA
+OPTBOT_MAX_CHG = float(os.getenv("OPTBOT_MAX_CHG", "2"))       # day change limit, percent, each side
+OPTBOT = {}   # user id -> settings. Kept in memory: after a restart the autopilot is Off until you switch it on again
+OPTBOT_LOG = []
+OPTBOT_DEFAULTS = {"mode": "off", "max_trades": 3, "lots": 1, "loss_limit": 3000.0, "armed_day": None}
+
+
+def bot_cfg(uid):
+    return OPTBOT.setdefault(uid, dict(OPTBOT_DEFAULTS))
+
+
+def bot_log(uid, text):
+    OPTBOT_LOG.append({"uid": uid, "t": ist_now().strftime("%H:%M:%S"), "text": text})
+    del OPTBOT_LOG[:-200]
+
+
+def bot_positions(uid, open_only=True):
+    with ORDER_LOCK:
+        return [o for o in ORDERS if o.get("user") == uid and o.get("bot") and (o.get("bot_state") == "open" or not open_only)]
+
+
+def bot_pnl(o):
+    """Profit so far on one autopilot trade: from the exit price once closed."""
+    if o.get("bot_state") == "closed" and o.get("bot_exit_px") and o.get("avg_price"):
+        return round((o["bot_exit_px"] - o["avg_price"]) * o["qty"], 2)
+    return None
+
+
+def bot_day_loss(uid):
+    """Net loss today across closed autopilot trades (0 or less means no loss)."""
+    return -sum(bot_pnl(o) or 0 for o in bot_positions(uid, open_only=False))
+
+
+def bot_place(u, o, entry_rec=None, exit_px=None):
+    """Send one order (paper or live) and record it. Returns (record, error). Never retried."""
+    live = o["mode"] == "live"
+    if not live:
+        rec = new_record(o, paper_id(), "complete", is_exit=entry_rec is not None)
+        rec["avg_price"] = exit_px if entry_rec is not None else o["ref"]
+        if entry_rec is not None:
+            rec["bot_exit"] = True
+        return rec, None
+    bname = BROKER_NAMES.get(o.get("broker"), "broker")
+    try:
+        oid = get_account(u["id"], o["broker"]).place(o)
+    except OrderRejected as e:
+        return None, f"{bname} rejected the order: {e}"
+    except Exception as e:
+        new_record(o, "UNKNOWN-" + secrets.token_hex(3), "unknown", is_exit=entry_rec is not None,
+                   note=f"{bname} did not confirm this order. Check your {bname} app.")
+        return None, f"UNSURE: {bname} did not confirm the order ({str(e)[:100]}). Check your {bname} app."
+    return new_record(o, oid, "open", is_exit=entry_rec is not None), None
+
+
+def bot_candidates(u):
+    """Scanner stocks that pass the entry rules, nearest to the 20 EMA first."""
+    d = api_scanner("5m", 0)
+    if not isinstance(d, dict) or d.get("error"):
+        return []
+    out = []
+    for r in d.get("rows", []):
+        chg, sig, lv = r.get("chg"), r.get("signal"), r.get("levels")
+        if chg is None or not lv or sig in (None, "–"):
+            continue
+        side = "BUY" if sig.endswith("BUY") else "SELL"
+        if side == "BUY" and not (0 <= chg <= OPTBOT_MAX_CHG):
+            continue
+        if side == "SELL" and not (-OPTBOT_MAX_CHG <= chg <= 0):
+            continue
+        it = INTERNAL.get((r["symbol"], "5m"))
+        if not it or not it.get("atr"):
+            continue
+        px = r["price"]
+        if (side == "BUY" and px < it["ema"]) or (side == "SELL" and px > it["ema"]):
+            continue
+        dist = abs(px - it["ema"]) / it["atr"]
+        if dist > OPTBOT_NEAR_ATR:
+            continue
+        if (side == "BUY" and not (lv["sl"] < px < lv["tp1"])) or (side == "SELL" and not (lv["tp1"] < px < lv["sl"])):
+            continue  # already past a level, so the signal levels no longer fit
+        out.append({"symbol": r["symbol"], "side": side, "px": px, "dist": dist, "levels": lv, "chg": chg})
+    out.sort(key=lambda c: c["dist"])
+    return out
+
+
+def bot_enter(u, cfg):
+    mode = "live" if cfg["mode"] == "live" else "paper"
+    for c in bot_candidates(u):
+        with ORDER_LOCK:
+            traded = any(o.get("user") == u["id"] and o.get("bot") and o["symbol"] == c["symbol"] for o in ORDERS)
+        if traded:
+            continue
+        right = "CE" if c["side"] == "BUY" else "PE"
+        try:
+            ch = build_chain(c["symbol"])
+        except Exception:
+            ch = None
+        rows = (ch or {}).get("rows") or []
+        if not rows or not ch.get("expiry"):
+            bot_log(u["id"], f"{c['symbol']}: no option chain, skipped.")
+            continue
+        row = min(rows, key=lambda r: abs(r["strike"] - c["px"]))
+        ltp = (row.get(right.lower()) or {}).get("ltp")
+        if not ltp:
+            bot_log(u["id"], f"{c['symbol']}: no price for the {int(row['strike'])} {right}, skipped.")
+            continue
+        limit = round(round(ltp * 1.01 / 0.05) * 0.05, 2)
+        payload = {"kind": "option", "symbol": c["symbol"], "side": "BUY", "qty": cfg["lots"], "order_type": "LIMIT", "price": limit,
+                   "product": "INTRADAY", "tf": "5m", "expiry": ch["expiry"], "strike": row["strike"], "right": right}
+        order, err, _, _ = make_order(payload, u, force=mode)
+        if err:
+            bot_log(u["id"], f"{c['symbol']} {right}: {err}")
+            continue
+        if order["mode"] != mode:
+            bot_log(u["id"], "Your trading mode changed, so no order was sent.")
+            return False
+        rec, err = bot_place(u, order)
+        if err:
+            bot_log(u["id"], f"{c['symbol']} {right}: {err}")
+            notify_user(u["id"], f"Autopilot order failed: {c['symbol']}", err)
+            if err.startswith("UNSURE"):
+                cfg["mode"] = "off"
+            return True  # an order may have reached the broker, so stop for this round
+        lv = c["levels"]
+        rec.update(bot=True, bot_right=right, bot_strike=row["strike"], bot_expiry=ch["expiry"], bot_state="open", bot_dir=c["side"], bot_sl=lv["sl"], bot_t1=lv["tp1"], bot_t2=lv["tp2"], bot_entry_under=c["px"],
+                   bot_t1_done=False, bot_exit_px=None, bot_reason=None)
+        append_log(rec)
+        bot_log(u["id"], f"{'LIVE' if mode == 'live' else 'Paper'} BUY {rec['label']} at about {limit:.2f}: stock {c['px']:.2f}, "
+                         f"{c['dist']:.2f} ATR from its 20 EMA, stop {lv['sl']:.2f}, T1 {lv['tp1']:.2f}, T2 {lv['tp2']:.2f}.")
+        notify_user(u["id"], f"Autopilot bought {rec['label']}", f"{mode} order at about {limit:.2f}. Stock stop {lv['sl']:.2f}, target {lv['tp2']:.2f}.")
+        return True
+    return False
+
+
+def bot_exit(u, pos, reason):
+    if pos.get("bot_state") != "open" or pos["status"] in ("rejected", "cancelled", "expired", "unknown"):
+        pos["bot_state"] = "closed"
+        append_log(pos)
+        return
+    if pos["mode"] == "live" and pos["status"] != "complete":
+        return  # wait for the entry to fill
+    ch = None
+    try:
+        ch = build_chain(pos["symbol"], pos["bot_expiry"])
+    except Exception:
+        pass
+    leg = next((r.get(pos["bot_right"].lower()) for r in (ch or {}).get("rows", []) if r["strike"] == pos["bot_strike"]), None)
+    ltp = (leg or {}).get("ltp")
+    if not ltp:
+        if not pos.get("bot_warned"):
+            pos["bot_warned"] = True
+            notify_user(u["id"], f"Autopilot cannot price {pos['label']}", f"Exit wanted ({reason}) but no option price is available. Close it yourself if needed.")
+        return
+    limit = round(round(ltp * 0.99 / 0.05) * 0.05, 2)
+    exit_o = {**pos, "side": "SELL", "order_type": "LIMIT", "price": limit, "ref": ltp, "key": None, "sl": None, "risk": None, "auto_sl": False, "trail": False}
+    for k in ("bot", "bot_state", "bot_dir", "bot_sl", "bot_t1", "bot_t2", "bot_entry_under", "bot_t1_done", "bot_exit_px", "bot_reason", "bot_warned", "bot_right", "bot_strike", "bot_expiry", "avg_price", "filled", "status", "id", "time", "date", "t"):
+        exit_o.pop(k, None)
+    pos["bot_state"] = "closing"   # recorded first so a crash mid-call is never followed by a second sell
+    append_log(pos)
+    rec, err = bot_place(u, exit_o, entry_rec=pos, exit_px=ltp)
+    if err:
+        unsure = err.startswith("UNSURE")
+        pos["bot_state"] = "unconfirmed" if unsure else "open"   # an unconfirmed sell is never sent again
+        pos["bot_warned"] = True
+        append_log(pos)
+        if unsure:
+            bot_cfg(u["id"])["mode"] = "off"
+        notify_user(u["id"], f"AUTOPILOT EXIT FAILED: {pos['label']}", f"{err}\nYour option position may still be open or may already be sold. Check your broker app now.")
+        bot_log(u["id"], f"Exit of {pos['label']} failed: {err}")
+        return
+    pos.update(bot_state="closed", bot_exit_px=ltp, bot_reason=reason)
+    append_log(pos)
+    pnl = bot_pnl(pos)
+    bot_log(u["id"], f"Sold {pos['label']} at about {limit:.2f} ({reason})" + (f", profit/loss {pnl:+.0f}." if pnl is not None else "."))
+    notify_user(u["id"], f"Autopilot sold {pos['label']}", f"{reason}. Sold at about {limit:.2f}.")
+
+
+def bot_manage(u, pos):
+    n = ist_now().time()
+    row, _ = row_for(pos["symbol"], "5m")
+    if n >= OPTBOT_SQUAREOFF:
+        return bot_exit(u, pos, "end of day")
+    if not row:
+        return
+    px = live_price(row)
+    up = pos["bot_dir"] == "BUY"
+    if (up and px <= pos["bot_sl"]) or (not up and px >= pos["bot_sl"]):
+        return bot_exit(u, pos, "stop-loss on the stock" if not pos["bot_t1_done"] else "back to entry after T1")
+    if (up and px >= pos["bot_t2"]) or (not up and px <= pos["bot_t2"]):
+        return bot_exit(u, pos, "target T2 reached")
+    if not pos["bot_t1_done"] and ((up and px >= pos["bot_t1"]) or (not up and px <= pos["bot_t1"])):
+        pos["bot_t1_done"] = True
+        pos["bot_sl"] = pos["bot_entry_under"]
+        append_log(pos)
+        bot_log(u["id"], f"{pos['label']}: T1 reached, stop moved to the entry level {pos['bot_entry_under']:.2f}.")
+
+
+def optbot_once():
+    if not market_open_now():
+        return
+    today = ist_now().strftime("%Y-%m-%d")
+    now_t = ist_now().time()
+    uids = {uid for uid, c in OPTBOT.items() if c["mode"] != "off"} | {o["user"] for o in list(ORDERS) if o.get("bot") and o.get("bot_state") == "open"}
+    for uid in uids:
+        u = user_by_id(uid)
+        cfg = bot_cfg(uid)
+        if not u:
+            continue
+        try:
+            if cfg["mode"] == "live" and (cfg["armed_day"] != today or user_mode(u)[0] != "live"):
+                cfg["mode"] = "off"
+                bot_log(uid, "Live autopilot was switched off because it was not armed today or your account is no longer in live mode.")
+                notify_user(uid, "Autopilot switched off", "Live autopilot needs your PIN each day, and your account must be in live mode.")
+            for pos in bot_positions(uid):
+                if pos["mode"] == "live":
+                    sync_status(u)
+                bot_manage(u, pos)
+            if cfg["mode"] == "off" or not (OPTBOT_FIRST_ENTRY <= now_t <= OPTBOT_LAST_ENTRY):
+                continue
+            made = bot_positions(uid, open_only=False)
+            if len(made) >= cfg["max_trades"] or len(bot_positions(uid)) >= 2:
+                continue
+            if bot_day_loss(uid) >= cfg["loss_limit"]:
+                cfg["mode"] = "off"
+                bot_log(uid, f"Daily loss limit of {cfg['loss_limit']:.0f} reached. Autopilot switched off for today.")
+                notify_user(uid, "Autopilot stopped: loss limit", f"The daily loss limit of {cfg['loss_limit']:.0f} was reached.")
+                continue
+            cfg["last_scan"] = now_t.strftime("%H:%M:%S")
+            bot_enter(u, cfg)
+        except Exception as e:
+            bot_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}")
 
 
 # ── Web app ──
@@ -3660,7 +3911,7 @@ def api_portfolio(request: Request):
                 errors.append(f"{BROKER_NAMES.get(b, b)}: {str(e)[:140]}")
     else:
         with ORDER_LOCK:
-            recs = [o for o in ORDERS if o.get("user") == u["id"] and o["mode"] == "paper" and o["status"] == "complete" and not o.get("is_exit")]
+            recs = [o for o in ORDERS if o.get("user") == u["id"] and o["mode"] == "paper" and o["status"] == "complete" and (not o.get("is_exit") or o.get("bot_exit"))]
         groups = {}
         for o in recs:
             g = groups.setdefault(o["label"], {"o": o, "bq": 0, "bv": 0.0, "sq": 0, "sv": 0.0})
@@ -3690,6 +3941,64 @@ def api_portfolio(request: Request):
     tot = {"realized": round(sum(r["realized"] or 0 for r in pos), 2), "unrealized": round(sum(r["unrealized"] or 0 for r in pos), 2)}
     tot["pnl"] = round(tot["realized"] + tot["unrealized"], 2)
     return {"mode": mode, "positions": pos, "totals": tot, "funds": funds, "errors": errors}
+
+
+def bot_view(u):
+    cfg = bot_cfg(u["id"])
+    today = ist_now().strftime("%Y-%m-%d")
+    trades = []
+    for o in sorted(bot_positions(u["id"], open_only=False), key=lambda o: o["time"]):
+        trades.append({"time": o["time"], "label": o["label"], "mode": o["mode"], "entry": o.get("avg_price") or o["price"], "state": o.get("bot_state"),
+                       "exit": o.get("bot_exit_px"), "pnl": bot_pnl(o), "reason": o.get("bot_reason"), "stock_sl": o.get("bot_sl"), "t2": o.get("bot_t2"), "dir": o.get("bot_dir")})
+    pnl = round(sum(t["pnl"] or 0 for t in trades), 2)
+    why = live_blocker(u) or ("Switch your account to Live with the toggle at the top first." if user_mode(u)[0] != "live" else None)
+    return {"mode": cfg["mode"], "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
+            "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
+            "rules": f"Buys at the money options on the scanner's top stocks from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}. Day change 0 to {OPTBOT_MAX_CHG:g}% buys a CE, 0 to -{OPTBOT_MAX_CHG:g}% buys a PE, "
+                     f"with the 5 min signal in the same direction and price nearest its 20 EMA. Exits at the signal's stop-loss or T2, stop moves to entry at T1, all closed by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
+            "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"]][-25:][::-1]}
+
+
+@app.get("/api/optbot")
+def api_optbot(request: Request):
+    return bot_view(request.state.user)
+
+
+@app.post("/api/optbot")
+def api_optbot_set(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    cfg = bot_cfg(u["id"])
+    try:
+        mt, lots, ll = int(payload.get("max_trades", cfg["max_trades"])), int(payload.get("lots", cfg["lots"])), float(payload.get("loss_limit", cfg["loss_limit"]))
+    except (TypeError, ValueError):
+        return {"error": "Trades, lots and the loss limit must be numbers."}
+    if not (1 <= mt <= 10) or not (1 <= lots <= u["caps"]["max_qty"]) or ll < 0:
+        return {"error": f"Use 1 to 10 trades, 1 to {u['caps']['max_qty']} lots, and a loss limit of 0 or more."}
+    mode = str(payload.get("mode", cfg["mode"]))
+    if mode not in ("off", "paper", "live"):
+        return {"error": "Choose Off, Paper or Live."}
+    if mode == "live":
+        if cfg["mode"] != "live" or cfg["armed_day"] != ist_now().strftime("%Y-%m-%d"):
+            why = live_blocker(u) or (None if user_mode(u)[0] == "live" else "Switch your account to Live with the toggle at the top first.")
+            if why:
+                return {"error": why}
+            err = pin_error(u, payload.get("pin"), True)
+            if err:
+                return {"error": err}
+            cfg["armed_day"] = ist_now().strftime("%Y-%m-%d")
+    cfg.update(mode=mode, max_trades=mt, lots=lots, loss_limit=ll)
+    bot_log(u["id"], f"Autopilot set to {mode.upper()}: up to {mt} trades, {lots} lot(s), daily loss limit {ll:.0f}.")
+    return {"ok": True, **bot_view(u)}
+
+
+@app.post("/api/optbot/exit_all")
+def api_optbot_exit(request: Request):
+    u = request.state.user
+    n = 0
+    for pos in bot_positions(u["id"]):
+        bot_exit(u, pos, "closed by you")
+        n += 1
+    return {"ok": True, "closed": n}
 
 
 @app.post("/api/orders/preview")
@@ -4328,6 +4637,7 @@ td.act{white-space:nowrap}
 .tk label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute)}
 .tk input,.tk select{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 9px}
 .tkreview{border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:10px}
+.botbox{margin-bottom:12px}.botrow{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:8px 0}.botrow label{display:flex;flex-direction:column;font-size:12px;color:var(--mute);gap:2px}.botrow input,.botrow select{width:130px}
 .tkfunds{border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:10px}
 .tkfunds div{display:flex;justify-content:space-between;gap:12px;padding:3px 0}.tkfunds span{color:var(--mute)}.tkfunds p{margin:6px 0 0}
 .tkfunds.bad{border-color:var(--sell)}.tkfunds.bad b{color:var(--sell)}
@@ -4483,6 +4793,20 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="ixrow"><div class="seg" id="scTfs" role="group" aria-label="Timeframe"></div>
  <b class="scttl" id="scTtl">Top 15 by traded value today</b>
  <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label><span class="sub" id="scMeta"></span></div>
+<div class="card botbox" id="botBox">
+ <div class="ixrow"><b>Options autopilot</b><span class="sub" id="botState"></span></div>
+ <div class="sub" id="botRules"></div>
+ <div class="botrow">
+  <label>Mode<select id="botMode"><option value="off">Off</option><option value="paper">Paper</option><option value="live">Live</option></select></label>
+  <label>Trades a day<input id="botMax" type="number" min="1" max="10" step="1"></label>
+  <label>Lots each<input id="botLots" type="number" min="1" step="1"></label>
+  <label>Stop for the day at a loss of ₹<input id="botLoss" type="number" min="0" step="500"></label>
+  <button class="btn" id="botSave">Save</button><button class="btn ghost" id="botExit">Exit all now</button>
+ </div>
+ <div class="tkmsg" id="botMsg" role="status"></div>
+ <div class="wrap"><table id="botTrades"></table></div>
+ <div class="sub" id="botLog"></div>
+</div>
 <div class="wrap"><table id="scTable"></table></div>
 
 </section>
@@ -4702,7 +5026,7 @@ function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mod
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
  $("ogrid").classList.toggle("ix",m==="index");$("ixbar").hidden=m!=="index";
  if(m==="index"){if(!["NIFTY","BANKNIFTY","SENSEX"].includes(osym)){osym="NIFTY";oexp=""}ixPaint();ixLoad();loadChain()}
- if(m==="scanner"){scPaint();scLoad()}else clearTimeout(scTimer);
+ if(m==="scanner"){scPaint();scLoad();botLoad()}else{clearTimeout(scTimer);clearTimeout(botTimer)}
  if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
@@ -4796,6 +5120,20 @@ function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=
    <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
    <td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
+let botTimer=null;
+async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
+ try{const d=await (await api("/api/optbot")).json();window.botD=d;
+  if(document.activeElement&&["botMode","botMax","botLots","botLoss"].includes(document.activeElement.id)){}else{$("botMode").value=d.mode;$("botMax").value=d.max_trades;$("botLots").value=d.lots;$("botLoss").value=d.loss_limit}
+  $("botRules").textContent=d.rules;
+  $("botState").textContent=(d.mode==="off"?"Off":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
+  $("botTrades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open (stock stop "+f2(t.stock_sl)+", T2 "+f2(t.t2)+")":esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
+  $("botLog").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}
+ botTimer=setTimeout(botLoad,8000)}
+async function botSend(extra){const body={mode:$("botMode").value,max_trades:+$("botMax").value,lots:+$("botLots").value,loss_limit:+$("botLoss").value,...extra};
+ if(body.mode==="live"&&!(window.botD&&window.botD.mode==="live"&&window.botD.armed)){const pin=prompt("Order PIN, to arm live autopilot for today");if(pin===null)return;body.pin=pin}
+ const d=await post("/api/optbot",body);$("botMsg").textContent=d.error||"Saved.";botLoad()}
+function initBot(){$("botSave").onclick=()=>botSend({});
+ $("botExit").onclick=async()=>{if(!confirm("Sell every option the autopilot is holding now?"))return;const d=await post("/api/optbot/exit_all",{});$("botMsg").textContent=d.error||`Closed ${d.closed} position(s).`;botLoad()}}
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
  $("scOnly").onchange=()=>{scLoad()};
@@ -4938,7 +5276,7 @@ $("tkQty").addEventListener("input",fundsPaint);
 $("tkFunds").onclick=e=>{if(e.target.id==="tkMax"&&fundsInfo&&fundsInfo.max_qty!=null){$("tkQty").value=Math.max(1,fundsInfo.max_qty);resetReview();fundsPaint()}};
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-initChart();initFlash();initModes();initIndex();initScanner();
+initChart();initFlash();initModes();initIndex();initScanner();initBot();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
