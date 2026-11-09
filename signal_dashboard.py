@@ -5797,15 +5797,50 @@ def api_portfolio(request: Request):
     return {"mode": mode, "positions": pos, "totals": tot, "funds": funds, "errors": errors}
 
 
+PAST_BOT = {}   # (user id, bot) -> (time, trades from earlier days). Read from the order log at most once a minute.
+PAST_BOT_DAYS = int(os.getenv("PAST_BOT_DAYS", "30"))
+
+
+def bot_past_trades(uid, kind):
+    """The autopilot's trades from earlier days, newest first, from the order log (the latest record of each order wins)."""
+    k = (uid, kind)
+    hit = PAST_BOT.get(k)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    today = ist_now().strftime("%Y-%m-%d")
+    since = (ist_now() - timedelta(days=PAST_BOT_DAYS)).strftime("%Y-%m-%d")
+    latest = {}
+    try:
+        lines = [r["rec"] for r in q("SELECT rec FROM order_log WHERE day>=? AND day<? ORDER BY n", (since, today))] if USE_PG else (open(ORDER_LOG) if os.path.exists(ORDER_LOG) else [])
+        for ln in lines:
+            try:
+                o = json.loads(ln)
+            except ValueError:
+                continue
+            if o.get("bot") and o.get("user") == uid and bot_kind(o.get("bot_strategy")) == kind and since <= (o.get("date") or "") < today:
+                latest[o["id"]] = o
+    except Exception as e:
+        print("past autopilot trades:", e, flush=True)
+    out = []
+    for o in sorted(latest.values(), key=lambda o: (o.get("date"), o.get("time")), reverse=True):
+        st = o.get("bot_state")
+        out.append({"date": o["date"], "time": o["time"], "label": o["label"], "mode": o["mode"], "entry": o.get("avg_price") or o["price"], "state": "closed" if st in ("open", "unconfirmed", "closing") else st,
+                    "exit": o.get("bot_exit_px"), "pnl": bot_pnl(o), "reason": o.get("bot_reason") or ("Closed at the end of that day" if st in ("open", "unconfirmed", "closing") else None),
+                    "dir": o.get("bot_dir"), "etype": o.get("bot_etype") or "signal", "past": True})
+    PAST_BOT[k] = (time.time(), out)
+    return out
+
+
 def bot_view(u, kind="scanner"):
     kind = bot_kind(kind)
     cfg = bot_cfg(u["id"], kind)
     today = ist_now().strftime("%Y-%m-%d")
     trades = []
-    for o in sorted(bot_positions(u["id"], open_only=False, kind=kind), key=lambda o: o["time"]):
-        trades.append({"time": o["time"], "label": o["label"], "mode": o["mode"], "entry": o.get("avg_price") or o["price"], "state": o.get("bot_state"),
+    for o in sorted(bot_positions(u["id"], open_only=False, kind=kind), key=lambda o: o["time"], reverse=True):
+        trades.append({"date": today, "time": o["time"], "label": o["label"], "mode": o["mode"], "entry": o.get("avg_price") or o["price"], "state": o.get("bot_state"),
                        "exit": o.get("bot_exit_px"), "pnl": bot_pnl(o), "reason": o.get("bot_reason"), "p_sl": o.get("bot_p_sl"), "p_t1": o.get("bot_p_t1"), "p_t2": o.get("bot_p_t2"), "dir": o.get("bot_dir"), "etype": o.get("bot_etype") or "signal"})
     pnl = round(sum(t["pnl"] or 0 for t in trades), 2)
+    trades = trades + bot_past_trades(u["id"], kind)
     why = live_blocker(u) or ("Switch your account to Live with the toggle at the top first." if user_mode(u)[0] != "live" else None)
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
     return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
@@ -6600,7 +6635,7 @@ th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(10),t
 th{font-weight:500;color:var(--mute);font-size:13px;cursor:pointer;user-select:none}
 tr:last-child td{border-bottom:0}
 .pill{display:inline-block;min-width:84px;text-align:center;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:500;background:var(--flat);color:var(--mute)}
-.botbox tr.taken{opacity:.55}
+.botbox .ixrow+.wrap,.botbox .wrap+.ixrow{margin-top:14px}.botbox tr.taken,.botbox tr.past{opacity:.6}.botbox td.act{white-space:nowrap}
 .pill.BUY{background:var(--buy-bg);color:var(--buy);font-weight:700}
 .pill.SELL{background:var(--sell-bg);color:var(--sell);font-weight:700}
 .pill.Open_BUY{color:var(--buy)}.pill.Open_SELL{color:var(--sell)}
@@ -7285,8 +7320,8 @@ async function botLoad(){clearTimeout(botTimer);if(mode!=="autopilot")return;
   $(p+"State").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
   const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";const mm=$(p+"Msg");if(mm.textContent==="Running."&&d.state!=="running")mm.textContent="The autopilot is stopped (the server restarted or it was stopped elsewhere). Press Play to start it.";
   $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
-  $(p+"Trades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"?"Gap":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
-  const sg=d.signals||[];$(p+"Sig").innerHTML=sg.length?`<thead><tr><th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Grade</th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.taken?"taken":""}"><td><b>${esc(x.symbol)}</b></td><td><span class="pill ${x.side}">${x.right==="CE"?"CALL (CE)":"PUT (PE)"}</span>${x.taken?" <span class=sub>taken by the autopilot</span>":""}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No stock qualifies right now.</td></tr></tbody>`;
+  $(p+"Trades").innerHTML=d.trades.length?`<thead><tr><th>Date</th><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr class="${t.past?"past":""}"><td>${t.past?esc(t.date||""):"Today"}</td><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"||t.etype==="continuation"?"Continuation":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No trades yet.</td></tr></tbody>`;
+  const sg=d.signals||[];$(p+"Sig").innerHTML=sg.length?`<thead><tr><th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Grade</th><th></th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.taken?"taken":""}"><td><b>${esc(x.symbol)}</b></td><td><span class="pill ${x.side}">${x.right==="CE"?"CALL (CE)":"PUT (PE)"}</span>${x.taken?" <span class=sub>taken by the autopilot</span>":""}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td><td class="act"><button class="mini" data-ap="chart" data-s="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button> <button class="mini" data-ap="ochart" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Option chart</button> <button class="mini go" data-ap="trade" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Trade ${x.right}</button></td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No stock qualifies right now.</td></tr></tbody>`;
   $(p+"Sig").parentElement.hidden=false;
   $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
  botTimer=setTimeout(botLoad,8000)}
@@ -7300,8 +7335,17 @@ function initInstall(){const b=$("installBtn"),standalone=matchMedia("(display-m
  if(/iphone|ipad|ipod/i.test(navigator.userAgent)){b.hidden=false}
  b.onclick=async()=>{if(installEv){installEv.prompt();await installEv.userChoice;installEv=null;b.hidden=true}else alert("On iPhone: tap the Share button in Safari, then Add to Home Screen. On Android: open the browser menu and choose Install app.")};
  addEventListener("appinstalled",()=>{b.hidden=true})}
+async function apOption(b,p,what){const m=$(p+"Msg");const sy=b.dataset.s,right=b.dataset.r;b.disabled=true;m.textContent=`Loading the ${sy} option chain…`;
+ try{const d=await (await api(`/api/options/chain?symbol=${encodeURIComponent(sy)}&tf=${b.dataset.tf||"15m"}`)).json();
+  if(d.error||!d.rows||!d.rows.length){m.textContent=d.error||"No option chain for "+sy+" right now.";return}
+  const row=d.rows.reduce((a,r)=>Math.abs(r.strike-d.atm)<Math.abs(a.strike-d.atm)?r:a,d.rows[0]),leg=right==="CE"?row.ce:row.pe;
+  lastChain=d;m.textContent="";
+  if(what==="ochart"){openOptChart(row.strike);return}
+  if(!leg||!leg.ltp){m.textContent=`No price for the ${sy} ${row.strike} ${right} yet, so no order was opened.`;return}
+  openTicket({kind:"option",symbol:d.symbol,expiry:d.expiry,strike:row.strike,right,side:"BUY",price:+leg.ltp,label:`${d.symbol} ${row.strike} ${right} ${d.expiry}`})
+ }catch(e){m.textContent="Could not load the option chain."}finally{b.disabled=false}}
 function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
- for(const p in BOTS){$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
+ for(const p in BOTS){$(p+"Sig").onclick=e=>{const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
 function confBadge(r){const c=r&&r.conf;if(!c)return "";const tip=`Grade ${c.g}, score ${c.s} of 100\n`+c.w.map(x=>(x[0]?"✓ ":"✗ ")+x[1]).join("\n")+(c.n<8?"\n(Some checks could not be made)":"");return `<span class="cg cg${c.g}" title="${esc(tip)}">${c.g}<small> ${c.s}</small></span>`}
 let btTimer=null;
 const inr=x=>(x<0?"-":"")+"₹"+Math.abs(Math.round(x)).toLocaleString("en-IN");
