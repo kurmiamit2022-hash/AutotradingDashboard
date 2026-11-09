@@ -62,7 +62,7 @@ REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "300"))
 PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "127.0.0.1")
 OPTION_TTL = int(os.getenv("OPTION_TTL", "120"))                 # seconds an option chain stays cached
-STRIKES_EACH_SIDE = int(os.getenv("STRIKES_EACH_SIDE", "8"))       # strikes shown above and below the money
+STRIKES_EACH_SIDE = int(os.getenv("STRIKES_EACH_SIDE", "25"))       # strikes shown above and below the money (set STRIKES_EACH_SIDE in Render to change)
 
 PERIODS = {"5m": "30d", "15m": "60d", "1d": "2y"}
 STEP = {"5m": pd.Timedelta(minutes=5), "15m": pd.Timedelta(minutes=15), "1h": pd.Timedelta(hours=1)}
