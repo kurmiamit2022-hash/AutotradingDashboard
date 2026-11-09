@@ -413,7 +413,7 @@ def analyse(symbol, df, interval):
 
     base.update(signal=signal, entry=round(entry, 2), sl=round(float(sl), 2),
                 tp1=round(tps[0], 2), tp2=round(tps[1], 2), tp3=round(tps[2], 2), tp4=round(tps[3], 2),
-                hits=hits, sl_hit=sl_hit, status=status, bars_ago=int(bars_ago), signal_time=fmt_time(df.index[j], interval))
+                hits=hits, sl_hit=sl_hit, status=status, bars_ago=int(bars_ago), signal_time=fmt_time(df.index[j], interval), signal_date=df.index[j].strftime("%Y-%m-%d"))
     base["side"] = name
     return base
 
@@ -2712,11 +2712,9 @@ def chain_for(symbol, expiry, u):
     return ch
 
 
-# ── Options autopilot: buys an at-the-money option on the Intraday Scanner's stocks, in paper or live mode ──
-# Entry (from 9:20 until OPTBOT_LAST_ENTRY): a stock in the scanner's top list whose day change is 0 to +2% (buy a CE) or 0 to -2% (buy a PE),
-# whose latest 5 min signal agrees, and whose price is close to its 20 EMA, nearest first. The stop-loss and targets are the signal's own levels
-# on the stock. At T1 the stop moves to the entry price; at T2 the option is sold. Everything is closed by OPTBOT_SQUAREOFF.
-# Live mode must be armed with the order PIN each day. Orders are never retried. Positions are kept in the order records, so a restart keeps managing them.
+# ── Options autopilot: buys an at-the-money option in paper or live mode. Two autopilots with the same rules: one for the Intraday Scanner's
+# stocks, one for NIFTY (see AUTO_RULES below for the entry and exit rules). Live mode must be armed with the order PIN each day.
+# Orders are never retried. Positions are kept in the order records, so a restart keeps managing them. ──
 OPTBOT_FIRST_ENTRY = dtime(9, 20)
 OPTBOT_LAST_ENTRY = dtime(*map(int, os.getenv("OPTBOT_LAST_ENTRY", "14:30").split(":")))
 OPTBOT_SQUAREOFF = dtime(*map(int, os.getenv("OPTBOT_SQUAREOFF", "15:15").split(":")))
@@ -2725,6 +2723,7 @@ OPTBOT_MAX_CHG = float(os.getenv("OPTBOT_MAX_CHG", "2"))       # day change limi
 OPTBOT_MAX_LOSS_PCT = float(os.getenv("OPTBOT_MAX_LOSS_PCT", "50"))   # the option stop is never set further than this percent below the price paid
 OPTBOT = {}   # (user id, "scanner" or "nifty") -> settings. Two separate autopilots with their own mode, limits and Play/Pause/Stop. Kept in memory: after a restart the autopilot is Off until you switch it on again
 OPTBOT_LOG = []
+BOT_DIAG = {}      # user id -> (time, text) of the last 'why nothing was bought' note
 OPTBOT_SKIP = {}   # (user id, symbol) -> time until which a stock that could not be traded is left alone
 OPTBOT_DEFAULTS = {"mode": "off", "strategy": "scanner", "paused": False, "last_mode": "paper", "max_trades": 3, "lots": 1, "loss_limit": 3000.0, "armed_day": None, "entries": "both", "min_grade": "any"}
 
@@ -2809,35 +2808,127 @@ def bot_opt_ltp(u, pos):
     return (leg or {}).get("ltp")
 
 
-def bot_candidates(u):
-    """Scanner stocks that pass the entry rules, nearest to the 20 EMA first."""
-    d = api_scanner("5m", 0)
-    if not isinstance(d, dict) or d.get("error"):
-        return []
+# Entry rules, the same for the stock autopilot (the scanner's stocks) and the NIFTY autopilot, from 9:20 until OPTBOT_LAST_ENTRY:
+#  1. FRESH: the indicator gives a signal on the 5 minute or the 15 minute chart (the candle has just closed), nothing has been hit yet,
+#     and the price is still between the signal's stop and first target. The trade is taken at once.
+#  2. CONTINUATION: a signal from an earlier day is still open (stop and first target not hit) and the price has come back to within
+#     OPTBOT_NEAR_ATR of its 20 EMA on the right side. The trade is taken then.
+# Both buy one at-the-money CE (BUY signal) or PE (SELL signal). The stop-loss and T1 to T4 are the indicator's own levels on the stock or index:
+# the stop moves to the entry at T1, to T1 at T2, to T2 at T3, and everything is sold at T4 or at the stop. Closed by OPTBOT_SQUAREOFF.
+OPTBOT_FRESH_BARS = int(os.getenv("OPTBOT_FRESH_BARS", "1"))   # a signal counts as fresh while it is at most this many candles old
+AUTO_TFS = ("5m", "15m")
+AUTO_SEEN = {}   # (user id, bot, symbol, timeframe, signal time, side) -> True: each signal is acted on once
+AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 or 15 minute chart, "
+              "or when a signal from an earlier day is still open and the price is back near its 20 EMA. Stop-loss and targets T1 to T4 are the indicator's own: "
+              "the stop moves to the entry at T1, to T1 at T2, to T2 at T3, and it sells everything at T4 or at the stop.")
+
+
+def auto_rows(kind, tf):
+    """The rows this autopilot may trade on one timeframe, with live prices and grades. None when there is no data yet."""
+    if kind == "nifty":
+        ensure_fresh(tf)
+        names = ["NIFTY"]
+    else:
+        d = api_scanner(tf, 0)
+        if not isinstance(d, dict) or d.get("error"):
+            return None
+        names = [r["symbol"] for r in d.get("rows", []) if r["symbol"] not in INDICES]
+    with LOCK:
+        by = {r["symbol"]: r for r in STATES[tf]["rows"]}
+    rows = [by[s] for s in names if s in by]
+    return add_conf(apply_live(rows), tf)
+
+
+def auto_candidates(u, cfg, kind, why=None):
+    """Signals that qualify right now, fresh ones first and then by grade and closeness to the 20 EMA. `why` collects the reason a live signal was left out."""
+    ent = cfg.get("entries", "both")
+    today = ist_now().strftime("%Y-%m-%d")
     out = []
-    for r in d.get("rows", []):
-        chg, sig, lv = r.get("chg"), r.get("signal"), r.get("levels")
-        if chg is None or not lv or sig in (None, "–"):
+
+    def no(label, text):
+        if why is not None:
+            why.append(f"{label}: {text}")
+    for tf in AUTO_TFS:
+        rows = auto_rows(kind, tf)
+        if rows is None:
+            no(tf, "no data yet")
             continue
-        side = "BUY" if sig.endswith("BUY") else "SELL"
-        if side == "BUY" and not (0 <= chg <= OPTBOT_MAX_CHG):
-            continue
-        if side == "SELL" and not (-OPTBOT_MAX_CHG <= chg <= 0):
-            continue
-        it = INTERNAL.get((r["symbol"], "5m"))
-        if not it or not it.get("atr"):
-            continue
-        px = r["price"]
-        if (side == "BUY" and px < it["ema"]) or (side == "SELL" and px > it["ema"]):
-            continue
-        dist = abs(px - it["ema"]) / it["atr"]
-        if dist > OPTBOT_NEAR_ATR:
-            continue
-        if (side == "BUY" and not (lv["sl"] < px < lv["tp1"])) or (side == "SELL" and not (lv["tp1"] < px < lv["sl"])):
-            continue  # already past a level, so the signal levels no longer fit
-        out.append({"symbol": r["symbol"], "side": side, "px": px, "dist": dist, "levels": lv, "chg": chg, "grade": (r.get("conf") or {}).get("g"), "score": (r.get("conf") or {}).get("s")})
-    out.sort(key=lambda c: c["dist"])
+        for r in rows:
+            sym, side, sig = r["symbol"], r.get("side"), r.get("signal") or "–"
+            label = f"{sym} {tf}"
+            if sig == "–" or side not in ("BUY", "SELL") or not r.get("entry") or not r.get("sl") or r.get("sl_hit"):
+                continue
+            sdate = r.get("signal_date")
+            fresh = r.get("bars_ago") is not None and r["bars_ago"] <= OPTBOT_FRESH_BARS and sdate == today
+            cont = not fresh and sig.startswith("Open") and bool(sdate) and sdate < today
+            if not fresh and not cont:
+                continue   # a signal from earlier today that is no longer fresh is not traded
+            if (fresh and ent == "gap") or (cont and ent == "fresh"):
+                continue
+            if r.get("hits"):
+                no(label, f"{side} signal already reached T{r['hits']}")
+                continue
+            px = float(r.get("ltp") or r["close"])
+            lv = {k: r.get(k) for k in ("sl", "tp1", "tp2", "tp3", "tp4")}
+            if (side == "BUY" and not (lv["sl"] < px < lv["tp1"])) or (side == "SELL" and not (lv["tp1"] < px < lv["sl"])):
+                no(label, f"{side} price {px:.2f} is already past T1 or the stop")
+                continue
+            it = INTERNAL.get((sym, tf)) or {}
+            dist = abs(px - it["ema"]) / it["atr"] if it.get("ema") and it.get("atr") else None
+            if cont:
+                if dist is None:
+                    no(label, "no 20 EMA yet")
+                    continue
+                if (side == "BUY" and px < it["ema"]) or (side == "SELL" and px > it["ema"]):
+                    no(label, f"continuing {side} from {sdate}: waiting, price is on the wrong side of the 20 EMA")
+                    continue
+                if dist > OPTBOT_NEAR_ATR:
+                    no(label, f"continuing {side} from {sdate}: waiting for a pullback to the 20 EMA ({dist:.1f} ATR away, needs {OPTBOT_NEAR_ATR:g})")
+                    continue
+            g = (r.get("conf") or {}).get("g")
+            if not grade_ok(cfg, g):
+                no(label, f"{side} grade {g or 'none'} is below your minimum ({cfg.get('min_grade')})")
+                continue
+            key = (u["id"], kind, sym, tf, r.get("signal_time"), side)
+            skey = f"{tf} {r.get('signal_time')} {side}"
+            if AUTO_SEEN.get(key):
+                continue
+            with ORDER_LOCK:
+                done = any(o.get("user") == u["id"] and o.get("bot") and o["symbol"] == sym and o.get("date") == today and o.get("bot_sigkey") == skey for o in ORDERS)
+            if done:
+                AUTO_SEEN[key] = True
+                continue
+            cf = r.get("conf") or {}
+            out.append({"symbol": sym, "side": side, "px": px, "levels": lv, "tf": tf, "etype": "fresh" if fresh else "continuation", "grade": g, "score": cf.get("s"),
+                        "dist": dist if dist is not None else 9.9, "key": key, "sigkey": skey,
+                        "note": (f"fresh {tf} {side} signal at {r.get('signal_time')}" if fresh else f"{side} signal from {sdate} still open, back near its 20 EMA on {tf}")
+                                + (f", grade {g} ({cf.get('s')})" if g else "")})
+    out.sort(key=lambda c: (c["etype"] != "fresh", -(c["score"] or 0), c["dist"]))
     return out
+
+
+def auto_enter(u, cfg, kind):
+    """Look at every qualifying signal and buy the best one. At most one purchase a look."""
+    mode = "live" if cfg["mode"] == "live" else "paper"
+    why = []
+    cands = auto_candidates(u, cfg, kind, why)
+    if why and not cands:   # say why, once per change or every 10 minutes, so a quiet autopilot can be understood
+        text = "No trade: " + "; ".join(why[:6]) + (f"; and {len(why) - 6} more" if len(why) > 6 else "")
+        last = BOT_DIAG.get((u["id"], kind))
+        if not last or last[1] != text or time.time() - last[0] > 600:
+            BOT_DIAG[(u["id"], kind)] = (time.time(), text)
+            bot_log(u["id"], text, bot=kind)
+    for c in cands:
+        if OPTBOT_SKIP.get((u["id"], c["symbol"]), 0) > time.time():
+            continue
+        if any(p["symbol"] == c["symbol"] for p in bot_positions(u["id"], kind=kind)):
+            continue   # one open trade on a stock at a time
+        r = bot_buy(u, cfg, c, mode, strategy=kind, skip_expiry_day=(kind == "nifty"), etype=c["etype"])
+        if r == "skip":
+            continue
+        AUTO_SEEN[c["key"]] = True
+        return r != "changed"
+    return False
 
 
 def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False, etype="fresh"):
@@ -2862,7 +2953,7 @@ def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False, etype="f
         return "skip"
     limit = round(round(ltp * 1.01 / 0.05) * 0.05, 2)
     payload = {"kind": "option", "symbol": c["symbol"], "side": "BUY", "qty": cfg["lots"], "order_type": "LIMIT", "price": limit,
-               "product": "INTRADAY", "tf": "5m", "expiry": ch["expiry"], "strike": row["strike"], "right": right}
+               "product": "INTRADAY", "tf": c.get("tf", "5m"), "expiry": ch["expiry"], "strike": row["strike"], "right": right}
     order, err, _, _ = make_order(payload, u, force=mode)
     if err:
         OPTBOT_SKIP[(u["id"], c["symbol"])] = time.time() + 300
@@ -2885,33 +2976,14 @@ def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False, etype="f
     p_t1 = round(p0 + delta * abs(lv["tp1"] - c["px"]), 2)
     p_t2 = round(p0 + delta * abs(lv["tp2"] - c["px"]), 2)
     rec.update(bot_p0=p0, bot_delta=delta, bot_p_sl=p_sl, bot_p_t1=p_t1, bot_p_t2=p_t2, bot_strategy=strategy, bot_etype=etype)
-    rec.update(bot=True, bot_right=right, bot_strike=row["strike"], bot_expiry=ch["expiry"], bot_state="open", bot_dir=c["side"], bot_sl=lv["sl"], bot_t1=lv["tp1"], bot_t2=lv["tp2"], bot_entry_under=c["px"],
+    rec.update(bot=True, bot_right=right, bot_strike=row["strike"], bot_expiry=ch["expiry"], bot_state="open", bot_dir=c["side"], bot_sl=lv["sl"], bot_t1=lv["tp1"], bot_t2=lv["tp2"],
+               bot_t3=lv.get("tp3"), bot_t4=lv.get("tp4"), bot_step=0, bot_stop=lv["sl"], bot_tf=c.get("tf", "5m"), bot_sigkey=c.get("sigkey"), bot_entry_under=c["px"],
                bot_t1_done=False, bot_exit_px=None, bot_reason=None)
     append_log(rec)
     bot_log(u["id"], f"{'LIVE' if mode == 'live' else 'Paper'} BUY {rec['label']} at about {limit:.2f}: {c['symbol']} {c['px']:.2f}, {c['note']}. "
-                     f"Option stop {p_sl:.2f}, T1 {p_t1:.2f}, T2 {p_t2:.2f} (delta {delta:.2f}); {c['symbol']} stop {lv['sl']:.2f}, target {lv['tp2']:.2f}.", bot=strategy)
-    notify_user(u["id"], f"Autopilot bought {rec['label']}", f"{mode} order at about {limit:.2f}. Option stop {p_sl:.2f}, target {p_t2:.2f}.")
+                     f"{c['symbol']} stop {lv['sl']:.2f}, T1 {lv['tp1']:.2f}, T2 {lv['tp2']:.2f}, T3 {lv['tp3']:.2f}, T4 {lv['tp4']:.2f}; option safety stop {p_sl:.2f} (delta {delta:.2f}).", bot=strategy)
+    notify_user(u["id"], f"Autopilot bought {rec['label']}", f"{mode} order at about {limit:.2f}. {c['symbol']} stop {lv['sl']:.2f}, final target {lv['tp4']:.2f}.")
     return "done"
-
-
-def bot_enter(u, cfg):
-    mode = "live" if cfg["mode"] == "live" else "paper"
-    for c in bot_candidates(u):
-        if OPTBOT_SKIP.get((u["id"], c["symbol"]), 0) > time.time():
-            continue
-        with ORDER_LOCK:
-            td = ist_now().strftime("%Y-%m-%d")
-            traded = any(o.get("user") == u["id"] and o.get("bot") and o["symbol"] == c["symbol"] and o.get("date") == td for o in ORDERS)
-        if traded:
-            continue
-        if not grade_ok(cfg, c.get("grade")):
-            continue
-        c["note"] = f"{c['dist']:.2f} ATR from its 20 EMA" + (f", grade {c['grade']} ({c['score']})" if c.get("grade") else "")
-        r = bot_buy(u, cfg, c, mode, etype="signal")
-        if r == "skip":
-            continue
-        return r != "changed"
-    return False
 
 
 # ── NIFTY gap continuation: when yesterday's 5 min signal is still open and NIFTY opens the same way, buy a CE or PE at 9:20 ──
@@ -2987,179 +3059,6 @@ def nifty_inputs(df, today, sym="NIFTY"):
     return side, prev, (float(f["Open"]), float(f["High"]), float(f["Low"]), float(f["Close"])), None
 
 
-NIFTY_RULES = ("NIFTY gap continuation: at 9:20, if yesterday's last 5 min signal is still open and NIFTY opened in the same direction (gap) and the first 5 min candle closed that way, "
-               "it buys one at-the-money CE (or PE). Target: the next pivot level. Stop: today's open or the nearest pivot behind price, whichever is closer. At most one trade a day, "
-               "skipped when reward is smaller than risk. On expiry day it uses the next expiry. Closed by 15:15.")
-NIFTY_STATE = {}   # user id -> {"day": date string, "done": True, "why": text}
-
-
-def nifty_frame():
-    if use_dhan():
-        got, _ = dhan_frames(["NIFTY"], "5m", 7)
-        return got.get("NIFTY")
-    import yfinance as yf
-    df = yf.download("^NSEI", period="7d", interval="5m", auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        return None
-    if getattr(df.columns, "nlevels", 1) > 1:
-        df.columns = df.columns.get_level_values(0)
-    df = df.dropna(subset=["Close", "High", "Low", "Open"]).copy()
-    df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
-    return df
-
-
-def nifty_enter(u, cfg):
-    """One look each morning, from 9:20: buy at most one NIFTY option, then nothing more for the day."""
-    today = ist_now().strftime("%Y-%m-%d")
-    st = NIFTY_STATE.setdefault(u["id"], {})
-    if st.get("day") == today and st.get("done"):
-        return False
-    if ist_now().time() > NIFTY_LAST_ENTRY:
-        st.update(day=today, done=True, why="The entry window (9:20 to 9:45) has passed.")
-        return False
-    with ORDER_LOCK:
-        if any(o.get("user") == u["id"] and o.get("bot") and o["symbol"] == "NIFTY" and o.get("date") == today for o in ORDERS):
-            st.update(day=today, done=True)
-            return False
-    if ist_now().time() < dtime(9, 20, 10):
-        return False   # the first candle has not closed yet
-    df = nifty_frame()
-    if df is None:
-        return False   # try again on the next tick
-    side, prev, first, why = nifty_inputs(df, ist_now().date())
-    if first is None and why and ("not available" in why or ("missing" in why and ist_now().time() < dtime(9, 30))):
-        return False   # the data provider is a little late, so look again shortly
-    if why:
-        st.update(day=today, done=True, why=why)
-        bot_log(u["id"], f"NIFTY: no trade today, {why}.", bot="nifty")
-        return False
-    plan, why = nifty_plan(side, prev, first)
-    if not plan:
-        st.update(day=today, done=True, why=why)
-        bot_log(u["id"], f"NIFTY: no trade today, {why}.", bot="nifty")
-        return False
-    c = {"symbol": "NIFTY", "side": plan["side"], "px": plan["entry"], "levels": {"sl": plan["sl"], "tp1": plan["tp1"], "tp2": plan["tp2"]},
-         "note": f"gap {plan['gap']:+.2f}% with yesterday's {plan['side']} signal open; stop at {plan['sl_name']}, target pivot {plan['target_name']}, reward/risk {plan['rr']:.1f}"}
-    r = bot_buy(u, cfg, c, "live" if cfg["mode"] == "live" else "paper", strategy="nifty", skip_expiry_day=True, etype="gap")
-    if r == "skip":
-        return False   # chain or price missing: try again for the rest of the window
-    st.update(day=today, done=True, why="Traded.")
-    return r != "changed"
-
-
-NIFTY_FRESH_MAX_AGE = int(os.getenv("NIFTY_FRESH_MAX_AGE", "1"))   # a fresh signal is used only while it is at most this many candles old
-STOCK_GAP_STATE = {}   # user id -> {"day": date string, "cands": [...], "done": True}
-
-
-def nifty_fresh(u, cfg):
-    """A fresh NIFTY 5 min signal (the indicator's own entry and levels) during the day: buy a CE or PE once per signal."""
-    now = ist_now()
-    st = NIFTY_STATE.setdefault(u["id"], {})
-    if now.time() < dtime(9, 20, 10):
-        return False
-    row = next((r for r in STATES["5m"]["rows"] if r.get("symbol") == "NIFTY"), None)
-    if not row or row.get("signal") not in ("BUY", "SELL") or row.get("bars_ago") is None or row["bars_ago"] > NIFTY_FRESH_MAX_AGE or not row.get("sl") or not row.get("tp1"):
-        return False
-    key = f"{now.strftime('%Y-%m-%d')} {row.get('signal_time')} {row['signal']}"
-    if st.get("fresh_seen") == key:
-        return False
-    st["fresh_seen"] = key   # one look at each signal, whether or not it ends in a trade
-    px, side = float(row["close"]), row["signal"]
-    lv = {"sl": row["sl"], "tp1": row["tp1"], "tp2": row["tp2"]}
-    if (side == "BUY" and not (lv["sl"] < px < lv["tp1"])) or (side == "SELL" and not (lv["tp1"] < px < lv["sl"])):
-        bot_log(u["id"], f"NIFTY fresh {side}: price already past the first target or the stop, skipped.", bot="nifty")
-        return False
-    it = INTERNAL.get(("NIFTY", "5m"))
-    if it and it.get("ema") and ((side == "BUY" and px < it["ema"]) or (side == "SELL" and px > it["ema"])):
-        bot_log(u["id"], f"NIFTY fresh {side}: price is on the wrong side of the 20 EMA, skipped.", bot="nifty")
-        return False
-    cf = (add_conf([row], "5m")[0].get("conf") or {})
-    if not grade_ok(cfg, cf.get("g")):
-        bot_log(u["id"], f"NIFTY fresh {side}: grade {cf.get('g') or 'none'} is below your minimum ({cfg.get('min_grade')}), skipped.", bot="nifty")
-        return False
-    c = {"symbol": "NIFTY", "side": side, "px": px, "levels": lv, "note": f"fresh 5 min {side} signal at {row.get('signal_time')}" + (f", grade {cf['g']} ({cf['s']})" if cf.get("g") else "")}
-    r = bot_buy(u, cfg, c, "live" if cfg["mode"] == "live" else "paper", strategy="nifty", skip_expiry_day=True, etype="fresh")
-    if r == "skip":
-        st.pop("fresh_seen", None)   # chain or price missing: look again next tick while the signal is fresh
-        return False
-    return r != "changed"
-
-
-STOCK_GAP_MAX = float(os.getenv("STOCK_GAP_MAX", str(OPTBOT_MAX_CHG)))
-
-
-def stock_frames(symbols):
-    out = {}
-    if use_dhan():
-        return dhan_frames(list(symbols), "5m", 7)[0]
-    import yfinance as yf
-    tk = [yf_ticker(s) for s in symbols]
-    df = yf.download(" ".join(tk), period="7d", interval="5m", auto_adjust=False, progress=False, group_by="ticker", threads=True)
-    if df is None or df.empty:
-        return out
-    for s, t in zip(symbols, tk):
-        try:
-            d = df[t] if getattr(df.columns, "nlevels", 1) > 1 else df
-            d = d.dropna(subset=["Close", "High", "Low", "Open"]).copy()
-            if d.empty:
-                continue
-            d.index = d.index.tz_localize("UTC").tz_convert(IST) if d.index.tz is None else d.index.tz_convert(IST)
-            out[s] = d
-        except Exception:
-            continue
-    return out
-
-
-def stock_gap_enter(u, cfg):
-    """Continuation for scanner stocks: from 9:20 to 9:45, a stock whose 5 min signal from yesterday is still open and which gapped the same way
-    (and whose first candle confirmed it) is bought as a CE or PE. Target is the next pivot level. At most one purchase a tick."""
-    now = ist_now()
-    today = now.strftime("%Y-%m-%d")
-    st = STOCK_GAP_STATE.setdefault(u["id"], {})
-    if st.get("day") != today:
-        st.clear()
-        st["day"] = today
-    if now.time() > NIFTY_LAST_ENTRY or now.time() < dtime(9, 20, 10):
-        return False
-    mode = "live" if cfg["mode"] == "live" else "paper"
-    if "cands" not in st and not st.get("done"):
-        d = api_scanner("5m", 0)
-        syms = [r["symbol"] for r in (d.get("rows", []) if isinstance(d, dict) else []) if r.get("symbol")]
-        if not syms:
-            return False
-        frames = stock_frames(syms)
-        if not frames:
-            return False   # data late: try again next tick
-        cands, whys = [], []
-        for sym, df in frames.items():
-            side, prev, first, why = nifty_inputs(df, now.date(), sym)
-            if first is None and why:
-                whys.append(f"{sym}: {why}")
-                continue
-            plan, why = nifty_plan(side, prev, first, {"gap_max": STOCK_GAP_MAX, "min_tgt": 0.3, "min_sl": 0.2})
-            if not plan:
-                whys.append(f"{sym}: {why}")
-                continue
-            cands.append({"symbol": sym, "side": plan["side"], "px": plan["entry"], "rr": plan["rr"],
-                          "levels": {"sl": plan["sl"], "tp1": plan["tp1"], "tp2": plan["tp2"]},
-                          "note": f"gap {plan['gap']:+.2f}% with yesterday's {plan['side']} signal open; stop at {plan['sl_name']}, target pivot {plan['target_name']}, reward/risk {plan['rr']:.1f}"})
-        cands.sort(key=lambda c: -c["rr"])
-        st["cands"] = cands
-        bot_log(u["id"], f"Stock gap continuation: {len(cands)} of {len(frames)} stocks qualify." + (f" Skipped: {'; '.join(whys[:3])}." if whys else ""), bot="scanner")
-    while st.get("cands"):
-        c = st["cands"].pop(0)
-        with ORDER_LOCK:
-            traded = any(o.get("user") == u["id"] and o.get("bot") and o["symbol"] == c["symbol"] and o.get("date") == today for o in ORDERS)
-        if traded or OPTBOT_SKIP.get((u["id"], c["symbol"]), 0) > time.time():
-            continue
-        r = bot_buy(u, cfg, c, mode, strategy="scanner", etype="gap")
-        if r == "skip":
-            continue
-        return r != "changed"
-    st["done"] = True
-    return False
-
-
 def bot_exit(u, pos, reason):
     if pos.get("bot_state") != "open" or pos["status"] in ("rejected", "cancelled", "expired", "unknown"):
         pos["bot_state"] = "closed"
@@ -3181,7 +3080,7 @@ def bot_exit(u, pos, reason):
         return
     limit = round(round(ltp * 0.99 / 0.05) * 0.05, 2)
     exit_o = {**pos, "side": "SELL", "order_type": "LIMIT", "price": limit, "ref": ltp, "key": None, "sl": None, "risk": None, "auto_sl": False, "trail": False}
-    for k in ("bot", "bot_state", "bot_dir", "bot_sl", "bot_t1", "bot_t2", "bot_entry_under", "bot_t1_done", "bot_exit_px", "bot_reason", "bot_warned", "bot_right", "bot_strike", "bot_expiry", "bot_p0", "bot_delta", "bot_p_sl", "bot_p_t1", "bot_p_t2", "bot_entry_under", "avg_price", "filled", "status", "id", "time", "date", "t"):
+    for k in [k for k in exit_o if k.startswith("bot")] + ["avg_price", "filled", "status", "id", "time", "date", "t"]:
         exit_o.pop(k, None)
     pos["bot_state"] = "closing"   # recorded first so a crash mid-call is never followed by a second sell
     append_log(pos)
@@ -3204,27 +3103,35 @@ def bot_exit(u, pos, reason):
 
 
 def bot_manage(u, pos):
+    """Follow the indicator's levels on the stock or index itself: stop-loss first, then T1 to T4 with the stop moving up behind them."""
     n = ist_now().time()
+    kind = bot_kind(pos.get("bot_strategy"))
     if n >= OPTBOT_SQUAREOFF:
         return bot_exit(u, pos, "end of day")
     row, _ = row_for(pos["symbol"], "5m")
-    if row:  # backstop: the stock itself went through the signal's stop-loss
+    up = pos["bot_dir"] == "BUY"
+    if row:
         px = live_price(row)
-        up = pos["bot_dir"] == "BUY"
-        if (up and px <= pos["bot_sl"]) or (not up and px >= pos["bot_sl"]):
-            return bot_exit(u, pos, "stock hit the signal stop-loss")
+        lv = [pos[k] for k in ("bot_t1", "bot_t2", "bot_t3", "bot_t4") if pos.get(k)]
+        step = pos.get("bot_step", 1 if pos.get("bot_t1_done") else 0)
+        stop = pos.get("bot_stop") or pos["bot_sl"]
+        if (up and px <= stop) or (not up and px >= stop):
+            return bot_exit(u, pos, "stock hit the signal stop-loss" if step == 0 else f"price came back to the stop after T{step}")
+        moved = False
+        while step < len(lv) and ((up and px >= lv[step]) or (not up and px <= lv[step])):
+            step += 1
+            moved = True
+        if moved:
+            entry = pos["bot_entry_under"]
+            stop = entry if step == 1 else lv[step - 2]
+            pos.update(bot_step=step, bot_stop=stop, bot_t1_done=True)
+            append_log(pos)
+            bot_log(u["id"], f"{pos['label']}: T{step} reached ({px:.2f}), stop moved to {stop:.2f}" + (" (the entry)." if step == 1 else f" (T{step - 1})."), bot=kind)
+            if step >= len(lv):
+                return bot_exit(u, pos, f"T{step} reached, all targets done")
     ltp = bot_opt_ltp(u, pos)
-    if not ltp:
-        return
-    if ltp <= pos["bot_p_sl"]:
-        return bot_exit(u, pos, "option stop-loss" if not pos["bot_t1_done"] else "back to entry price after T1")
-    if ltp >= pos["bot_p_t2"]:
-        return bot_exit(u, pos, "option target T2 reached")
-    if not pos["bot_t1_done"] and ltp >= pos["bot_p_t1"]:
-        pos["bot_t1_done"] = True
-        pos["bot_p_sl"] = max(pos["bot_p_sl"], pos["bot_p0"])
-        append_log(pos)
-        bot_log(u["id"], f"{pos['label']}: T1 reached at {ltp:.2f}, option stop moved to the entry price {pos['bot_p0']:.2f}.", bot=bot_kind(pos.get("bot_strategy")))
+    if ltp and ltp <= pos["bot_p_sl"]:
+        return bot_exit(u, pos, "option safety stop")
 
 
 def optbot_once():
@@ -3264,18 +3171,7 @@ def optbot_once():
                     notify_user(uid, "Autopilot stopped: loss limit", f"The daily loss limit of {cfg['loss_limit']:.0f} was reached.")
                     continue
                 cfg["last_scan"] = now_t.strftime("%H:%M:%S")
-                ent = cfg.get("entries", "both")
-                room = lambda: len(bot_positions(uid, open_only=False, kind=kind)) < cfg["max_trades"] and len(bot_positions(uid, kind=kind)) < 2
-                if kind == "nifty":
-                    if ent in ("both", "gap"):
-                        nifty_enter(u, cfg)
-                    if ent in ("both", "fresh") and room():
-                        nifty_fresh(u, cfg)
-                else:
-                    if ent in ("both", "gap"):
-                        stock_gap_enter(u, cfg)
-                    if ent in ("both", "fresh") and room():
-                        bot_enter(u, cfg)
+                auto_enter(u, cfg, kind)
             except Exception as e:
                 bot_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}", bot=kind)
 
@@ -5510,6 +5406,7 @@ def cap_classes():
 
 # Intraday focus: rank by traded value (what NSE's most-active page sorts by) and skip cheap shares. Raw volume is dominated by low-priced
 # stocks such as IDEA, YESBANK and SUZLON, which are hard to trade as futures or options. Both can be changed with environment variables.
+SCANNER_INDICES = [x.strip().upper() for x in os.getenv("SCANNER_INDICES", "NIFTY,SENSEX").split(",") if x.strip()]   # indices shown at the top of the scanner
 SCANNER_RANK = os.getenv("SCANNER_RANK", "value").strip().lower()
 SCANNER_RANK = SCANNER_RANK if SCANNER_RANK in ("value", "volume") else "value"
 SCANNER_MIN_PRICE = float(os.getenv("SCANNER_MIN_PRICE", "150") or 0)
@@ -5545,8 +5442,15 @@ def api_scanner(tf: str = "15m", only: int = 0):
     by, n = SCANNER_RANK, SCANNER_TOP
     ensure_fresh(tf)
     with LOCK:
-        rows = [r for r in apply_live(list(STATES[tf]["rows"])) if r.get("type") != "index"]
-    rows = add_conf(rows, tf)
+        all_rows = apply_live(list(STATES[tf]["rows"]))
+    rows = add_conf([r for r in all_rows if r.get("type") != "index"], tf)
+    sec = {}
+    for r in rows:   # how each sector is doing today: the average day change of its stocks
+        c_ = r.get("ltp_chg", r.get("chg"))
+        if c_ is not None:
+            sec.setdefault(r.get("sector"), []).append(c_)
+    sec_chg = {k: round(sum(v) / len(v), 2) for k, v in sec.items() if v}
+    idx_rows = add_conf([r for r in all_rows if r.get("symbol") in SCANNER_INDICES], tf)
     with LOCK:
         upd, busy = STATES[tf]["updated"], STATES[tf]["refreshing"] or not STATES[tf]["updated"]
     by_sym = {r["symbol"]: r for r in rows}
@@ -5573,16 +5477,25 @@ def api_scanner(tf: str = "15m", only: int = 0):
         key = "val_cr" if by == "value" else "vol"
         ranked = [r["symbol"] for r in sorted((r for r in rows if r.get(key) and allowed(r["symbol"])), key=lambda r: -r[key])]
     out = []
+
+    def item(r, rank, is_index=False):
+        return {"rank": rank, "symbol": r["symbol"], "cap": None if is_index else (caps or {}).get(r["symbol"]), "index": is_index,
+                "sector": "Index" if is_index else r.get("sector"), "sector_chg": None if is_index else sec_chg.get(r.get("sector")),
+                "price": r.get("ltp", r["close"]), "chg": r.get("ltp_chg", r.get("chg")), "vol": None if is_index else r.get("vol"),
+                "val_cr": None if is_index else r.get("val_cr"), "signal": r["signal"], "status": r["status"],
+                "signal_time": r["signal_time"], "bars_ago": r["bars_ago"], "side": r.get("side"), "conf": r.get("conf"),
+                "levels": {k: r[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")} if r.get("entry") is not None else None}
+    for r in sorted(idx_rows, key=lambda r: SCANNER_INDICES.index(r["symbol"])):   # the indices come first, unranked
+        if not (only and r["signal"] == "–"):
+            out.append(item(r, None, True))
+    stocks = 0
     for sym in ranked:
         r = by_sym[sym]
-        sg = r["signal"]
-        if only and sg == "–":
+        if only and r["signal"] == "–":
             continue
-        out.append({"rank": len(out) + 1, "symbol": sym, "cap": (caps or {}).get(sym), "sector": r.get("sector"), "price": r.get("ltp", r["close"]),
-                    "chg": r.get("ltp_chg", r.get("chg")), "vol": r.get("vol"), "val_cr": r.get("val_cr"), "signal": sg, "status": r["status"],
-                    "signal_time": r["signal_time"], "bars_ago": r["bars_ago"], "side": r.get("side"), "conf": r.get("conf"),
-                    "levels": {k: r[k] for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4")} if r.get("entry") is not None else None})
-        if len(out) >= n:
+        stocks += 1
+        out.append(item(r, stocks))
+        if stocks >= n:
             break
     return {"tf": tf, "by": by, "source": source, "cap_source": "nse" if caps is not None else "approx", "rows": out, "skipped": skipped, "top": n, "cheap": len(set(cheap)), "min_price": SCANNER_MIN_PRICE, "rank": by, "scanning": busy, "updated": upd,
             "note": (f"Today's ten most active large-cap and mid-cap F&O stocks by traded {by}, from NSE's most active list. Large cap = NIFTY 100, mid cap = NIFTY MIDCAP 150. Stocks priced under ₹{SCANNER_MIN_PRICE:g} are left out. Only F&O stocks are shown, because those are the ones that can be traded as futures or options."
@@ -5761,10 +5674,9 @@ def bot_view(u, kind="scanner"):
     pnl = round(sum(t["pnl"] or 0 for t in trades), 2)
     why = live_blocker(u) or ("Switch your account to Live with the toggle at the top first." if user_mode(u)[0] != "live" else None)
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
-    return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "nifty_note": (NIFTY_STATE.get(u["id"]) or {}).get("why") if (NIFTY_STATE.get(u["id"]) or {}).get("day") == today else None, "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
+    return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
-            "rules": ((NIFTY_RULES + " Also buys on a fresh 5 min NIFTY signal during the day, once per signal, using the signal's own stop and targets.") if kind == "nifty" else "Gap continuation (9:20 to 9:45): a stock whose 5 min signal from yesterday is still open and which gapped the same way is bought, target the next pivot. Otherwise, ") + ("" if kind == "nifty" else f"Buys at the money options on the scanner's top stocks from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}. Day change 0 to {OPTBOT_MAX_CHG:g}% buys a CE, 0 to -{OPTBOT_MAX_CHG:g}% buys a PE, "
-                     f"with the 5 min signal in the same direction and price nearest its 20 EMA. The stock's stop-loss and targets are converted to option prices using the option's delta: sell at the option stop (never worse than -{OPTBOT_MAX_LOSS_PCT:g}%) or at T2, stop moves to the price paid at T1, all closed by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."),
+            "rules": AUTO_RULES + (" Trades NIFTY only." if kind == "nifty" else " Trades the scanner's stocks.") + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, a continuation needs the price within {OPTBOT_NEAR_ATR:g} ATR of its 20 EMA, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
 
 
@@ -5792,7 +5704,7 @@ def bot_apply(u, payload, mode, kind="scanner"):
         cfg["armed_day"] = ist_now().strftime("%Y-%m-%d")
     ent = payload.get("entries", cfg.get("entries", "both"))
     if ent not in ("both", "fresh", "gap"):
-        return "Choose both entry types, fresh signals only, or gap continuation only."
+        return "Choose both entry types, fresh signals only, or continuation only."
     mg = payload.get("min_grade", cfg.get("min_grade", "any"))
     if mg not in GRADE_NEED:
         return "Choose any grade, B or better, or A only."
@@ -5838,7 +5750,7 @@ def api_optbot_control(request: Request, payload: dict = Body(...)):
         if err:
             return {"error": err}
         cfg.update(mode=mode, paused=False, last_mode=mode)
-        bot_log(u["id"], f"Play: {'NIFTY gap continuation' if kind == 'nifty' else 'scanner stocks'} autopilot running in {mode.upper()} mode.", bot=kind)
+        bot_log(u["id"], f"Play: {'NIFTY' if kind == 'nifty' else 'scanner stocks'} autopilot running in {mode.upper()} mode.", bot=kind)
     elif action == "pause":
         if cfg["mode"] == "off":
             return {"error": "The autopilot is not running."}
@@ -6697,7 +6609,7 @@ dialog::backdrop{background:rgba(14,10,40,.6);backdrop-filter:blur(3px)}
 .ixhist{margin-top:12px;padding:10px 14px;background:var(--panel)}.ixhh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .ixhist table.gt td,.ixhist table.gt th{text-align:right}.ixhist table.gt td:first-child,.ixhist table.gt th:first-child,.ixhist table.gt td:nth-child(2),.ixhist table.gt th:nth-child(2){text-align:left}
 .scttl{font-size:16px}
-#scTable td,#scTable th{text-align:left}#scTable td:nth-child(n+7),#scTable th:nth-child(n+7){text-align:right}
+#scTable td,#scTable th{text-align:left}#scTable td:nth-child(n+8),#scTable th:nth-child(n+8){text-align:right}#scTable th.srt{cursor:pointer;user-select:none;white-space:nowrap}#scTable th.srt:hover{color:var(--acc)}#scTable th .ar{font-size:10px;margin-left:3px;opacity:.9}
 .ogrid.ix{grid-template-columns:minmax(0,1fr)}.ogrid.ix .olist{display:none}
 @media(prefers-reduced-motion:reduce){.ixc.fresh{animation:none!important}}
 /* signal flashing */
@@ -7145,20 +7057,29 @@ async function scLoad(){clearTimeout(scTimer);if(mode!=="scanner")return;const m
  try{const d=await (await api(`/api/scanner?tf=${scTf}&only=${$("scOnly").checked?1:0}`)).json();if(my!==scTf)return;scData=d;scRender()}
  catch(e){$("scMeta").textContent="Cannot reach the server."}
  scTimer=setTimeout(scLoad,scData&&scData.scanning?3000:20000)}
+let scSort={k:null,d:1};try{const q=JSON.parse(localStorage.getItem("scSort")||"null");if(q&&q.k)scSort=q}catch(e){}
+const SC_COLS=[["#","rank"],["Symbol","symbol"],["Signal","signal"],["Status","status"],["Signal candle","age"],["",null],["Sector","sector"],["Sector %","sector_chg"],["Price","price"],["Day %","chg"],["Volume","vol"],["Value ₹ Cr","val_cr"],["Entry","entry"],["SL","sl"],["T1","tp1"],["T2","tp2"],["T3","tp3"],["T4","tp4"]];
+const SC_TEXT=["symbol","status","sector","rank","age","signal"];
+function scVal(r,k){if(k==="rank")return r.rank==null?-1:r.rank;if(k==="age")return r.bars_ago;
+ if(k==="signal")return r.signal==="–"?null:(r.signal.startsWith("Open")?1000:0)-((r.conf&&r.conf.s)||0);
+ if(["entry","sl","tp1","tp2","tp3","tp4"].includes(k))return r.levels?r.levels[k]:null;return r[k]===undefined?null:r[k]}
+function scSorted(rows){if(!scSort.k)return rows;const k=scSort.k,d=scSort.d;
+ return rows.map((r,i)=>[r,i]).sort((a,b)=>{const x=scVal(a[0],k),y=scVal(b[0],k);if(x==null&&y==null)return a[1]-b[1];if(x==null)return 1;if(y==null)return -1;
+  const c=typeof x==="string"?x.localeCompare(y):x-y;return c?c*d:a[1]-b[1]}).map(x=>x[0])}
 function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=`<tbody><tr><td class="empty">${d?esc(d.error):""}</td></tr></tbody>`;return}
  $("scMeta").textContent=(d.source==="nse"?"NSE most active":"Computed from candle data")+(d.updated?` · candles updated ${d.updated}`:"")+(d.scanning?" · scanning…":"");
- const cols=["#","Symbol","Signal","Status","Signal candle","","Price","Day %","Volume","Value ₹ Cr","Entry","SL","T1","T2","T3","T4"];
- $("scTtl").textContent=`Top ${d.top||15} by traded ${d.rank||"value"} today · large and mid caps · price ₹${d.min_price||0}+`;
- const head="<thead><tr>"+cols.map(c=>`<th>${c}</th>`).join("")+"</tr></thead>";
- if(!d.rows.length){tb.innerHTML=head+`<tbody><tr><td colspan="${cols.length}" class="empty">${d.scanning?"First scan is running. This page updates on its own.":"Nothing matches."}</td></tr></tbody>`;return}
- tb.innerHTML=head+"<tbody>"+d.rows.filter(r=>!$("scConf").checked||(r.conf&&r.conf.g==="A")).map(r=>{const L=r.levels,fr=r.signal==="BUY"||r.signal==="SELL",lv=(k,i)=>L?`<td class="${r.status&&r.status.startsWith("T")&&+r.status[1]>i?"up":""}">${f2(L[k])}</td>`:"<td>–</td>";
+ $("scTtl").textContent=`NIFTY, SENSEX and the top ${d.top||15} stocks by traded ${d.rank||"value"} today · large and mid caps · price ₹${d.min_price||0}+`;
+ const head="<thead><tr>"+SC_COLS.map(([n,k])=>k?`<th class="srt" data-k="${k}" aria-sort="${scSort.k===k?(scSort.d>0?"ascending":"descending"):"none"}" title="Sort by ${esc(n)}">${n}<span class="ar">${scSort.k===k?(scSort.d>0?"▲":"▼"):""}</span></th>`:`<th>${n}</th>`).join("")+"</tr></thead>";
+ if(!d.rows.length){tb.innerHTML=head+`<tbody><tr><td colspan="${SC_COLS.length}" class="empty">${d.scanning?"First scan is running. This page updates on its own.":"Nothing matches."}</td></tr></tbody>`;return}
+ tb.innerHTML=head+"<tbody>"+scSorted(d.rows.filter(r=>!$("scConf").checked||(r.conf&&r.conf.g==="A"))).map(r=>{const L=r.levels,fr=r.signal==="BUY"||r.signal==="SELL",lv=(k,i)=>L?`<td class="${r.status&&r.status.startsWith("T")&&+r.status[1]>i?"up":""}">${f2(L[k])}</td>`:"<td>–</td>";
   const c=r.chg==null?"<td>–</td>":`<td class="${r.chg>=0?"up":"dn"}">${r.chg>0?"+":""}${r.chg.toFixed(2)}%</td>`;
+  const sc=r.sector_chg==null?"<td>–</td>":`<td class="${r.sector_chg>=0?"up":"dn"}">${r.sector_chg>0?"+":""}${r.sector_chg.toFixed(2)}%</td>`;
   const side=r.signal.endsWith("SELL")?"SELL":"BUY",has=r.signal!=="–"&&L;
-  return `<tr${fr?` class="fresh ${r.signal==="BUY"?"buy":"sell"}"`:""}><td>${r.rank}</td><td><b>${esc(r.symbol)}</b>${r.cap?`<span class="tag">${r.cap}</span>`:""}${fr?'<span class="newb">NEW</span>':""}</td>
+  return `<tr${fr?` class="fresh ${r.signal==="BUY"?"buy":"sell"}"`:""}><td>${r.rank==null?"–":r.rank}</td><td><b>${esc(r.symbol)}</b>${r.index?'<span class="tag">Index</span>':r.cap?`<span class="tag">${r.cap}</span>`:""}${fr?'<span class="newb">NEW</span>':""}</td>
    <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span>${confBadge(r)}</td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
-   <td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
-let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: scanner stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY gap continuation"}};
+   <td>${esc(r.sector||"–")}</td>${sc}<td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
+let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: scanner stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY"}};
 window.botD={};
 function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="ixrow"><b>${t}</b><span class="sub" id="${p}State"></span></div>
@@ -7166,7 +7087,7 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="botrow">
   <label>Mode<select id="${p}Mode"><option value="paper">Paper</option><option value="live">Live</option></select></label>
   <label>Only trade grade<select id="${p}Grade"><option value="any">Any (A, B or C)</option><option value="B">B or better</option><option value="A">A only</option></select></label>
-  <label>Entries<select id="${p}Ent"><option value="both">Fresh + continuation</option><option value="fresh">Fresh signals only</option><option value="gap">Gap continuation only</option></select></label>
+  <label>Entries<select id="${p}Ent"><option value="both">Fresh + continuation</option><option value="fresh">Fresh 5/15 min signals only</option><option value="gap">Continuation only (yesterday's signal near the 20 EMA)</option></select></label>
   <label>Trades a day<input id="${p}Max" type="number" min="1" max="10" step="1"></label>
   <label>Lots each<input id="${p}Lots" type="number" min="1" step="1"></label>
   <label>Stop for the day at a loss of ₹<input id="${p}Loss" type="number" min="0" step="500"></label>
@@ -7185,7 +7106,7 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
 async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
  for(const p in BOTS){try{const d=await (await api("/api/optbot?bot="+BOTS[p].kind)).json();window.botD[p]=d;
   if(document.activeElement&&[p+"Mode",p+"Ent",p+"Grade",p+"Max",p+"Lots",p+"Loss"].includes(document.activeElement.id)){}else{$(p+"Mode").value=d.mode==="off"?d.choice:d.mode;$(p+"Ent").value=d.entries;$(p+"Grade").value=d.min_grade;$(p+"Max").value=d.max_trades;$(p+"Lots").value=d.lots;$(p+"Loss").value=d.loss_limit}
-  $(p+"Rules").textContent=d.rules+(d.strategy==="nifty"&&d.nifty_note?` Today: ${d.nifty_note}`:"");
+  $(p+"Rules").textContent=d.rules;
   $(p+"State").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
   const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";
   $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
@@ -7256,7 +7177,8 @@ function initBacktest(){$("btRun").onclick=btRun;
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
  $("scOnly").onchange=()=>{scLoad()};$("scConf").onchange=()=>{scRender()};
- $("scTable").onclick=e=>{const b=e.target.closest("[data-sc]");if(!b)return;const sy=b.dataset.s;
+ $("scTable").onclick=e=>{const th=e.target.closest("th[data-k]");if(th){const k=th.dataset.k;scSort=scSort.k===k?{k,d:-scSort.d}:{k,d:SC_TEXT.includes(k)?1:-1};try{localStorage.setItem("scSort",JSON.stringify(scSort))}catch(x){}scRender();return}
+  const b=e.target.closest("[data-sc]");if(!b)return;const sy=b.dataset.s;
   if(b.dataset.sc==="chart")openChart(sy,scTf);
   else if(b.dataset.sc==="fut")openTicket({kind:"future",symbol:sy,label:sy+" futures, nearest month",side:b.dataset.side,price:+b.dataset.p,tf:scTf});
   else{optOverride=scTf;osym=sy;oexp="";setMode("options");loadChain()}}}
