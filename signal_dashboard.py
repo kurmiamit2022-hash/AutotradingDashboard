@@ -5331,6 +5331,24 @@ def dhan_option_candles(symbol, expiry, strike, right, minutes, days):
             for t, r in df.iterrows()]
 
 
+def dhan_underlying_candles(symbol, minutes, days):
+    """Candles of the option's parent stock or index from Dhan, in the same shape and for the same days as the option candles."""
+    inst = dhan_inst(symbol)
+    if not inst:
+        raise DhanDataError(f"{symbol} is not in Dhan's instrument list")
+    sid, seg, kind = inst
+    end = ist_now().date() + timedelta(days=1)
+    res = dhan_post("/charts/intraday", {"securityId": sid, "exchangeSegment": seg, "instrument": kind, "interval": minutes, "oi": False,
+                                         "fromDate": f"{(end - timedelta(days=7)).isoformat()} 00:00:00", "toDate": f"{end.isoformat()} 00:00:00"})
+    df = dhan_to_df(res, False)
+    if df is None or df.empty:
+        return []
+    keep = sorted({t.date() for t in df.index})[-days:]
+    df = df[[t.date() in keep for t in df.index]]
+    return [{"t": int(t.timestamp()), "lbl": t.strftime("%H:%M"), "d": t.strftime("%d %b"), "o": float(r.Open), "h": float(r.High), "l": float(r.Low), "c": float(r.Close), "v": int(r.Volume or 0)}
+            for t, r in df.iterrows()]
+
+
 @app.get("/api/options/history")
 def api_option_history(request: Request, symbol: str, expiry: str, strike: float, tf: str = "5m", days: int = 1):
     """Price history of the call and the put of one strike, from Dhan's intraday data."""
@@ -5360,6 +5378,17 @@ def api_option_history(request: Request, symbol: str, expiry: str, strike: float
             return {"error": f"Could not read the price history ({type(e).__name__}: {str(e)[:100]})."}
         OPT_HIST[key] = (time.time(), rows)
         out[side.lower()] = rows
+    ukey = (symbol, "UND", 0.0, "", minutes, days)   # the parent script, on the same candle size and days, for a like-for-like comparison
+    hit = OPT_HIST.get(ukey)
+    if hit and time.time() - hit[0] < 20:
+        out["und"] = hit[1]
+    else:
+        try:
+            out["und"] = dhan_underlying_candles(symbol, minutes, days)
+            OPT_HIST[ukey] = (time.time(), out["und"])
+        except Exception as e:
+            out["und"] = []
+            out["und_error"] = f"The {symbol} chart could not be loaded ({str(e)[:90]})."
     if not out["ce"] and not out["pe"]:
         out["error"] = "Dhan returned no candles for these contracts. They may not have traded yet, or the Data API is not subscribed."
     return out
@@ -7472,10 +7501,10 @@ async function ogLoad(){const my=++oreq2;$("ogMsg").textContent="Loading prices�
  try{const d=await (await api(`/api/options/history?symbol=${encodeURIComponent(lastChain.symbol)}&expiry=${encodeURIComponent(lastChain.expiry)}&strike=${og.k}&tf=${og.tf}&days=${og.days}`)).json();if(my!==oreq2)return;
   if(d.error){$("ogMsg").textContent=d.error;return}$("ogMsg").textContent="";og.data=d;ogDraw()}catch(e){if(my===oreq2)$("ogMsg").textContent="Cannot reach the server."}}
 let oreq2=0;
-function ogDraw(){const d=og.data;if(!d)return;const sides=og.view==="both"?["ce","pe"]:[og.view],col={ce:"#ff9f43",pe:"#35c9ff"};
+function ogDraw(){const d=og.data;if(!d)return;og.und=null;const sides=og.view==="both"?["ce","pe"]:[og.view],col={ce:"#ff9f43",pe:"#35c9ff"};
  const maps={};for(const s of ["ce","pe"]){maps[s]=new Map((d[s]||[]).map(c=>[c.t,c]))}
  const tl=[...new Set(sides.flatMap(s=>(d[s]||[]).map(c=>c.t)))].sort((a,b)=>a-b),n=tl.length;if(!n){$("ogMsg").textContent="No candles for this side.";return}
- const W=Math.max($("ogSvg").clientWidth||700,Math.min(2400,n*(og.view==="both"?5:7)+70)),H=sides.length===1?330:290,pl=52,pr=10,pt=10,pb=26,vh=sides.length===1?60:0,ph=H-pt-pb-vh;
+ const U=d.und&&d.und.length?d.und:null,uh=U?170:0,W=Math.max($("ogSvg").clientWidth||700,Math.min(2400,n*(og.view==="both"?5:7)+70)),H0=sides.length===1?330:290,H=H0+uh,pl=64,pr=10,pt=10,pb=26,vh=sides.length===1?60:0,ph=H0-pt-pb-vh;
  const vals=sides.flatMap(s=>(d[s]||[]).flatMap(c=>og.view==="both"?[c.c]:[c.h,c.l])),mx=Math.max(...vals),mn=Math.min(...vals),pad=(mx-mn)*.06||1,hi=mx+pad,lo=Math.max(0,mn-pad);
  const y=v=>pt+(hi-v)/(hi-lo)*ph,step=(W-pl-pr)/n,x=i=>pl+(i+.5)*step;
  const tk=(()=>{const raw=(hi-lo)/5,p=Math.pow(10,Math.floor(Math.log10(raw||1))),m=raw/p;return (m<=1?1:m<=2?2:m<=5?5:10)*p})();
@@ -7488,16 +7517,24 @@ function ogDraw(){const d=og.data;if(!d)return;const sides=og.view==="both"?["ce
  else{const s=sides[0],vmax=Math.max(1,...(d[s]||[]).map(c=>c.v)),bw=Math.max(1,Math.min(14,step*.7));
   tl.forEach((t,i)=>{const c=maps[s].get(t);if(!c)return;const up=c.c>=c.o,cl=up?"var(--buy)":"var(--sell)",top=y(Math.max(c.o,c.c)),bh=Math.max(1,Math.abs(y(c.o)-y(c.c)));
    body+=`<line x1="${x(i)}" x2="${x(i)}" y1="${y(c.h)}" y2="${y(c.l)}" stroke="${cl}"/><rect x="${x(i)-bw/2}" y="${top}" width="${bw}" height="${bh}" fill="${cl}"/>`
-   +`<rect x="${x(i)-bw/2}" y="${H-pb-c.v/vmax*(vh-8)}" width="${bw}" height="${c.v/vmax*(vh-8)}" fill="${col[s]}" opacity=".45"/>`})}
- $("ogSvg").innerHTML=`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(d.symbol)} ${d.strike} price chart">${g}${body}${xl}<line class="xh" id="ogx" x1="0" x2="0" y1="${pt}" y2="${H-pb}" visibility="hidden"/></svg>`;
+   +`<rect x="${x(i)-bw/2}" y="${H0-pb-c.v/vmax*(vh-8)}" width="${bw}" height="${c.v/vmax*(vh-8)}" fill="${col[s]}" opacity=".45"/>`})}
+ let und="";
+ if(U){const um=new Map(U.map(c=>[c.t,c])),y0=H0-pb+22,ub=H-pb-4,uhh=ub-y0,vals2=tl.map(t=>um.get(t)).filter(Boolean).flatMap(c=>[c.h,c.l]);
+  if(vals2.length){const mx2=Math.max(...vals2),mn2=Math.min(...vals2),pd2=(mx2-mn2)*.08||1,h2=mx2+pd2,l2=mn2-pd2,uy=v=>y0+(h2-v)/(h2-l2)*uhh,raw=(h2-l2)/4,pw=Math.pow(10,Math.floor(Math.log10(raw||1))),mm=raw/pw,tk2=(mm<=1?1:mm<=2?2:mm<=5?5:10)*pw,bw2=Math.max(1,Math.min(14,step*.7));
+   und+=`<text x="${pl}" y="${y0-8}" class="ugl" style="font-weight:700">${esc(d.symbol)} (parent script, same time axis)</text><line class="ax" x1="${pl}" x2="${W-pr}" y1="${y0}" y2="${y0}"/>`;
+   for(let t=Math.ceil(l2/tk2)*tk2;t<=h2;t+=tk2)und+=`<line class="ax" x1="${pl}" x2="${W-pr}" y1="${uy(t)}" y2="${uy(t)}"/><text x="${pl-5}" y="${uy(t)+3}" text-anchor="end">${f2(t)}</text>`;
+   tl.forEach((t,i)=>{const c=um.get(t);if(!c)return;const cl=c.c>=c.o?"var(--buy)":"var(--sell)";und+=`<line x1="${x(i)}" x2="${x(i)}" y1="${uy(c.h)}" y2="${uy(c.l)}" stroke="${cl}"/><rect x="${x(i)-bw2/2}" y="${uy(Math.max(c.o,c.c))}" width="${bw2}" height="${Math.max(1,Math.abs(uy(c.o)-uy(c.c)))}" fill="${cl}"/>`});
+   og.und=um}}
+ $("ogSvg").innerHTML=`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(d.symbol)} ${d.strike} price chart with the parent script">${g}${body}${und}${xl}<line class="xh" id="ogx" x1="0" x2="0" y1="${pt}" y2="${H-pb}" visibility="hidden"/></svg>`;
  og.geom={pl,step,n,tl,maps,W};
  const sm=s=>{const a=d[s]||[];if(!a.length)return `<div><b style="color:${col[s]}">${s==="ce"?"Call":"Put"}</b> no candles</div>`;const o=a[0].o,l=a[a.length-1].c,ch=(l-o)/o*100;
   return `<div><b style="color:${col[s]}">${s==="ce"?"Call (CE)":"Put (PE)"}</b> last <b>${f2(l)}</b> <span class="${ch>=0?"up":"dn"}">${ch>=0?"+":""}${ch.toFixed(1)}%</span><br>open ${f2(o)} · high ${f2(Math.max(...a.map(c=>c.h)))} · low ${f2(Math.min(...a.map(c=>c.l)))} · volume ${fk(a.reduce((q,c)=>q+c.v,0))}</div>`};
- $("ogSum").innerHTML=sm("ce")+sm("pe")}
+ const um=U?(()=>{const o=U[0].o,l=U[U.length-1].c,ch=(l-o)/o*100;return `<div><b>${esc(d.symbol)}</b> last <b>${f2(l)}</b> <span class="${ch>=0?"up":"dn"}">${ch>=0?"+":""}${ch.toFixed(2)}%</span><br>open ${f2(o)} · high ${f2(Math.max(...U.map(c=>c.h)))} · low ${f2(Math.min(...U.map(c=>c.l)))}</div>`})():`<div class="sub">${esc(d.und_error||"No chart for the parent script.")}</div>`;
+ $("ogSum").innerHTML=(og.view==="pe"?"":sm("ce"))+(og.view==="ce"?"":sm("pe"))+um}
 function ogHover(e){const gm=og.geom,sv=$("ogSvg").querySelector("svg");if(!gm||!sv)return;const r=sv.getBoundingClientRect(),px=(e.clientX-r.left)*(gm.W/r.width),i=Math.min(gm.n-1,Math.max(0,Math.floor((px-gm.pl)/gm.step)));
  const t=gm.tl[i],ln=$("ogx");ln.setAttribute("x1",gm.pl+(i+.5)*gm.step);ln.setAttribute("x2",gm.pl+(i+.5)*gm.step);ln.setAttribute("visibility","visible");
  const c=gm.maps.ce.get(t),p=gm.maps.pe.get(t),f=(n,c)=>c?`<b style="color:${n==="CE"?"#ff9f43":"#35c9ff"}">${n}</b> O ${f2(c.o)} H ${f2(c.h)} L ${f2(c.l)} C ${f2(c.c)}`:`<b>${n}</b> –`;
- const any=c||p;$("ogTip").innerHTML=`${esc(any.d)} ${any.lbl} · `+(og.view==="pe"?"":f("CE",c))+(og.view==="both"?" · ":"")+(og.view==="ce"?"":f("PE",p))}
+ const any=c||p,uc=og.und&&og.und.get(t);$("ogTip").innerHTML=`${esc(any.d)} ${any.lbl} · `+(og.view==="pe"?"":f("CE",c))+(og.view==="both"?" · ":"")+(og.view==="ce"?"":f("PE",p))+(uc?` · <b>${esc(og.data.symbol)}</b> O ${f2(uc.o)} H ${f2(uc.h)} L ${f2(uc.l)} C ${f2(uc.c)}`:"")}
 function initChainGraph(){
  $("ogClose").onclick=()=>$("optDlg").close();
  for(const [id,key] of [["ogView","view"],["ogTf","tf"],["ogDays","days"]])$(id).onclick=e=>{const b=e.target.closest("button[data-v]");if(!b)return;og[key]=key==="days"?+b.dataset.v:b.dataset.v;try{localStorage.setItem("og",JSON.stringify({tf:og.tf,days:og.days,view:og.view}))}catch(x){}ogSeg();if(key==="view"&&og.data)ogDraw();else ogLoad()};
