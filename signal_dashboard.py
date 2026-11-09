@@ -5297,6 +5297,63 @@ def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0):
     return JSONResponse(d)
 
 
+OPT_HIST = {}   # (symbol, expiry, strike, right, minutes, days) -> (time, candles): option price history kept for a short while
+
+
+def dhan_option_candles(symbol, expiry, strike, right, minutes, days):
+    """Intraday candles of one option contract from Dhan: [{t, lbl, d, o, h, l, c, v}] for the last `days` trading days."""
+    ek = datetime.strptime(expiry, EXPIRY_FMT).strftime("%d%b%Y").upper()
+    if not load_master("dhan"):
+        raise DhanDataError("Dhan's instrument list could not be loaded")
+    inst = M("dhan")["opt"].get((symbol, ek, float(strike), right))
+    if not inst:
+        raise DhanDataError(f"{symbol} {strike:g} {right} is not in Dhan's instrument list")
+    end = ist_now().date() + timedelta(days=1)
+    res = dhan_post("/charts/intraday", {"securityId": str(inst[0]), "exchangeSegment": inst[3], "instrument": "OPTIDX" if symbol in INDICES or symbol in BSE_INDICES else "OPTSTK",
+                                         "interval": minutes, "oi": False, "fromDate": f"{(end - timedelta(days=7)).isoformat()} 00:00:00", "toDate": f"{end.isoformat()} 00:00:00"})
+    df = dhan_to_df(res, False)
+    if df is None or df.empty:
+        return []
+    keep = sorted({t.date() for t in df.index})[-days:]
+    df = df[[t.date() in keep for t in df.index]]
+    return [{"t": int(t.timestamp()), "lbl": t.strftime("%H:%M"), "d": t.strftime("%d %b"), "o": float(r.Open), "h": float(r.High), "l": float(r.Low), "c": float(r.Close), "v": int(r.Volume or 0)}
+            for t, r in df.iterrows()]
+
+
+@app.get("/api/options/history")
+def api_option_history(request: Request, symbol: str, expiry: str, strike: float, tf: str = "5m", days: int = 1):
+    """Price history of the call and the put of one strike, from Dhan's intraday data."""
+    symbol = symbol.upper().strip()
+    if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol):
+        return {"error": "Enter a valid symbol."}
+    minutes = {"1m": 1, "5m": 5, "15m": 15}.get(tf)
+    if not minutes:
+        return {"error": "Choose 1, 5 or 15 minutes."}
+    days = 3 if days >= 3 else 1
+    if DATA_BROKER != "dhan":
+        return {"error": "Option price history comes from Dhan's data feed. Set DATA_BROKER=dhan on the server."}
+    out = {"symbol": symbol, "expiry": expiry, "strike": strike, "tf": tf, "days": days}
+    for side in ("CE", "PE"):
+        key = (symbol, expiry, float(strike), side, minutes, days)
+        hit = OPT_HIST.get(key)
+        if hit and time.time() - hit[0] < 20:
+            out[side.lower()] = hit[1]
+            continue
+        try:
+            rows = dhan_option_candles(symbol, expiry, strike, side, minutes, days)
+        except DhanDataError as e:
+            return {"error": f"Dhan: {e}"}
+        except ValueError:
+            return {"error": "The expiry date is not valid."}
+        except Exception as e:
+            return {"error": f"Could not read the price history ({type(e).__name__}: {str(e)[:100]})."}
+        OPT_HIST[key] = (time.time(), rows)
+        out[side.lower()] = rows
+    if not out["ce"] and not out["pe"]:
+        out["error"] = "Dhan returned no candles for these contracts. They may not have traded yet, or the Data API is not subscribed."
+    return out
+
+
 @app.get("/api/options/chain")
 def api_chain(request: Request, symbol: str, expiry: str = "", tf: str = DEFAULT_INTERVAL):
     symbol = symbol.upper().strip()
@@ -5614,18 +5671,59 @@ def api_order_funds(request: Request, payload: dict = Body(...)):
 PF_OPT = {}   # (symbol, expiry) -> (time, chain rows): option prices for the paper portfolio, kept for a few seconds
 
 
-def paper_option_ltp(u, o):
-    """Last price of the option a paper order holds, from the option chain (or the broker's prices when NSE is blocked)."""
-    k = (o["symbol"], o.get("expiry"))
-    hit = PF_OPT.get(k)
-    if not hit or time.time() - hit[0] > 10:
-        try:
-            rows = (chain_for(o["symbol"], o.get("expiry"), u) or {}).get("rows") or []
-        except Exception:
-            rows = []
-        hit = PF_OPT[k] = (time.time(), rows)
-    leg = next((r.get(str(o.get("right", "")).lower()) for r in hit[1] if r["strike"] == o.get("strike")), None)
-    return (leg or {}).get("ltp") or None
+def paper_option_prices(u, orders):
+    """({order label: last price}, [problems]) for the option contracts held in paper orders.
+    The held contracts are priced directly from the broker (one small request); the option chain is the fallback."""
+    out, errs, want = {}, [], {}
+    for o in orders:
+        want.setdefault(o["label"], o)
+    if not want:
+        return out, errs
+    bid, acct = chain_account(u)
+    ref = {}
+    if acct and load_master(bid):
+        opt = M(bid)["opt"]
+        for label, o in want.items():
+            try:
+                ek = datetime.strptime(o["expiry"], EXPIRY_FMT).strftime("%d%b%Y").upper()
+                inst = opt.get((o["symbol"], ek, float(o["strike"]), o["right"]))
+            except (TypeError, ValueError, KeyError):
+                inst = None
+            if inst:
+                ref[label] = (inst[3], str(inst[0]))
+        if ref:
+            items = sorted(set(ref.values()))
+            hit = PF_OPT.get(("direct", bid, tuple(items)))
+            if hit and time.time() - hit[0] < 4:
+                prices = hit[1]
+            else:
+                try:
+                    prices = acct.ltp(items)
+                    PF_OPT[("direct", bid, tuple(items))] = (time.time(), prices)
+                except Exception as e:
+                    prices = {}
+                    errs.append(f"{BROKER_NAMES.get(bid, bid)} did not return option prices ({str(e)[:110]}).")
+            for label, k in ref.items():
+                if prices.get(k):
+                    out[label] = prices[k]
+    for label, o in want.items():   # anything not priced above: the option chain
+        if label in out:
+            continue
+        k = (o["symbol"], o.get("expiry"))
+        hit = PF_OPT.get(k)
+        if not hit or time.time() - hit[0] > 10:
+            try:
+                rows = (chain_for(o["symbol"], o.get("expiry"), u) or {}).get("rows") or []
+            except Exception:
+                rows = []
+            hit = PF_OPT[k] = (time.time(), rows)
+        leg = next((r.get(str(o.get("right", "")).lower()) for r in hit[1] if r["strike"] == o.get("strike")), None)
+        if (leg or {}).get("ltp"):
+            out[label] = leg["ltp"]
+    miss = [l for l in want if l not in out]
+    if miss:
+        errs.append("No live price for " + ", ".join(miss[:3]) + (f" and {len(miss) - 3} more" if len(miss) > 3 else "") + ". Profit and loss show once a price is available.")
+    return out, errs
 
 
 @app.get("/api/portfolio")
@@ -5650,6 +5748,12 @@ def api_portfolio(request: Request):
         with ORDER_LOCK:
             recs = [o for o in ORDERS if o.get("user") == u["id"] and o["mode"] == "paper" and o["status"] == "complete" and o.get("date") == ist_now().strftime("%Y-%m-%d") and (not o.get("is_exit") or o.get("bot_exit"))]
         groups = {}
+        held = {}
+        for o in recs:
+            if o["kind"] == "option":
+                held[o["label"]] = held.get(o["label"], 0) + (o["qty"] if o["side"] == "BUY" else -o["qty"])
+        oprices, oerrs = paper_option_prices(u, [o for o in recs if o["kind"] == "option" and held.get(o["label"])])
+        errors.extend(oerrs)
         for o in recs:
             g = groups.setdefault(o["label"], {"o": o, "bq": 0, "bv": 0.0, "sq": 0, "sv": 0.0})
             px = o.get("avg_price") or o["price"]
@@ -5670,7 +5774,7 @@ def api_portfolio(request: Request):
                 row, _ = row_for(o["symbol"], DEFAULT_INTERVAL)
                 ltp = live_price(row) if row else None
             elif o["kind"] == "option" and net:
-                ltp = paper_option_ltp(u, o)
+                ltp = oprices.get(label)
             unreal = net * (ltp - avg) if net and ltp is not None else 0.0
             pos.append({"label": label, "qty": net, "avg": avg, "ltp": ltp, "realized": round(real, 2), "unrealized": round(unreal, 2),
                         "product": o["product"], "broker": "Paper"})
@@ -6522,7 +6626,7 @@ td.pick-pe{box-shadow:inset 0 0 0 2px var(--sell);font-weight:700}
 .px{display:inline-block;min-width:52px}
 dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0;width:min(460px,92vw)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
-#chartDlg{width:min(1100px,96vw);max-width:96vw}
+#chartDlg,#optDlg{width:min(1100px,96vw);max-width:96vw}.kb{background:none;border:0;color:inherit;font:inherit;font-weight:700;cursor:pointer;padding:2px 4px;border-radius:6px}.kb:hover{background:var(--line)}.kb span{font-size:11px;opacity:.7}.ogtip{font-size:13px;min-height:20px;margin:6px 0;color:var(--ink)}.ogsum{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-top:10px;font-size:13px}.ogsum div{padding:8px 10px;border:1px solid var(--line);border-radius:10px}#ogSvg{overflow-x:auto;max-width:100%}#ogSvg svg{display:block;touch-action:pan-x pan-y}#ogSvg text{fill:var(--mute);font-size:10px}#ogSvg .ax{stroke:var(--line);stroke-width:1}#ogSvg .xh{stroke:var(--acc);stroke-width:1;stroke-dasharray:3 3}
 .chbox{padding:14px 16px}.chhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}.chhead b{font-size:18px}
 .chtfs{display:flex;gap:4px;margin-left:auto}.chtfs button{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:4px 12px;cursor:pointer;font:inherit}
 .chtfs button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
@@ -6628,7 +6732,7 @@ dialog::backdrop{background:rgba(14,10,40,.6);backdrop-filter:blur(3px)}
 .ixhist{margin-top:12px;padding:10px 14px;background:var(--panel)}.ixhh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .ixhist table.gt td,.ixhist table.gt th{text-align:right}.ixhist table.gt td:first-child,.ixhist table.gt th:first-child,.ixhist table.gt td:nth-child(2),.ixhist table.gt th:nth-child(2){text-align:left}
 .scttl{font-size:16px}
-#scTable td,#scTable th{text-align:left}#scTable td:nth-child(n+8),#scTable th:nth-child(n+8){text-align:right}#scTable th.srt{cursor:pointer;user-select:none;white-space:nowrap}#scTable th.srt:hover{color:var(--acc)}#scTable th .ar{font-size:10px;margin-left:3px;opacity:.9}
+#scTable td,#scTable th{text-align:left}#scTable td:nth-child(n+8),#scTable th:nth-child(n+8){text-align:right}.omain{min-width:0}.ochart{margin:10px 0;padding:10px 12px;max-width:100%;overflow:hidden}#ocSvg{overflow-x:auto;max-width:100%}.ochart svg{display:block}.ochart svg text{fill:var(--mute);font-size:10px}.ochart svg .ax{stroke:var(--line);stroke-width:1}.ochart svg .sp{stroke:var(--acc);stroke-dasharray:4 3;stroke-width:1.2}.ochart svg .atmb{fill:var(--acc);opacity:.10}.oleg{font-size:12px;color:var(--mute)}.oleg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 4px 0 10px;vertical-align:-1px}#scTable th.srt{cursor:pointer;user-select:none;white-space:nowrap}#scTable th.srt:hover{color:var(--acc)}#scTable th .ar{font-size:10px;margin-left:3px;opacity:.9}
 .ogrid.ix{grid-template-columns:minmax(0,1fr)}.ogrid.ix .olist{display:none}
 @media(prefers-reduced-motion:reduce){.ixc.fresh{animation:none!important}}
 /* signal flashing */
@@ -6701,6 +6805,10 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  </aside>
  <div class="omain">
   <div class="osum" id="osum" hidden></div>
+  <div class="card ochart" id="ochartc" hidden>
+   <div class="ixrow"><div class="seg" id="ocSeg" role="group" aria-label="Graph type"></div><label class="chk"><input type="checkbox" id="ocOn" checked> Show graph</label>
+    <span class="oleg"><i style="background:#ff9f43"></i>Calls <i style="background:#35c9ff"></i>Puts</span><span class="sub" id="ocNote"></span></div>
+   <div class="wrap" id="ocSvg"></div></div>
   <label class="more"><input type="checkbox" id="omore"> Show volume and IV</label>
   <div class="wrap"><table class="otab" id="otable"></table></div>
   <div class="note" id="onote">Pick a script on the left. Every F&amp;O stock and index has a chain. Sensex and Bankex chains are priced by your broker and show no open interest.</div>
@@ -6869,6 +6977,14 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div class="chleg" id="chLeg"></div>
  <div id="chMsg" class="tkmsg" role="status"></div>
  <div id="chart"></div>
+</div></dialog>
+<dialog id="optDlg" aria-labelledby="ogTitle"><div class="chbox">
+ <div class="chhead"><b id="ogTitle"></b><div class="seg" id="ogView" role="group" aria-label="Show"></div><div class="seg" id="ogTf" role="group" aria-label="Candle size"></div><div class="seg" id="ogDays" role="group" aria-label="Days"></div><button class="btn ghost" id="ogClose">Close</button></div>
+ <div class="oleg"><i style="background:#ff9f43"></i>Call (CE) <i style="background:#35c9ff"></i>Put (PE)</div>
+ <div id="ogTip" class="ogtip" aria-live="polite">Move over the chart to read prices.</div>
+ <div id="ogMsg" class="tkmsg" role="status"></div>
+ <div class="wrap" id="ogSvg"></div>
+ <div class="ogsum" id="ogSum"></div>
 </div></dialog>
 <dialog id="ticket" aria-labelledby="tkTitle"><div class="tk">
  <h2 id="tkTitle">Order ticket</h2>
@@ -7232,9 +7348,80 @@ async function drawChart(){
  else leg.unshift("<span>No signal to show levels for on this timeframe.</span>");
  $("chLeg").innerHTML=leg.join("");
  ch.timeScale().fitContent();if(d.candles.length>120)ch.timeScale().setVisibleLogicalRange({from:d.candles.length-120,to:d.candles.length+4})}
+const OC_M={oi:["Open interest","oi","n"],doi:["Change in OI","doi","n"],vol:["Volume","vol","n"],ltp:["Premium","ltp","p"]};
+let ocm="oi";try{ocm=localStorage.getItem("ocm")||"oi"}catch(e){}
+function drawChain(d){
+ const card=$("ochartc");if(!d||d.error||!d.rows||!d.rows.length){card.hidden=true;return}
+ card.hidden=false;
+ const has=k=>d.rows.some(r=>r.ce[k]!=null||r.pe[k]!=null),ok=Object.keys(OC_M).filter(k=>has(OC_M[k][1]));
+ if(!ok.includes(ocm))ocm=ok.includes("oi")?"oi":(ok[0]||"ltp");
+ $("ocSeg").innerHTML=Object.entries(OC_M).map(([k,[n]])=>`<button data-m="${k}" aria-pressed="${k===ocm}" ${ok.includes(k)?"":"disabled"}>${n}</button>`).join("");
+ $("ocNote").textContent=ok.includes("oi")?"":"Open interest and volume are not available for this chain (the broker's prices only).";
+ if(!$("ocOn").checked||!ok.length){$("ocSvg").innerHTML="";return}
+ const [name,key,kind]=OC_M[ocm],rows=d.rows,n=rows.length,gw=n>24?30:36,H=250,pl=48,pr=10,pt=22,pb=30,W=pl+n*gw+pr;
+ const val=(r,s)=>{const v=r[s][key];return v==null?null:+v};
+ const all=rows.flatMap(r=>[val(r,"ce"),val(r,"pe")]).filter(v=>v!=null);
+ const mx=Math.max(0,...all),mn=Math.min(0,...all),span=(mx-mn)||1,y=v=>pt+(mx-v)/span*(H-pt-pb);
+ const fmt=v=>kind==="p"?f2(v):fk(Math.abs(v)).replace(/^/,v<0?"-":"");
+ const step=(()=>{const raw=span/4,p=Math.pow(10,Math.floor(Math.log10(raw||1))),m=raw/p;return (m<=1?1:m<=2?2:m<=5?5:10)*p})();
+ let g="";for(let t=Math.ceil(mn/step)*step;t<=mx+1e-9;t+=step)g+=`<line class="ax" x1="${pl}" x2="${W-pr}" y1="${y(t)}" y2="${y(t)}"/><text x="${pl-5}" y="${y(t)+3}" text-anchor="end">${fmt(t)}</text>`;
+ const ai=rows.findIndex(r=>r.strike===d.atm);if(ai>=0)g=`<rect class="atmb" x="${pl+ai*gw}" y="${pt}" width="${gw}" height="${H-pt-pb}"/>`+g+`<text x="${pl+ai*gw+gw/2}" y="${pt-8}" text-anchor="middle">ATM</text>`;
+ let body="";const bw=(gw-8)/2,zero=y(0);
+ if(kind==="p"){
+  for(const [s,c] of [["ce","#ff9f43"],["pe","#35c9ff"]]){const pts=rows.map((r,i)=>[pl+i*gw+gw/2,val(r,s)]).filter(p=>p[1]!=null);
+   body+=`<polyline fill="none" stroke="${c}" stroke-width="2" points="${pts.map(p=>p[0]+","+y(p[1])).join(" ")}"/>`+pts.map((p,i)=>`<circle cx="${p[0]}" cy="${y(p[1])}" r="2.6" fill="${c}"><title>${rows.find((r,j)=>pl+j*gw+gw/2===p[0]).strike} ${s.toUpperCase()} ${name}: ${f2(p[1])}</title></circle>`).join("")}
+ }else{
+  rows.forEach((r,i)=>{for(const [s,c,o] of [["ce","#ff9f43",0],["pe","#35c9ff",1]]){const v=val(r,s);if(v==null)continue;const x=pl+i*gw+4+o*bw,yv=y(v);
+   body+=`<rect x="${x}" y="${Math.min(yv,zero)}" width="${bw}" height="${Math.max(1,Math.abs(zero-yv))}" fill="${c}" rx="1.5"><title>${r.strike} ${s.toUpperCase()} ${name}: ${v.toLocaleString("en-IN")}</title></rect>`}})
+ }
+ let xl="";rows.forEach((r,i)=>{if(n>24&&i%2)return;xl+=`<text x="${pl+i*gw+gw/2}" y="${H-pb+14}" text-anchor="middle" ${r.strike===d.atm?'style="font-weight:700"':""}>${r.strike.toLocaleString("en-IN")}</text>`});
+ let sp="";const sk=rows.findIndex((r,i)=>i<n-1&&rows[i].strike<=d.underlying&&d.underlying<rows[i+1].strike);
+ if(sk>=0){const f=(d.underlying-rows[sk].strike)/(rows[sk+1].strike-rows[sk].strike),x=pl+(sk+f)*gw+gw/2;sp=`<line class="sp" x1="${x}" x2="${x}" y1="${pt}" y2="${H-pb}"/><text x="${Math.min(x+4,W-60)}" y="${pt+10}">Spot ${f2(d.underlying)}</text>`}
+ $("ocSvg").innerHTML=`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(d.symbol)} ${name} by strike, calls and puts">${g}<line class="ax" x1="${pl}" x2="${W-pr}" y1="${zero}" y2="${zero}" style="stroke-width:1.5"/>${body}${sp}${xl}</svg>`}
+let og={k:null,tf:"5m",days:1,view:"both",data:null,geom:null};try{const q=JSON.parse(localStorage.getItem("og")||"null");if(q)Object.assign(og,{tf:q.tf||"5m",days:q.days||1,view:q.view||"both"})}catch(e){}
+function ogSeg(){const seg=(id,items,cur)=>$(id).innerHTML=items.map(([v,n])=>`<button data-v="${v}" aria-pressed="${String(v)===String(cur)}">${n}</button>`).join("");
+ seg("ogView",[["both","Both"],["ce","Call"],["pe","Put"]],og.view);seg("ogTf",[["1m","1 min"],["5m","5 min"],["15m","15 min"]],og.tf);seg("ogDays",[[1,"Latest day"],[3,"3 days"]],og.days)}
+async function openOptChart(k){og.k=k;og.data=null;ogSeg();$("ogTitle").textContent=`${lastChain.symbol} ${k.toLocaleString("en-IN")} · ${lastChain.expiry}`;if(!$("optDlg").open)$("optDlg").showModal();await ogLoad()}
+async function ogLoad(){const my=++oreq2;$("ogMsg").textContent="Loading prices…";$("ogSvg").innerHTML="";$("ogSum").innerHTML="";
+ try{const d=await (await api(`/api/options/history?symbol=${encodeURIComponent(lastChain.symbol)}&expiry=${encodeURIComponent(lastChain.expiry)}&strike=${og.k}&tf=${og.tf}&days=${og.days}`)).json();if(my!==oreq2)return;
+  if(d.error){$("ogMsg").textContent=d.error;return}$("ogMsg").textContent="";og.data=d;ogDraw()}catch(e){if(my===oreq2)$("ogMsg").textContent="Cannot reach the server."}}
+let oreq2=0;
+function ogDraw(){const d=og.data;if(!d)return;const sides=og.view==="both"?["ce","pe"]:[og.view],col={ce:"#ff9f43",pe:"#35c9ff"};
+ const maps={};for(const s of ["ce","pe"]){maps[s]=new Map((d[s]||[]).map(c=>[c.t,c]))}
+ const tl=[...new Set(sides.flatMap(s=>(d[s]||[]).map(c=>c.t)))].sort((a,b)=>a-b),n=tl.length;if(!n){$("ogMsg").textContent="No candles for this side.";return}
+ const W=Math.max($("ogSvg").clientWidth||700,Math.min(2400,n*(og.view==="both"?5:7)+70)),H=sides.length===1?330:290,pl=52,pr=10,pt=10,pb=26,vh=sides.length===1?60:0,ph=H-pt-pb-vh;
+ const vals=sides.flatMap(s=>(d[s]||[]).flatMap(c=>og.view==="both"?[c.c]:[c.h,c.l])),mx=Math.max(...vals),mn=Math.min(...vals),pad=(mx-mn)*.06||1,hi=mx+pad,lo=Math.max(0,mn-pad);
+ const y=v=>pt+(hi-v)/(hi-lo)*ph,step=(W-pl-pr)/n,x=i=>pl+(i+.5)*step;
+ const tk=(()=>{const raw=(hi-lo)/5,p=Math.pow(10,Math.floor(Math.log10(raw||1))),m=raw/p;return (m<=1?1:m<=2?2:m<=5?5:10)*p})();
+ let g="";for(let t=Math.ceil(lo/tk)*tk;t<=hi;t+=tk)g+=`<line class="ax" x1="${pl}" x2="${W-pr}" y1="${y(t)}" y2="${y(t)}"/><text x="${pl-5}" y="${y(t)+3}" text-anchor="end">${f2(t)}</text>`;
+ const any=(d.ce&&d.ce.length?d.ce:d.pe)||[],byT=new Map(any.map(c=>[c.t,c]));let xl="",lastD=null,every=Math.max(1,Math.ceil(n/(W>900?12:7)));
+ tl.forEach((t,i)=>{const c=maps.ce.get(t)||maps.pe.get(t),nd=c.d!==lastD;if(nd&&lastD!==null)g+=`<line class="ax" x1="${x(i)-step/2}" x2="${x(i)-step/2}" y1="${pt}" y2="${H-pb}" style="stroke-dasharray:2 3"/>`;
+  if(nd||i%every===0)xl+=`<text x="${x(i)}" y="${H-pb+13}" text-anchor="middle">${og.days>1&&nd?c.d+" ":""}${c.lbl}</text>`;lastD=c.d});
+ let body="";
+ if(og.view==="both"){for(const s of sides){const pts=[];tl.forEach((t,i)=>{const c=maps[s].get(t);if(c)pts.push(`${x(i)},${y(c.c)}`)});body+=`<polyline fill="none" stroke="${col[s]}" stroke-width="2" stroke-linejoin="round" points="${pts.join(" ")}"/>`}}
+ else{const s=sides[0],vmax=Math.max(1,...(d[s]||[]).map(c=>c.v)),bw=Math.max(1,Math.min(14,step*.7));
+  tl.forEach((t,i)=>{const c=maps[s].get(t);if(!c)return;const up=c.c>=c.o,cl=up?"var(--buy)":"var(--sell)",top=y(Math.max(c.o,c.c)),bh=Math.max(1,Math.abs(y(c.o)-y(c.c)));
+   body+=`<line x1="${x(i)}" x2="${x(i)}" y1="${y(c.h)}" y2="${y(c.l)}" stroke="${cl}"/><rect x="${x(i)-bw/2}" y="${top}" width="${bw}" height="${bh}" fill="${cl}"/>`
+   +`<rect x="${x(i)-bw/2}" y="${H-pb-c.v/vmax*(vh-8)}" width="${bw}" height="${c.v/vmax*(vh-8)}" fill="${col[s]}" opacity=".45"/>`})}
+ $("ogSvg").innerHTML=`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(d.symbol)} ${d.strike} price chart">${g}${body}${xl}<line class="xh" id="ogx" x1="0" x2="0" y1="${pt}" y2="${H-pb}" visibility="hidden"/></svg>`;
+ og.geom={pl,step,n,tl,maps,W};
+ const sm=s=>{const a=d[s]||[];if(!a.length)return `<div><b style="color:${col[s]}">${s==="ce"?"Call":"Put"}</b> no candles</div>`;const o=a[0].o,l=a[a.length-1].c,ch=(l-o)/o*100;
+  return `<div><b style="color:${col[s]}">${s==="ce"?"Call (CE)":"Put (PE)"}</b> last <b>${f2(l)}</b> <span class="${ch>=0?"up":"dn"}">${ch>=0?"+":""}${ch.toFixed(1)}%</span><br>open ${f2(o)} · high ${f2(Math.max(...a.map(c=>c.h)))} · low ${f2(Math.min(...a.map(c=>c.l)))} · volume ${fk(a.reduce((q,c)=>q+c.v,0))}</div>`};
+ $("ogSum").innerHTML=sm("ce")+sm("pe")}
+function ogHover(e){const gm=og.geom,sv=$("ogSvg").querySelector("svg");if(!gm||!sv)return;const r=sv.getBoundingClientRect(),px=(e.clientX-r.left)*(gm.W/r.width),i=Math.min(gm.n-1,Math.max(0,Math.floor((px-gm.pl)/gm.step)));
+ const t=gm.tl[i],ln=$("ogx");ln.setAttribute("x1",gm.pl+(i+.5)*gm.step);ln.setAttribute("x2",gm.pl+(i+.5)*gm.step);ln.setAttribute("visibility","visible");
+ const c=gm.maps.ce.get(t),p=gm.maps.pe.get(t),f=(n,c)=>c?`<b style="color:${n==="CE"?"#ff9f43":"#35c9ff"}">${n}</b> O ${f2(c.o)} H ${f2(c.h)} L ${f2(c.l)} C ${f2(c.c)}`:`<b>${n}</b> –`;
+ const any=c||p;$("ogTip").innerHTML=`${esc(any.d)} ${any.lbl} · `+(og.view==="pe"?"":f("CE",c))+(og.view==="both"?" · ":"")+(og.view==="ce"?"":f("PE",p))}
+function initChainGraph(){
+ $("ogClose").onclick=()=>$("optDlg").close();
+ for(const [id,key] of [["ogView","view"],["ogTf","tf"],["ogDays","days"]])$(id).onclick=e=>{const b=e.target.closest("button[data-v]");if(!b)return;og[key]=key==="days"?+b.dataset.v:b.dataset.v;try{localStorage.setItem("og",JSON.stringify({tf:og.tf,days:og.days,view:og.view}))}catch(x){}ogSeg();if(key==="view"&&og.data)ogDraw();else ogLoad()};
+ $("ogSvg").addEventListener("pointermove",ogHover);
+$("ocSeg").onclick=e=>{const b=e.target.closest("button[data-m]");if(!b||b.disabled)return;ocm=b.dataset.m;try{localStorage.setItem("ocm",ocm)}catch(x){}drawChain(lastChain)};
+ $("ocOn").checked=(()=>{try{return localStorage.getItem("ocOn")!=="0"}catch(e){return true}})();
+ $("ocOn").onchange=()=>{try{localStorage.setItem("ocOn",$("ocOn").checked?"1":"0")}catch(x){}drawChain(lastChain)}}
 function renderChain(d){
  const box=document.getElementById("onote"),sum=document.getElementById("osum"),tb=document.getElementById("otable");
- if(d.error){sum.hidden=true;tb.innerHTML="";box.textContent=d.error;return}
+ if(d.error){sum.hidden=true;tb.innerHTML="";box.textContent=d.error;drawChain(null);return}
  oexp=d.expiry;lastChain=d;const sg=d.signal||"–";
  const stat=(l,v)=>`<div class="stat"><span class="l">${l}</span><b>${v}</b></div>`;
  const lv=d.levels?["entry","sl","tp1","tp2","tp3","tp4"].map((k,i)=>`<span>${["Entry","SL","T1","T2","T3","T4"][i]} <b>${f2(d.levels[k])}</b></span>`).join(""):"";
@@ -7265,8 +7452,9 @@ function renderChain(d){
   const pickC=d.suggested&&d.suggested.side==="CE"&&atm,pickP=d.suggested&&d.suggested.side==="PE"&&atm;
   const ch=ce.map((c,i)=>`<td class="${cls(d.bias==="CE"&&"bias-ce",pickC&&i===ce.length-1&&"pick-ce")}">${c}</td>`).join("");
   const ph=pe.map((c,i)=>`<td class="${cls(d.bias==="PE"&&"bias-pe",pickP&&i===0&&"pick-pe")}">${c}</td>`).join("");
-  return `<tr class="${atm?"atm":""}">${ch}<td class="k">${r.strike.toLocaleString("en-IN")}</td>${ph}</tr>`}).join("");
+  return `<tr class="${atm?"atm":""}">${ch}<td class="k"><button class="kb" data-k="${r.strike}" title="Price charts of the ${r.strike} call and put">${r.strike.toLocaleString("en-IN")} <span>📈</span></button></td>${ph}</tr>`}).join("");
  const cH=more?["OI","Chg OI","Volume","IV","LTP"]:["OI","Chg OI","LTP"],pH=more?["LTP","IV","Volume","Chg OI","OI"]:["LTP","Chg OI","OI"];
+ drawChain(d);
  tb.innerHTML=`<thead><tr><th class="g" colspan="${cH.length}">Calls</th><th class="k" rowspan="2">Strike</th><th class="g" colspan="${pH.length}">Puts</th></tr><tr>${cH.map(h=>`<th>${h}</th>`).join("")}${pH.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${rows}</tbody>`;
  box.textContent=(d.note?d.note+" ":"")+(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The signal is calculated on the underlying's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click B or S beside a price to buy or sell that option.";
 }
@@ -7338,7 +7526,7 @@ $("tkQty").addEventListener("input",fundsPaint);
 $("tkFunds").onclick=e=>{if(e.target.id==="tkMax"&&fundsInfo&&fundsInfo.max_qty!=null){$("tkQty").value=Math.max(1,fundsInfo.max_qty);resetReview();fundsPaint()}};
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-initChart();initFlash();initModes();initIndex();initScanner();initBot();initBacktest();initConf();initInstall();
+initChart();initFlash();initModes();initIndex();initScanner();initBot();initBacktest();initConf();initInstall();initChainGraph();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
@@ -7358,7 +7546,8 @@ $("body").onclick=e=>{const cb=e.target.closest("[data-chart]");if(cb){openChart
  const b=e.target.closest("[data-trade]");if(!b||!data)return;const r=data.rows.find(x=>x.symbol===b.dataset.trade);if(!r)return;
  const side=r.signal.endsWith("SELL")?"SELL":"BUY";
  openTicket(mode==="futures"?{kind:"future",symbol:r.symbol,label:r.symbol+" futures, nearest month",side,price:r.close}:{kind:"equity",symbol:r.symbol,label:r.symbol,side,price:r.close})};
-$("otable").onclick=e=>{const b=e.target.closest(".ob");if(!b||!lastChain)return;
+$("otable").onclick=e=>{const kb=e.target.closest(".kb");if(kb&&lastChain){openOptChart(+kb.dataset.k);return}
+ const b=e.target.closest(".ob");if(!b||!lastChain)return;
  openTicket({kind:"option",symbol:lastChain.symbol,expiry:lastChain.expiry,strike:+b.dataset.strike,right:b.dataset.right,side:b.dataset.side,price:+b.dataset.ltp,label:`${lastChain.symbol} ${+b.dataset.strike} ${b.dataset.right} ${lastChain.expiry}`})};
 $("chk").onclick=async()=>{$("chkMsg").textContent="Checking…";const bs=(tradeInfo.brokers||[]).length?tradeInfo.brokers:[""];const out=[];
  try{for(const b of bs){out.push((await (await api("/api/trading/check?which="+b)).json()).message)}$("chkMsg").textContent=out.join(" ")}catch(e){$("chkMsg").textContent="Cannot reach the server."}};
