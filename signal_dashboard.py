@@ -2817,8 +2817,10 @@ def bot_opt_ltp(u, pos):
 # the stop moves to the entry at T1, to T1 at T2, to T2 at T3, and everything is sold at T4 or at the stop. Closed by OPTBOT_SQUAREOFF.
 OPTBOT_FRESH_BARS = int(os.getenv("OPTBOT_FRESH_BARS", "1"))   # a signal counts as fresh while it is at most this many candles old
 AUTO_TFS = ("5m", "15m")
+AUTO_MOVE_MIN = float(os.getenv("AUTO_MOVE_MIN", "1"))   # the scanner autopilot only trades stocks whose move today (up or down) is between these percentages
+AUTO_MOVE_MAX = float(os.getenv("AUTO_MOVE_MAX", "3"))
 AUTO_SEEN = {}   # (user id, bot, symbol, timeframe, signal time, side) -> True: each signal is acted on once
-AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 or 15 minute chart, "
+AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 or 15 minute chart (a 5 minute BUY is taken only while the 15 minute chart is also in a BUY zone, and a 5 minute SELL only in a SELL zone), "
               "or when a signal from an earlier day is still open and the price is back near its 20 EMA. Stop-loss and targets T1 to T4 are the indicator's own: "
               "the stop moves to the entry at T1, to T1 at T2, to T2 at T3, and it sells everything at T4 or at the stop.")
 
@@ -2829,17 +2831,16 @@ def auto_rows(kind, tf):
         ensure_fresh(tf)
         names = ["NIFTY"]
     else:
-        d = api_scanner(tf, 0)
-        if not isinstance(d, dict) or d.get("error"):
-            return None
-        names = [r["symbol"] for r in d.get("rows", []) if r["symbol"] not in INDICES]
+        ensure_fresh(tf)
+        with LOCK:
+            names = [r["symbol"] for r in STATES[tf]["rows"] if r.get("type") != "index" and r["symbol"] not in INDICES and r["symbol"] not in SCANNER_EXCLUDE]
     with LOCK:
         by = {r["symbol"]: r for r in STATES[tf]["rows"]}
     rows = [by[s] for s in names if s in by]
     return add_conf(apply_live(rows), tf)
 
 
-def auto_candidates(u, cfg, kind, why=None):
+def auto_candidates(u, cfg, kind, why=None, manual=False):
     """Signals that qualify right now, fresh ones first and then by grade and closeness to the 20 EMA. `why` collects the reason a live signal was left out."""
     ent = cfg.get("entries", "both")
     today = ist_now().strftime("%Y-%m-%d")
@@ -2848,8 +2849,10 @@ def auto_candidates(u, cfg, kind, why=None):
     def no(label, text):
         if why is not None:
             why.append(f"{label}: {text}")
+    big = auto_rows(kind, "15m")   # the 15 minute chart is the zone filter for 5 minute entries
+    zone = {r["symbol"]: r.get("side") for r in (big or []) if (r.get("signal") or "–") != "–" and not r.get("sl_hit")}
     for tf in AUTO_TFS:
-        rows = auto_rows(kind, tf)
+        rows = big if tf == "15m" else auto_rows(kind, tf)
         if rows is None:
             no(tf, "no data yet")
             continue
@@ -2857,6 +2860,15 @@ def auto_candidates(u, cfg, kind, why=None):
             sym, side, sig = r["symbol"], r.get("side"), r.get("signal") or "–"
             label = f"{sym} {tf}"
             if sig == "–" or side not in ("BUY", "SELL") or not r.get("entry") or not r.get("sl") or r.get("sl_hit"):
+                continue
+            if kind == "scanner":
+                mv = r.get("ltp_chg", r.get("chg"))
+                if mv is None or not (AUTO_MOVE_MIN <= abs(mv) <= AUTO_MOVE_MAX):
+                    no(label, f"{side} skipped: moved {'%+.2f%%' % mv if mv is not None else 'unknown'} today, needs {AUTO_MOVE_MIN:g}% to {AUTO_MOVE_MAX:g}% either way")
+                    continue
+            if tf == "5m" and zone.get(sym) != side:
+                z = zone.get(sym)
+                no(label, f"{side} on 5 min skipped: the 15 minute chart is " + (f"in a {z} zone" if z else "not in any zone"))
                 continue
             sdate = r.get("signal_date")
             fresh = r.get("bars_ago") is not None and r["bars_ago"] <= OPTBOT_FRESH_BARS and sdate == today
@@ -2891,16 +2903,15 @@ def auto_candidates(u, cfg, kind, why=None):
                 continue
             key = (u["id"], kind, sym, tf, r.get("signal_time"), side)
             skey = f"{tf} {r.get('signal_time')} {side}"
-            if AUTO_SEEN.get(key):
-                continue
             with ORDER_LOCK:
                 done = any(o.get("user") == u["id"] and o.get("bot") and o["symbol"] == sym and o.get("date") == today and o.get("bot_sigkey") == skey for o in ORDERS)
             if done:
                 AUTO_SEEN[key] = True
+            if (AUTO_SEEN.get(key) or done) and not manual:
                 continue
             cf = r.get("conf") or {}
             out.append({"symbol": sym, "side": side, "px": px, "levels": lv, "tf": tf, "etype": "fresh" if fresh else "continuation", "grade": g, "score": cf.get("s"),
-                        "dist": dist if dist is not None else 9.9, "key": key, "sigkey": skey,
+                        "dist": dist if dist is not None else 9.9, "key": key, "sigkey": skey, "taken": bool(done), "time": r.get("signal_time"),
                         "note": (f"fresh {tf} {side} signal at {r.get('signal_time')}" if fresh else f"{side} signal from {sdate} still open, back near its 20 EMA on {tf}")
                                 + (f", grade {g} ({cf.get('s')})" if g else "")})
     out.sort(key=lambda c: (c["etype"] != "fresh", -(c["score"] or 0), c["dist"]))
@@ -5799,8 +5810,31 @@ def bot_view(u, kind="scanner"):
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
     return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
-            "rules": AUTO_RULES + (" Trades NIFTY only." if kind == "nifty" else " Trades the scanner's stocks.") + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, a continuation needs the price within {OPTBOT_NEAR_ATR:g} ATR of its 20 EMA, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
+            "rules": AUTO_RULES + (" Trades NIFTY only." if kind == "nifty" else f" Looks at every F&O stock (not only the intraday scanner's list) whose move today is between {AUTO_MOVE_MIN:g}% and {AUTO_MOVE_MAX:g}%, up or down.") + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, a continuation needs the price within {OPTBOT_NEAR_ATR:g} ATR of its 20 EMA, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
+            "signals": manual_signals(u, kind),
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
+
+
+MANUAL_SIG = {}   # (user id, bot) -> (time, list). The signal list for manual trading is recomputed at most every 10 seconds.
+
+
+def manual_signals(u, kind):
+    """The trades this autopilot would consider right now, for someone trading by hand. Shown whether or not the autopilot is running."""
+    k = (u["id"], kind)
+    hit = MANUAL_SIG.get(k)
+    if hit and time.time() - hit[0] < 10:
+        return hit[1]
+    cfg = bot_cfg(u["id"], kind)
+    try:
+        cands = auto_candidates(u, cfg, kind, manual=True)
+    except Exception as e:
+        print("manual signals:", e)
+        return hit[1] if hit else []
+    out = [{"symbol": c["symbol"], "side": c["side"], "right": "CE" if c["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "px": round(c["px"], 2), "time": c.get("time"),
+            "sl": c["levels"]["sl"], "t1": c["levels"]["tp1"], "t2": c["levels"]["tp2"], "t3": c["levels"]["tp3"], "t4": c["levels"]["tp4"], "grade": c.get("grade"), "score": c.get("score"),
+            "taken": c.get("taken", False), "note": c["note"]} for c in cands]
+    MANUAL_SIG[k] = (time.time(), out)
+    return out
 
 
 @app.get("/api/optbot")
@@ -5873,7 +5907,7 @@ def api_optbot_control(request: Request, payload: dict = Body(...)):
         if err:
             return {"error": err}
         cfg.update(mode=mode, paused=False, last_mode=mode)
-        bot_log(u["id"], f"Play: {'NIFTY' if kind == 'nifty' else 'scanner stocks'} autopilot running in {mode.upper()} mode.", bot=kind)
+        bot_log(u["id"], f"Play: {'NIFTY' if kind == 'nifty' else 'F&O stocks'} autopilot running in {mode.upper()} mode.", bot=kind)
     elif action == "pause":
         if cfg["mode"] == "off":
             return {"error": "The autopilot is not running."}
@@ -6566,6 +6600,7 @@ th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(10),t
 th{font-weight:500;color:var(--mute);font-size:13px;cursor:pointer;user-select:none}
 tr:last-child td{border-bottom:0}
 .pill{display:inline-block;min-width:84px;text-align:center;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:500;background:var(--flat);color:var(--mute)}
+.botbox tr.taken{opacity:.55}
 .pill.BUY{background:var(--buy-bg);color:var(--buy);font-weight:700}
 .pill.SELL{background:var(--sell-bg);color:var(--sell);font-weight:700}
 .pill.Open_BUY{color:var(--buy)}.pill.Open_SELL{color:var(--sell)}
@@ -6779,7 +6814,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -6819,9 +6854,11 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="ixrow"><div class="seg" id="scTfs" role="group" aria-label="Timeframe"></div>
  <b class="scttl" id="scTtl">Top 15 by traded value today</b>
  <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label> <label class="chk"><input type="checkbox" id="scConf"> Grade A only</label><span class="sub" id="scMeta"></span></div>
-<div id="botHost"></div>
 <div class="wrap"><table id="scTable"></table></div>
 
+</section>
+<section id="view-autopilot" hidden>
+<div id="botHost"></div>
 </section>
 <section id="view-history" hidden>
 <div class="hbar">
@@ -7105,12 +7142,13 @@ const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
 function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",options:"options",index:"options",scanner:"scanner",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
- ["stocks","options","scanner","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ const vm={stocks:"stocks",futures:"stocks",options:"options",index:"options",scanner:"scanner",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","options","scanner","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
  $("ogrid").classList.toggle("ix",m==="index");$("ixbar").hidden=m!=="index";
  if(m==="index"){if(!["NIFTY","BANKNIFTY","SENSEX"].includes(osym)){osym="NIFTY";oexp=""}ixPaint();ixLoad();loadChain()}
- if(m==="scanner"){scPaint();scLoad();botLoad()}else{clearTimeout(scTimer);clearTimeout(botTimer)}
+ if(m==="scanner"){scPaint();scLoad()}else clearTimeout(scTimer);
+ if(m==="autopilot")botLoad();else clearTimeout(botTimer);
  if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
 function initConf(){$("confOnly").onchange=()=>render()}
@@ -7214,7 +7252,7 @@ function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=
    <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span>${confBadge(r)}</td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
    <td>${esc(r.sector||"–")}</td>${sc}<td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
-let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: scanner stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY"}};
+let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: F&O stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY"}};
 window.botD={};
 function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="ixrow"><b>${t}</b><span class="sub" id="${p}State"></span></div>
@@ -7236,9 +7274,11 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  </div>
  <div class="tkmsg" id="${p}Msg" role="status"></div>
  <div class="wrap"><table id="${p}Trades"></table></div>
+ <div class="ixrow"><b>Signals for manual trades</b><span class="sub" id="${p}SigNote">What this autopilot would trade right now, shown even while it is off.</span></div>
+ <div class="wrap"><table id="${p}Sig"></table></div>
  <div class="sub" id="${p}Log"></div>
 </div>`}
-async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
+async function botLoad(){clearTimeout(botTimer);if(mode!=="autopilot")return;
  for(const p in BOTS){try{const d=await (await api("/api/optbot?bot="+BOTS[p].kind)).json();window.botD[p]=d;
   if(document.activeElement&&[p+"Mode",p+"Ent",p+"Grade",p+"Max",p+"Lots",p+"Loss"].includes(document.activeElement.id)){}else{$(p+"Mode").value=d.mode==="off"?d.choice:d.mode;$(p+"Ent").value=d.entries;$(p+"Grade").value=d.min_grade;$(p+"Max").value=d.max_trades;$(p+"Lots").value=d.lots;$(p+"Loss").value=d.loss_limit}
   $(p+"Rules").textContent=d.rules;
@@ -7246,6 +7286,8 @@ async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
   const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";const mm=$(p+"Msg");if(mm.textContent==="Running."&&d.state!=="running")mm.textContent="The autopilot is stopped (the server restarted or it was stopped elsewhere). Press Play to start it.";
   $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
   $(p+"Trades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"?"Gap":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
+  const sg=d.signals||[];$(p+"Sig").innerHTML=sg.length?`<thead><tr><th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Grade</th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.taken?"taken":""}"><td><b>${esc(x.symbol)}</b></td><td><span class="pill ${x.side}">${x.right==="CE"?"CALL (CE)":"PUT (PE)"}</span>${x.taken?" <span class=sub>taken by the autopilot</span>":""}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No stock qualifies right now.</td></tr></tbody>`;
+  $(p+"Sig").parentElement.hidden=false;
   $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
  botTimer=setTimeout(botLoad,8000)}
 async function botCtl(p,action,extra){const D=window.botD[p]||{};const body={action,bot:BOTS[p].kind,mode:$(p+"Mode").value,entries:$(p+"Ent").value,min_grade:$(p+"Grade").value,max_trades:+$(p+"Max").value,lots:+$(p+"Lots").value,loss_limit:+$(p+"Loss").value,...extra};
