@@ -5611,6 +5611,23 @@ def api_order_funds(request: Request, payload: dict = Body(...)):
     return out
 
 
+PF_OPT = {}   # (symbol, expiry) -> (time, chain rows): option prices for the paper portfolio, kept for a few seconds
+
+
+def paper_option_ltp(u, o):
+    """Last price of the option a paper order holds, from the option chain (or the broker's prices when NSE is blocked)."""
+    k = (o["symbol"], o.get("expiry"))
+    hit = PF_OPT.get(k)
+    if not hit or time.time() - hit[0] > 10:
+        try:
+            rows = (chain_for(o["symbol"], o.get("expiry"), u) or {}).get("rows") or []
+        except Exception:
+            rows = []
+        hit = PF_OPT[k] = (time.time(), rows)
+    leg = next((r.get(str(o.get("right", "")).lower()) for r in hit[1] if r["strike"] == o.get("strike")), None)
+    return (leg or {}).get("ltp") or None
+
+
 @app.get("/api/portfolio")
 def api_portfolio(request: Request):
     """Positions with live profit and loss, and the broker balance. Live mode reads the broker; paper mode is worked out from paper orders."""
@@ -5652,6 +5669,8 @@ def api_portfolio(request: Request):
             if o["kind"] in ("equity", "future"):
                 row, _ = row_for(o["symbol"], DEFAULT_INTERVAL)
                 ltp = live_price(row) if row else None
+            elif o["kind"] == "option" and net:
+                ltp = paper_option_ltp(u, o)
             unreal = net * (ltp - avg) if net and ltp is not None else 0.0
             pos.append({"label": label, "qty": net, "avg": avg, "ltp": ltp, "realized": round(real, 2), "unrealized": round(unreal, 2),
                         "product": o["product"], "broker": "Paper"})
@@ -7108,7 +7127,7 @@ async function botLoad(){clearTimeout(botTimer);if(mode!=="scanner")return;
   if(document.activeElement&&[p+"Mode",p+"Ent",p+"Grade",p+"Max",p+"Lots",p+"Loss"].includes(document.activeElement.id)){}else{$(p+"Mode").value=d.mode==="off"?d.choice:d.mode;$(p+"Ent").value=d.entries;$(p+"Grade").value=d.min_grade;$(p+"Max").value=d.max_trades;$(p+"Lots").value=d.lots;$(p+"Loss").value=d.loss_limit}
   $(p+"Rules").textContent=d.rules;
   $(p+"State").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
-  const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";
+  const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";const mm=$(p+"Msg");if(mm.textContent==="Running."&&d.state!=="running")mm.textContent="The autopilot is stopped (the server restarted or it was stopped elsewhere). Press Play to start it.";
   $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
   $(p+"Trades").innerHTML=d.trades.length?`<thead><tr><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"?"Gap":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":"";
   $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
@@ -7352,7 +7371,7 @@ async function loadPortfolio(){try{const d=await (await api("/api/portfolio")).j
  $("pfKpi").innerHTML=`<div><span class="l">Today's P&amp;L</span><span class="v ${pnlCls(t.pnl)}">${money(t.pnl)}</span><span class="s">${d.mode==="live"?"From your broker":"Paper, simulated"}</span></div>`+
   `<div><span class="l">Unrealised (open)</span><span class="v ${pnlCls(t.unrealized)}">${money(t.unrealized)}</span><span class="s">${open} open position${open===1?"":"s"}</span></div>`+
   `<div><span class="l">Realised (closed)</span><span class="v ${pnlCls(t.realized)}">${money(t.realized)}</span></div>`+bal;
- $("pfNote").textContent=(d.errors||[]).join(" ")||(d.mode==="live"?"Live positions and profit from your broker. Refreshes every few seconds.":"Paper positions are worked out from your simulated orders, priced at the latest price on this dashboard. Option positions show no live price in paper mode.");
+ $("pfNote").textContent=(d.errors||[]).join(" ")||(d.mode==="live"?"Live positions and profit from your broker. Refreshes every few seconds.":"Paper positions are worked out from your simulated orders, priced at the latest price on this dashboard. Option positions are priced from the option chain, a few seconds behind.");
  $("pfTable").innerHTML=d.positions.length?`<thead><tr><th>Instrument</th><th>Side</th><th>Net qty</th><th>Avg price</th><th>Last price</th><th>Unrealised</th><th>Realised</th><th>Total P&amp;L</th></tr></thead><tbody>`+d.positions.map(r=>`<tr><td>${esc(r.label)}${r.broker&&r.broker!=="Paper"?`<span class="tag">${esc(r.broker)}</span>`:""}</td><td>${r.qty>0?"LONG":r.qty<0?"SHORT":"Closed"}</td><td>${r.qty}</td><td>${r.avg?f2(r.avg):"–"}</td><td>${r.ltp?f2(r.ltp):"–"}</td><td class="${pnlCls(r.unrealized)}">${money(r.unrealized)}</td><td class="${pnlCls(r.realized)}">${money(r.realized)}</td><td class="${pnlCls(r.pnl)}"><b>${money(r.pnl)}</b></td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="empty">No positions today.</td></tr></tbody>`}catch(e){}}
 function renderOrders(d){const t=$("ordTable");
  if(!d.orders.length){t.innerHTML="";$("ordNote").textContent="No orders have been placed from this dashboard today.";return}
