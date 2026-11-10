@@ -5316,7 +5316,10 @@ def chart_data(symbol, tf, at=0):
     def tm(ts):
         return ts.strftime("%Y-%m-%d") if tf == "1d" else int(ts.timestamp()) + 19800  # IST on the axis
 
+    past = next((i for i in range(n) if at and int(df.index[i].timestamp()) == at and (buy[i] or sell[i])), None) if at else None
     start = max(0, n - CHART_BARS[tf])
+    if past is not None:
+        start = min(start, max(0, past - 60))   # an older signal opened from a list or a replay is shown with some candles before it
     t = [tm(df.index[i]) for i in range(start, n)]
 
     out = {"symbol": symbol, "tf": tf, "intraday": tf != "1d", "index": symbol in INDEX_YF,
@@ -5327,7 +5330,6 @@ def chart_data(symbol, tf, at=0):
     if CHART_INDICATOR:
         out["lines"] = {"stop": [[t[i - start], round(float(ls[i] if d[i] == 1 else ss[i]), 2), int(d[i])] for i in range(start, n) if np.isfinite(ls[i] if d[i] == 1 else ss[i])],
                         "ema": [[t[i - start], round(float(ema[i]), 2)] for i in range(start, n)]}
-    past = next((i for i in range(n) if at and int(df.index[i].timestamp()) == at and (buy[i] or sell[i])), None) if at else None
     if past is not None:
         rec = eval_signals(symbol, df, tf, [past], buy, c, df["High"].to_numpy(float), df["Low"].to_numpy(float), atr, ls, ss)[0]
         out["markers"] = [{"time": t[past - start], "side": rec["side"]}] if past >= start else []   # a past signal opened from the history list is the one marked
@@ -6025,7 +6027,10 @@ def replay_series(df, tf):
                 break
         sg.append({"j": j, "side": "BUY" if side == 1 else "SELL", "dir": side, "entry": entry, "sl": float(sl), "tps": [float(t) for t in tps], "risk": float(risk), "sl_i": sl_i, "tidx": tidx,
                    "date": df.index[j].strftime("%Y-%m-%d"), "time": df.index[j].strftime("%H:%M")})
-    return {"n": n, "ts": ts, "close_ts": ts + mins * 60, "c": c, "hi": hi, "lo": lo, "ema": ema, "atr": atr, "sg": sg, "sig_idx": [g["j"] for g in sg],
+    day0 = {}
+    for k, dstr in enumerate(t.strftime("%Y-%m-%d") for t in df.index):
+        day0.setdefault(dstr, k)
+    return {"day0": day0, "n": n, "ts": ts, "close_ts": ts + mins * 60, "c": c, "hi": hi, "lo": lo, "ema": ema, "atr": atr, "sg": sg, "sig_idx": [g["j"] for g in sg],
             "dates": [t.strftime("%Y-%m-%d") for t in df.index], "tm": [t.strftime("%H:%M") for t in df.index]}
 
 
@@ -6090,7 +6095,7 @@ def replay_load(kind, set_progress):
                 continue
             if S:
                 data.setdefault(sname, {})[tf] = S
-    days = sorted({d for v in data.values() if "5m" in v for d in v["5m"]["dates"]})[-8:]
+    days = sorted({d for v in data.values() if "5m" in v for d in v["5m"]["dates"]})[-30:]
     REPLAY_DATA[kind] = hit = (time.time(), data, errors, days)
     return hit
 
@@ -6135,7 +6140,7 @@ def replay_run(data, kind, day, cfg):
             st = {"5m": replay_state(S5, k5), "15m": replay_state(S15, k15)}
             ser = {"5m": (S5, k5), "15m": (S15, k15)}
             ltp = float(S5["c"][k5])
-            d0 = next((k for k in range(S5["n"]) if S5["dates"][k] == day), 0)
+            d0 = S5["day0"].get(day, 0)
             prev = float(S5["c"][d0 - 1]) if d0 > 0 else None
             chg = (ltp / prev - 1) * 100 if prev else None
             for tf in ("5m", "15m"):
@@ -6176,14 +6181,14 @@ def replay_run(data, kind, day, cfg):
                     if dist > OPTBOT_NEAR_ATR:
                         skip("continuation: not back near the 20 EMA", key)
                         continue
-                cands.append({"symbol": s, "tf": tf, "g": g, "px": ltp, "key": key, "etype": "fresh" if fresh else "continuation", "dist": dist if dist is not None else 9.9, "at": endt, "chg": chg, "S5": S5, "k5": k5})
+                cands.append({"symbol": s, "tf": tf, "g": g, "px": ltp, "key": key, "etype": "fresh" if fresh else "continuation", "dist": dist if dist is not None else 9.9, "at": endt, "chg": chg, "S5": S5, "k5": k5, "sts": int(S["ts"][g["j"]])})
         cands.sort(key=lambda c: (c["etype"] != "fresh", c["dist"]))
         for c in cands:
             g = c["g"]
             if c["key"] not in seen:
                 seen.add(c["key"])
                 signals.append({"symbol": c["symbol"], "side": g["side"], "right": "CE" if g["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "at": c["at"], "signal_time": f"{g['date']} {g['time']}",
-                                "price": round(c["px"], 2), "sl": round(g["sl"], 2), "tps": [round(t, 2) for t in g["tps"]], "move": None if c["chg"] is None else round(c["chg"], 2), "taken": False, "why_not": None})
+                                "price": round(c["px"], 2), "sl": round(g["sl"], 2), "tps": [round(t, 2) for t in g["tps"]], "move": None if c["chg"] is None else round(c["chg"], 2), "taken": False, "why_not": None, "ts": c["sts"], "day": day})
             sig = next(x for x in signals if (x["symbol"], x["tf"], x["signal_time"], x["side"]) == (c["symbol"], c["tf"], f"{g['date']} {g['time']}", g["side"]))
             if c["key"] in taken_keys or sig["taken"]:
                 continue
@@ -6212,7 +6217,42 @@ def replay_run(data, kind, day, cfg):
     summ = {"signals": len(signals), "trades": len(trades), "wins": len(win), "losses": sum(1 for t in trades if t["r"] < 0), "flat": sum(1 for t in trades if t["r"] == 0),
             "total_r": tot, "avg_r": round(tot / len(trades), 2) if trades else 0.0, "win_rate": round(len(win) / len(trades) * 100) if trades else 0,
             "best": max((t["r"] for t in trades), default=0), "worst": min((t["r"] for t in trades), default=0)}
-    return {"day": day, "bot": kind, "summary": summ, "trades": trades, "signals": signals, "skips": sorted(skips.items(), key=lambda x: -x[1]), "max_trades": max_trades, "entries": ent}
+    eq, run = [], 0.0
+    for t in trades:
+        run += t["r"]
+        eq.append(round(run, 2))
+    return {"day": day, "bot": kind, "equity": eq, "summary": summ, "trades": trades, "signals": signals, "skips": sorted(skips.items(), key=lambda x: -x[1]), "max_trades": max_trades, "entries": ent}
+
+
+def replay_run_range(data, kind, days, cfg):
+    """Several days in a row, each with its own daily trade limit. Adds the equity curve, daily results and drawdown."""
+    trades, signals, skips, per_day = [], [], {}, []
+    for day in days:
+        r = replay_run(data, kind, day, cfg)
+        if r.get("error"):
+            continue
+        trades += r["trades"]
+        signals += r["signals"]
+        for k, n in r["skips"]:
+            skips[k] = skips.get(k, 0) + n
+        per_day.append({"day": day, "trades": r["summary"]["trades"], "wins": r["summary"]["wins"], "r": r["summary"]["total_r"], "signals": r["summary"]["signals"]})
+    if not per_day:
+        return {"error": "No candles for those days in the data loaded."}
+    rs = [t["r"] for t in trades]
+    eq, run, peak, dd = [], 0.0, 0.0, 0.0
+    for t in trades:
+        run += t["r"]
+        peak = max(peak, run)
+        dd = max(dd, peak - run)
+        eq.append(round(run, 2))
+    gain, loss = sum(x for x in rs if x > 0), -sum(x for x in rs if x < 0)
+    win = [x for x in rs if x > 0]
+    summ = {"signals": len(signals), "trades": len(trades), "wins": len(win), "losses": sum(1 for x in rs if x < 0), "flat": sum(1 for x in rs if x == 0), "total_r": round(sum(rs), 2),
+            "avg_r": round(sum(rs) / len(rs), 2) if rs else 0.0, "win_rate": round(len(win) / len(rs) * 100) if rs else 0, "best": max(rs, default=0), "worst": min(rs, default=0),
+            "profit_factor": round(gain / loss, 2) if loss else None, "max_drawdown": round(dd, 2), "days": len(per_day), "green_days": sum(1 for d in per_day if d["r"] > 0), "red_days": sum(1 for d in per_day if d["r"] < 0),
+            "best_day": max(per_day, key=lambda d: d["r"]), "worst_day": min(per_day, key=lambda d: d["r"])}
+    return {"mode": "range", "day": f"{per_day[0]['day']} to {per_day[-1]['day']}", "bot": kind, "summary": summ, "trades": trades, "signals": signals[:4000], "signals_total": len(signals),
+            "skips": sorted(skips.items(), key=lambda x: -x[1]), "per_day": per_day, "equity": eq, "max_trades": int(cfg.get("max_trades", 3)), "entries": cfg.get("entries", "both")}
 
 
 def replay_trade(c, day):
@@ -6248,7 +6288,7 @@ def replay_trade(c, day):
     r = round((exit_px - entry) * dr / risk, 2) if risk else 0.0
     return {"symbol": c["symbol"], "side": g["side"], "right": "CE" if g["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "entered": c["at"], "entry": round(entry, 2),
             "sl": round(g["sl"], 2), "t1": round(lv[0], 2), "t4": round(lv[3], 2), "exit": round(exit_px, 2), "exit_at": exit_at, "exit_hhmm": exit_at, "reason": why, "targets": step,
-            "r": r, "pct": round((exit_px / entry - 1) * 100 * dr, 2)}
+            "r": r, "pct": round((exit_px / entry - 1) * 100 * dr, 2), "ts": c["sts"], "day": day}
 
 
 def replay_job(uid, kind, day):
@@ -6261,9 +6301,15 @@ def replay_job(uid, kind, day):
         if not data:
             j.update(status="error", msg="No candles could be loaded. " + ("; ".join(errors[:3]) if errors else "Check the data feed."))
             return
-        day = day if day in days else (days[-2] if len(days) > 1 and days[-1] == ist_now().strftime("%Y-%m-%d") else days[-1])
-        j["msg"] = f"Replaying {day}…"
-        res = replay_run(data, kind, day, bot_cfg(uid, kind))
+        today = ist_now().strftime("%Y-%m-%d")
+        if day == "month":
+            span = [d for d in days[1:] if d < today or ist_now().strftime("%H:%M") > "15:35"]   # the first day is warm-up for the indicator
+            j["msg"] = f"Replaying {len(span)} trading days…"
+            res = replay_run_range(data, kind, span, bot_cfg(uid, kind))
+        else:
+            day = day if day in days else (days[-2] if len(days) > 1 and days[-1] == today else days[-1])
+            j["msg"] = f"Replaying {day}…"
+            res = replay_run(data, kind, day, bot_cfg(uid, kind))
         res["days"] = days
         res["loaded"] = len(data)
         res["errors"] = errors[:5]
@@ -7088,6 +7134,7 @@ th{font-weight:500;color:var(--mute);font-size:13px;cursor:pointer;user-select:n
 tr:last-child td{border-bottom:0}
 .pill{display:inline-block;min-width:84px;text-align:center;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:500;background:var(--flat);color:var(--mute)}
 .ixrow{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.rpch .ax{stroke:var(--mute);stroke-opacity:.35;stroke-width:1}.rpch{margin:10px 0}.rpch svg{display:block;max-width:720px;width:100%;height:auto}.rpch text{font-size:10px;fill:var(--mute)}.rpscroll{max-height:420px;overflow:auto}
 .chtrade{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.chtrade button{border:0;border-radius:10px;padding:8px 14px;font:inherit;font-weight:700;cursor:pointer;color:#fff}.chtrade .b{background:var(--buy)}.chtrade .s{background:var(--sell)}.chtrade button:disabled{opacity:.5}.chtrade .sub{align-self:center}
 .botbox .ixrow+.wrap,.botbox .wrap+.ixrow{margin-top:14px}.botbox tr.taken,.botbox tr.past{opacity:.6}.botbox td.act{white-space:nowrap}
 .pill.BUY{background:var(--buy-bg);color:var(--buy);font-weight:700}
@@ -7750,7 +7797,7 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <label class="sub" style="display:flex;gap:6px;align-items:center;margin:6px 0"><input type="checkbox" id="${p}Past"> Show trades from earlier days</label>
  <div class="ixrow"><b>Signals for manual trades</b><span class="sub" id="${p}SigNote">What this autopilot would trade right now, shown even while it is off.</span></div>
  <div class="wrap"><table id="${p}Sig"></table></div>
- <div class="ixrow"><b>Replay a past day</b><select id="${p}RDay" aria-label="Day to replay"></select><button class="btn" id="${p}RRun">Replay</button><span class="sub" id="${p}RMsg">Runs the rules above over that day's 5 and 15 minute candles. Nothing is traded.</span></div>
+ <div class="ixrow"><b>Replay past days</b><select id="${p}RDay" aria-label="Day to replay"></select><button class="btn" id="${p}RRun">Replay</button><span class="sub" id="${p}RMsg">Runs the rules above over the last month of 5 and 15 minute candles, or one day. Nothing is traded.</span></div>
  <div id="${p}RRes"></div>
  <div class="sub" id="${p}Log"></div>
 </div>`}
@@ -7778,21 +7825,33 @@ function initInstall(){const b=$("installBtn"),standalone=matchMedia("(display-m
  b.onclick=async()=>{if(installEv){installEv.prompt();await installEv.userChoice;installEv=null;b.hidden=true}else alert("On iPhone: tap the Share button in Safari, then Add to Home Screen. On Android: open the browser menu and choose Install app.")};
  addEventListener("appinstalled",()=>{b.hidden=true})}
 function rpDays(p,days,sel){const el=$(p+"RDay"),cur=sel||el.value;if(!days){days=[];const d=new Date();while(days.length<6){d.setDate(d.getDate()-1);if(d.getDay()%6)days.unshift(d.toISOString().slice(0,10))}}
- el.innerHTML=days.slice().reverse().map(x=>`<option value="${x}"${x===cur?" selected":""}>${x}</option>`).join("")}
+ el.innerHTML=`<option value="month"${cur==="month"||!cur?" selected":""}>Whole month (all days)</option>`+days.slice().reverse().map(x=>`<option value="${x}"${x===cur?" selected":""}>${x}</option>`).join("")}
 async function rpRun(p){const b=$(p+"RRun"),m=$(p+"RMsg");b.disabled=true;$(p+"RRes").innerHTML="";m.textContent="Starting…";
  try{let r=await post("/api/optbot/replay",{bot:BOTS[p].kind,day:$(p+"RDay").value});if(r.error){m.textContent=r.error;b.disabled=false;return}
   const poll=async()=>{const g=await (await api("/api/optbot/replay?bot="+BOTS[p].kind)).json();
    if(g.status==="running"){m.textContent=(g.msg||"Working…")+(g.total?` ${g.done} of ${g.total} candle sets`:"");setTimeout(poll,2000);return}
-   b.disabled=false;if(g.status==="done"){m.textContent=`Replayed ${g.result.day}.`;rpDays(p,g.result.days,g.result.day);rpShow(p,g.result)}else m.textContent=g.msg||"The replay could not run."};
+   b.disabled=false;if(g.status==="done"){m.textContent=`Replayed ${g.result.day}.`;rpDays(p,g.result.days,$(p+"RDay").value);rpShow(p,g.result)}else m.textContent=g.msg||"The replay could not run."};
   poll()}catch(e){m.textContent="The replay could not run.";b.disabled=false}}
-function rpShow(p,r){const s=r.summary,R=x=>`<span class="${x>0?"up":x<0?"dn":""}">${x>0?"+":""}${x}R</span>`,why=t=>t==="fresh"?"Fresh":"Continuation",pill=(sd,rt)=>`<span class="pill ${sd}">${rt==="CE"?"CALL (CE)":"PUT (PE)"}</span>`;
- const tr=r.trades.length?`<div class="wrap"><table><thead><tr><th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>In</th><th>Price</th><th>Stop</th><th>T1</th><th>T4</th><th>Out</th><th>Price</th><th>Result</th><th>Targets</th><th>Moved</th><th>R</th></tr></thead><tbody>`+r.trades.map(t=>`<tr><td><b>${esc(t.symbol)}</b></td><td>${pill(t.side,t.right)}</td><td>${t.tf==="5m"?"5 min":"15 min"}</td><td>${why(t.type)}</td><td>${t.entered}</td><td>${t.entry}</td><td>${t.sl}</td><td>${t.t1}</td><td>${t.t4}</td><td>${t.exit_at}</td><td>${t.exit}</td><td>${esc(t.reason)}</td><td>${t.targets}</td><td class="${t.pct>=0?"up":"dn"}">${t.pct>0?"+":""}${t.pct}%</td><td>${R(t.r)}</td></tr>`).join("")+"</tbody></table></div>":`<div class="sub">The rules would not have taken any trade on ${r.day}.</div>`;
- const sg=r.signals.length?`<details><summary>All ${r.signals.length} signal${r.signals.length>1?"s":""} that qualified</summary><div class="wrap"><table><thead><tr><th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>Signal candle</th><th>Qualified at</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Day move</th><th>Taken</th></tr></thead><tbody>`+r.signals.map(x=>`<tr class="${x.taken?"":"past"}"><td><b>${esc(x.symbol)}</b></td><td>${pill(x.side,x.right)}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${why(x.type)}</td><td>${esc(x.signal_time)}</td><td>${x.at}</td><td>${x.price}</td><td>${x.sl}</td>${x.tps.map(v=>`<td>${v}</td>`).join("")}<td>${x.move==null?"–":(x.move>0?"+":"")+x.move+"%"}</td><td>${x.taken?"Yes":esc(x.why_not||"No")}</td></tr>`).join("")+"</tbody></table></div></details>":"";
+function rpCharts(r){const eq=r.equity||[];if(!eq.length)return "";const W=640,H=150,pl=34,pr=8,pt=8,pb=18,n=eq.length,lo=Math.min(0,...eq),hi=Math.max(0,...eq),sp=(hi-lo)||1,x=i=>pl+(n<2?(W-pl-pr)/2:i/(n-1)*(W-pl-pr)),y=v=>pt+(hi-v)/sp*(H-pt-pb);
+ let g=`<line class="ax" x1="${pl}" x2="${W-pr}" y1="${y(0)}" y2="${y(0)}"/>`;for(const v of [lo,(lo+hi)/2,hi])g+=`<text x="${pl-4}" y="${y(v)+3}" text-anchor="end">${v.toFixed(1)}R</text>`;
+ const pts=eq.map((v,i)=>`${x(i)},${y(v)}`).join(" "),end=eq[n-1],cl=end>=0?"var(--buy)":"var(--sell)";
+ let svg=`<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Equity curve in R">${g}<polygon points="${x(0)},${y(0)} ${pts} ${x(n-1)},${y(0)}" fill="${cl}" opacity=".12"/><polyline fill="none" stroke="${cl}" stroke-width="2" points="${pts}"/><text x="${W-pr}" y="${H-4}" text-anchor="end">${n} trade${n>1?"s":""}</text></svg>`;
+ let bars="";const pd=r.per_day;if(pd&&pd.length>1){const H2=130,m=Math.max(1,...pd.map(d=>Math.abs(d.r))),bw=(W-pl-pr)/pd.length,mid=pt+(H2-pt-pb)/2,sc=(H2-pt-pb)/2/m;
+  bars=`<svg viewBox="0 0 ${W} ${H2}" width="100%" role="img" aria-label="Result of each day in R"><line class="ax" x1="${pl}" x2="${W-pr}" y1="${mid}" y2="${mid}"/><text x="${pl-4}" y="${pt+8}" text-anchor="end">+${m.toFixed(0)}R</text><text x="${pl-4}" y="${H2-pb}" text-anchor="end">-${m.toFixed(0)}R</text>`+pd.map((d,i)=>{const h=Math.abs(d.r)*sc,yy=d.r>=0?mid-h:mid;return `<rect x="${pl+i*bw+1}" y="${yy}" width="${Math.max(2,bw-2)}" height="${Math.max(1,h)}" fill="${d.r>=0?"var(--buy)":"var(--sell)"}"><title>${d.day}: ${d.r>0?"+":""}${d.r}R, ${d.trades} trade${d.trades===1?"":"s"}</title></rect>`}).join("")+`<text x="${pl}" y="${H2-4}">${pd[0].day.slice(5)}</text><text x="${W-pr}" y="${H2-4}" text-anchor="end">${pd[pd.length-1].day.slice(5)}</text></svg>`}
+ return `<div class="rpch"><div class="sub">Running total in R, trade by trade</div>${svg}${bars?`<div class="sub">Result of each day in R</div>${bars}`:""}</div>`}
+function rpShow(p,r){const s=r.summary,rg=r.mode==="range",R=x=>`<span class="${x>0?"up":x<0?"dn":""}">${x>0?"+":""}${x}R</span>`,why=t=>t==="fresh"?"Fresh":"Continuation",pill=(sd,rt)=>`<span class="pill ${sd}">${rt==="CE"?"CALL (CE)":"PUT (PE)"}</span>`,cb=(x)=>`<button class="mini" data-rc="${esc(x.symbol)}|${x.tf}|${x.ts}">Chart</button>`;
+ const dy=x=>rg?`<td>${x.day.slice(5)}</td>`:"",dh=rg?"<th>Day</th>":"";
+ const tr=r.trades.length?`<div class="wrap rpscroll"><table><thead><tr>${dh}<th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>In</th><th>Price</th><th>Stop</th><th>T1</th><th>T4</th><th>Out</th><th>Price</th><th>Result</th><th>Targets</th><th>Moved</th><th>R</th><th></th></tr></thead><tbody>`+r.trades.map(t=>`<tr>${dy(t)}<td><b>${esc(t.symbol)}</b></td><td>${pill(t.side,t.right)}</td><td>${t.tf==="5m"?"5 min":"15 min"}</td><td>${why(t.type)}</td><td>${t.entered}</td><td>${t.entry}</td><td>${t.sl}</td><td>${t.t1}</td><td>${t.t4}</td><td>${t.exit_at}</td><td>${t.exit}</td><td>${esc(t.reason)}</td><td>${t.targets}</td><td class="${t.pct>=0?"up":"dn"}">${t.pct>0?"+":""}${t.pct}%</td><td>${R(t.r)}</td><td>${cb(t)}</td></tr>`).join("")+"</tbody></table></div>":`<div class="sub">The rules would not have taken any trade on ${esc(r.day)}.</div>`;
+ const shown=r.signals.slice(0,300),tot=r.signals_total||r.signals.length;
+ const sg=r.signals.length?`<details><summary>All ${tot} signal${tot>1?"s":""} that qualified${tot>shown.length?` (first ${shown.length} shown, the CSV has them all)`:""}</summary><div class="wrap rpscroll"><table><thead><tr>${dh}<th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>Signal candle</th><th>Qualified at</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Day move</th><th>Taken</th><th></th></tr></thead><tbody>`+shown.map(x=>`<tr class="${x.taken?"":"past"}">${dy(x)}<td><b>${esc(x.symbol)}</b></td><td>${pill(x.side,x.right)}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${why(x.type)}</td><td>${esc(x.signal_time)}</td><td>${x.at}</td><td>${x.price}</td><td>${x.sl}</td>${x.tps.map(v=>`<td>${v}</td>`).join("")}<td>${x.move==null?"–":(x.move>0?"+":"")+x.move+"%"}</td><td>${x.taken?"Yes":esc(x.why_not||"No")}</td><td>${cb(x)}</td></tr>`).join("")+"</tbody></table></div></details>":"";
  const sk=r.skips.length?`<details><summary>Why other signals were left out</summary><ul>${r.skips.map(([k,n])=>`<li>${esc(k)}: ${n}</li>`).join("")}</ul></details>`:"";
- $(p+"RRes").innerHTML=`<div class="ogsum"><div><b>${r.day}</b> · ${s.trades} trade${s.trades===1?"":"s"} from ${s.signals} qualifying signal${s.signals===1?"":"s"}<br>${s.wins} won, ${s.losses} lost, ${s.flat} flat · win rate ${s.win_rate}%</div><div>Total <b>${R(s.total_r)}</b> · average ${R(s.avg_r)} a trade<br>best ${R(s.best)} · worst ${R(s.worst)}</div></div>${tr}${sg}${sk}
- <div class="sub">Results follow the stock or index price. R is the stop-loss distance (a stop-out is −1R, T4 is +4R), not option rupees. The grade filter is not applied. Daily limit ${r.max_trades} trade${r.max_trades===1?"":"s"}, ${r.entries==="both"?"fresh and continuation entries":r.entries==="fresh"?"fresh entries only":"continuation only"}. ${r.loaded} stocks loaded${r.errors&&r.errors.length?`; some failed: ${esc(r.errors.slice(0,2).join("; "))}`:""}.</div><button class="btn ghost" id="${p}RCsv">Download the signals as CSV</button>`;
- $(p+"RCsv").onclick=()=>{const h=["day","stock","buy","chart","type","signal candle","qualified at","price","stop","T1","T2","T3","T4","day move %","taken","why not"],rows=r.signals.map(x=>[r.day,x.symbol,x.right,x.tf,x.type,x.signal_time,x.at,x.price,x.sl,...x.tps,x.move,x.taken?"yes":"no",x.why_not||""]);
-  const csv=[h,...rows].map(l=>l.map(v=>`"${String(v==null?"":v).replace(/"/g,'""')}"`).join(",")).join("\n"),a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=`autopilot_replay_${r.bot}_${r.day}.csv`;a.click()}}
+ const head=rg?`<div><b>${esc(r.day)}</b> · ${s.days} trading days<br>${s.trades} trades from ${tot} qualifying signals · ${s.wins} won, ${s.losses} lost, ${s.flat} flat · win rate ${s.win_rate}%</div><div>Total <b>${R(s.total_r)}</b> · average ${R(s.avg_r)} a trade · profit factor ${s.profit_factor==null?"–":s.profit_factor}<br>max drawdown ${s.max_drawdown}R · ${s.green_days} green and ${s.red_days} red days · best day ${R(s.best_day.r)} (${s.best_day.day.slice(5)}), worst ${R(s.worst_day.r)} (${s.worst_day.day.slice(5)})</div>`
+  :`<div><b>${r.day}</b> · ${s.trades} trade${s.trades===1?"":"s"} from ${s.signals} qualifying signal${s.signals===1?"":"s"}<br>${s.wins} won, ${s.losses} lost, ${s.flat} flat · win rate ${s.win_rate}%</div><div>Total <b>${R(s.total_r)}</b> · average ${R(s.avg_r)} a trade<br>best ${R(s.best)} · worst ${R(s.worst)}</div>`;
+ $(p+"RRes").innerHTML=`<div class="ogsum">${head}</div>${rpCharts(r)}${tr}${sg}${sk}
+ <div class="sub">Results follow the stock or index price. R is the stop-loss distance (a stop-out is −1R, T4 is +4R), not option rupees. The grade filter is not applied. Daily limit ${r.max_trades} trade${r.max_trades===1?"":"s"} a day, ${r.entries==="both"?"fresh and continuation entries":r.entries==="fresh"?"fresh entries only":"continuation only"}.${r.loaded?` ${r.loaded} stocks loaded`:""}${r.errors&&r.errors.length?`; some failed: ${esc(r.errors.slice(0,2).join("; "))}`:""}. Each Chart button opens that stock with the signal's levels.</div><button class="btn ghost" id="${p}RCsv">Download the signals as CSV</button>`;
+ $(p+"RRes").onclick=e=>{const b=e.target.closest("[data-rc]");if(!b)return;const [sy,t,ts]=b.dataset.rc.split("|");openChart(sy,t,+ts)};
+ $(p+"RCsv").onclick=()=>{const h=["day","stock","buy","chart","type","signal candle","qualified at","price","stop","T1","T2","T3","T4","day move %","taken","why not"],rows=r.signals.map(x=>[x.day||r.day,x.symbol,x.right,x.tf,x.type,x.signal_time,x.at,x.price,x.sl,...x.tps,x.move,x.taken?"yes":"no",x.why_not||""]);
+  const csv=[h,...rows].map(l=>l.map(v=>`"${String(v==null?"":v).replace(/"/g,'""')}"`).join(",")).join("\n"),a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=`autopilot_replay_${r.bot}_${r.day.replace(/ /g,"_")}.csv`;a.click()}}
 async function atmOption(sy,right,tf,m,what){m.textContent=`Loading the ${sy} option chain…`;
  try{const d=await (await api(`/api/options/chain?symbol=${encodeURIComponent(sy)}&tf=${tf||"15m"}`)).json();
   if(d.error||!d.rows||!d.rows.length){m.textContent=d.error||"No option chain for "+sy+" right now.";return}
