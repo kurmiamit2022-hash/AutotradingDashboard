@@ -5228,6 +5228,45 @@ CHART_CACHE = {}
 CHART_BARS = {"5m": 400, "15m": 400, "1d": 500}
 
 
+CHART_INDICATOR = os.getenv("CHART_INDICATOR", "1") != "0"   # draw the indicator's lines on charts (set 0 to show only the latest signal and its levels)
+
+
+def indicator_pack(symbol, df, tf, stamp, lo_t=None, minbars=60):
+    """The indicator drawn on a chart, from a candle table with an India-time index: its two lines and the latest buy or sell signal with
+    stop-loss and targets. `stamp(ts)` gives the chart's time for a candle; only candles from `lo_t` on are returned (the earlier ones are warm-up)."""
+    n = len(df)
+    if n < minbars:
+        return None
+    c = df["Close"].to_numpy(float)
+    ls, ss, d, atr = chandelier(df)
+    ema = df["Close"].ewm(span=EMA_LEN, adjust=False).mean().to_numpy()
+    green, red = qqe_states(df["Close"])
+    up = np.zeros(n, bool)
+    dn = np.zeros(n, bool)
+    up[1:] = (d[1:] == 1) & (d[:-1] == -1)
+    dn[1:] = (d[1:] == -1) & (d[:-1] == 1)
+    buy = up & (c > ema) & within_lookback(green)
+    sell = dn & (c < ema) & within_lookback(red)
+    start = 0 if lo_t is None else next((i for i in range(n) if int(df.index[i].timestamp()) >= lo_t), n)
+    out = {"stop": [], "ema": [], "sig": None}
+    if CHART_INDICATOR:
+        for i in range(start, n):
+            v = ls[i] if d[i] == 1 else ss[i]
+            if np.isfinite(v):
+                out["stop"].append([stamp(df.index[i]), round(float(v), 2), int(d[i])])
+            if np.isfinite(ema[i]):
+                out["ema"].append([stamp(df.index[i]), round(float(ema[i]), 2)])
+    js = np.flatnonzero(buy | sell)
+    if len(js):
+        j = int(js[-1])
+        rec = eval_signals(symbol, df, tf, [j], buy, c, df["High"].to_numpy(float), df["Low"].to_numpy(float), atr, ls, ss)[0]
+        sgn = 1 if rec["side"] == "BUY" else -1
+        risk = abs(rec["entry"] - rec["sl"])
+        out["sig"] = {"side": rec["side"], "t": stamp(df.index[j]), "visible": j >= start, "entry": rec["entry"], "sl": rec["sl"], "sl_hit": rec["sl_hit"], "hits": rec["hits"],
+                      "tps": [round(rec["entry"] + sgn * risk * r, 2) for r in R_MULTIPLES], "time": rec["time"]}
+    return out
+
+
 def chart_data(symbol, tf, at=0):
     if use_dhan():
         df = dhan_frames([symbol], tf, _days(PERIODS[tf]))[0].get(symbol)
@@ -5263,14 +5302,18 @@ def chart_data(symbol, tf, at=0):
     start = max(0, n - CHART_BARS[tf])
     t = [tm(df.index[i]) for i in range(start, n)]
 
-    out = {"symbol": symbol, "tf": tf, "intraday": tf != "1d",
+    out = {"symbol": symbol, "tf": tf, "intraday": tf != "1d", "index": symbol in INDEX_YF,
            "candles": [{"time": t[k], "open": round(float(df["Open"].iloc[i]), 2), "high": round(float(df["High"].iloc[i]), 2),
                         "low": round(float(df["Low"].iloc[i]), 2), "close": round(float(c[i]), 2)} for k, i in enumerate(range(start, n))],
-           "markers": [{"time": t[i - start], "side": "BUY" if buy[i] else "SELL"} for i in range(start, n) if buy[i] or sell[i]],
-           "signal": None}
+           "markers": [{"time": t[i - start], "side": "BUY" if buy[i] else "SELL"} for i in range(start, n) if buy[i] or sell[i]][-1:],
+           "lines": None, "signal": None}
+    if CHART_INDICATOR:
+        out["lines"] = {"stop": [[t[i - start], round(float(ls[i] if d[i] == 1 else ss[i]), 2), int(d[i])] for i in range(start, n) if np.isfinite(ls[i] if d[i] == 1 else ss[i])],
+                        "ema": [[t[i - start], round(float(ema[i]), 2)] for i in range(start, n)]}
     past = next((i for i in range(n) if at and int(df.index[i].timestamp()) == at and (buy[i] or sell[i])), None) if at else None
     if past is not None:
         rec = eval_signals(symbol, df, tf, [past], buy, c, df["High"].to_numpy(float), df["Low"].to_numpy(float), atr, ls, ss)[0]
+        out["markers"] = [{"time": t[past - start], "side": rec["side"]}] if past >= start else []   # a past signal opened from the history list is the one marked
         sgn = 1 if rec["side"] == "BUY" else -1
         risk = abs(rec["entry"] - rec["sl"])
         out["signal"] = {"side": rec["side"], "state": rec["side"] + " (past signal)", "status": hist_status(rec), "time": rec["time"],
@@ -5349,6 +5392,23 @@ def dhan_underlying_candles(symbol, minutes, days):
             for t, r in df.iterrows()]
 
 
+def candle_last_days(rows, days):
+    """The rows of the last `days` trading days of a candle list."""
+    seen = []
+    for r in rows:
+        if r["d"] not in seen:
+            seen.append(r["d"])
+    keep = set(seen[-days:])
+    return [r for r in rows if r["d"] in keep]
+
+
+def candle_rows_df(rows):
+    """A candle list as the table the indicator reads (India-time index)."""
+    df = pd.DataFrame({"Open": [r["o"] for r in rows], "High": [r["h"] for r in rows], "Low": [r["l"] for r in rows], "Close": [r["c"] for r in rows], "Volume": [r["v"] for r in rows]},
+                      index=pd.to_datetime([r["t"] for r in rows], unit="s", utc=True).tz_convert(IST))
+    return df
+
+
 @app.get("/api/options/history")
 def api_option_history(request: Request, symbol: str, expiry: str, strike: float, tf: str = "5m", days: int = 1):
     """Price history of the call and the put of one strike, from Dhan's intraday data."""
@@ -5362,14 +5422,15 @@ def api_option_history(request: Request, symbol: str, expiry: str, strike: float
     if DATA_BROKER != "dhan":
         return {"error": "Option price history comes from Dhan's data feed. Set DATA_BROKER=dhan on the server."}
     out = {"symbol": symbol, "expiry": expiry, "strike": strike, "tf": tf, "days": days}
+    full = {}   # a week of candles per series: the indicator needs the earlier days to warm up, the chart shows only the last `days`
     for side in ("CE", "PE"):
-        key = (symbol, expiry, float(strike), side, minutes, days)
+        key = (symbol, expiry, float(strike), side, minutes, 7)
         hit = OPT_HIST.get(key)
         if hit and time.time() - hit[0] < 20:
-            out[side.lower()] = hit[1]
+            full[side.lower()] = hit[1]
             continue
         try:
-            rows = dhan_option_candles(symbol, expiry, strike, side, minutes, days)
+            rows = dhan_option_candles(symbol, expiry, strike, side, minutes, 7)
         except DhanDataError as e:
             return {"error": f"Dhan: {e}"}
         except ValueError:
@@ -5377,18 +5438,29 @@ def api_option_history(request: Request, symbol: str, expiry: str, strike: float
         except Exception as e:
             return {"error": f"Could not read the price history ({type(e).__name__}: {str(e)[:100]})."}
         OPT_HIST[key] = (time.time(), rows)
-        out[side.lower()] = rows
-    ukey = (symbol, "UND", 0.0, "", minutes, days)   # the parent script, on the same candle size and days, for a like-for-like comparison
+        full[side.lower()] = rows
+    ukey = (symbol, "UND", 0.0, "", minutes, 7)   # the parent script, on the same candle size and days, for a like-for-like comparison
     hit = OPT_HIST.get(ukey)
     if hit and time.time() - hit[0] < 20:
-        out["und"] = hit[1]
+        full["und"] = hit[1]
     else:
         try:
-            out["und"] = dhan_underlying_candles(symbol, minutes, days)
-            OPT_HIST[ukey] = (time.time(), out["und"])
+            full["und"] = dhan_underlying_candles(symbol, minutes, 7)
+            OPT_HIST[ukey] = (time.time(), full["und"])
         except Exception as e:
-            out["und"] = []
+            full["und"] = []
             out["und_error"] = f"The {symbol} chart could not be loaded ({str(e)[:90]})."
+    ind = {}
+    for k, rows in full.items():
+        shown = candle_last_days(rows, days)
+        out[k] = shown
+        ind[k] = None
+        if shown:
+            try:
+                ind[k] = indicator_pack(symbol, candle_rows_df(rows), "5m", lambda ts: int(ts.timestamp()), lo_t=shown[0]["t"])
+            except Exception as e:
+                print("option indicator:", e, flush=True)
+    out["ind"] = ind
     if not out["ce"] and not out["pe"]:
         out["error"] = "Dhan returned no candles for these contracts. They may not have traded yet, or the Data API is not subscribed."
     return out
@@ -6664,6 +6736,8 @@ th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(10),t
 th{font-weight:500;color:var(--mute);font-size:13px;cursor:pointer;user-select:none}
 tr:last-child td{border-bottom:0}
 .pill{display:inline-block;min-width:84px;text-align:center;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:500;background:var(--flat);color:var(--mute)}
+.ixrow{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.chtrade{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.chtrade button{border:0;border-radius:10px;padding:8px 14px;font:inherit;font-weight:700;cursor:pointer;color:#fff}.chtrade .b{background:var(--buy)}.chtrade .s{background:var(--sell)}.chtrade button:disabled{opacity:.5}.chtrade .sub{align-self:center}
 .botbox .ixrow+.wrap,.botbox .wrap+.ixrow{margin-top:14px}.botbox tr.taken,.botbox tr.past{opacity:.6}.botbox td.act{white-space:nowrap}
 .pill.BUY{background:var(--buy-bg);color:var(--buy);font-weight:700}
 .pill.SELL{background:var(--sell-bg);color:var(--sell);font-weight:700}
@@ -6823,17 +6897,8 @@ dialog::backdrop{background:rgba(14,10,40,.6);backdrop-filter:blur(3px)}
 .seg.tm button[data-tm=live][aria-pressed=true]{background:linear-gradient(135deg,#e0264b,#ff9f1a);color:#fff;box-shadow:0 0 14px rgba(var(--glows),.55)}
 .seg.tm button[data-tm=paper][aria-pressed=true]{background:var(--g);color:#fff}
 .seg.tm button:disabled{opacity:.5;cursor:not-allowed}
-.ixbar{margin-bottom:12px}.ixrow{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
-.ixmat{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px}
-.ixc{background:var(--panel);border-radius:14px;box-shadow:var(--shadow);padding:10px 14px;display:flex;flex-direction:column;gap:3px;cursor:pointer;border:2px solid transparent;text-align:left;color:var(--ink);font:inherit}
-.ixc[aria-pressed=true]{border-color:var(--acc)}.ixc .t{font-size:12.5px;color:var(--mute);font-weight:600}.ixc .px{font-size:12.5px;color:var(--mute)}
-.ixc.fresh.BUY{animation:pulseb 2.2s ease-in-out infinite}.ixc.fresh.SELL{animation:pulses 2.2s ease-in-out infinite}
-.ixhist{margin-top:12px;padding:10px 14px;background:var(--panel)}.ixhh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.ixhist table.gt td,.ixhist table.gt th{text-align:right}.ixhist table.gt td:first-child,.ixhist table.gt th:first-child,.ixhist table.gt td:nth-child(2),.ixhist table.gt th:nth-child(2){text-align:left}
 .scttl{font-size:16px}
 #scTable td,#scTable th{text-align:left}#scTable td:nth-child(n+8),#scTable th:nth-child(n+8){text-align:right}.omain{min-width:0}.ochart{margin:10px 0;padding:10px 12px;max-width:100%;overflow:hidden}#ocSvg{overflow-x:auto;max-width:100%}.ochart svg{display:block}.ochart svg text{fill:var(--mute);font-size:10px}.ochart svg .ax{stroke:var(--line);stroke-width:1}.ochart svg .sp{stroke:var(--acc);stroke-dasharray:4 3;stroke-width:1.2}.ochart svg .atmb{fill:var(--acc);opacity:.10}.oleg{font-size:12px;color:var(--mute)}.oleg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 4px 0 10px;vertical-align:-1px}#scTable th.srt{cursor:pointer;user-select:none;white-space:nowrap}#scTable th.srt:hover{color:var(--acc)}#scTable th .ar{font-size:10px;margin-left:3px;opacity:.9}
-.ogrid.ix{grid-template-columns:minmax(0,1fr)}.ogrid.ix .olist{display:none}
-@media(prefers-reduced-motion:reduce){.ixc.fresh{animation:none!important}}
 /* signal flashing */
 .newb{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:999px;font-size:10.5px;font-weight:800;letter-spacing:.08em;color:#fff;background:linear-gradient(135deg,var(--hot),#ff4d6d);animation:blink 1s steps(2,start) infinite;vertical-align:middle}
 tr.fresh.buy td:first-child{box-shadow:inset 4px 0 0 var(--buy)}tr.fresh.sell td:first-child{box-shadow:inset 4px 0 0 var(--sell)}
@@ -6878,7 +6943,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="index">Index Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -6889,12 +6954,6 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="note" id="note"></div>
 </section>
 <section id="view-options" hidden>
-<div class="ixbar" id="ixbar" hidden>
- <div class="ixrow"><div class="seg" id="ixSym" role="group" aria-label="Index"></div><div class="seg" id="ixTfs" role="group" aria-label="Timeframe"></div><span class="sub" id="ixNote"></span></div>
- <div class="ixmat" id="ixMat"></div>
- <div class="card ixhist"><div class="ixhh"><b id="ixHTitle">Last 10 signals</b><button class="btn ghost" id="ixChart">Chart</button></div>
-  <div class="wrap"><table class="gt" id="ixHist"></table></div></div>
-</div>
 <div class="ogrid" id="ogrid">
  <aside class="olist" aria-label="Scripts">
   <input id="osym" placeholder="Search a stock or index" aria-label="Search scripts" autocomplete="off">
@@ -7076,6 +7135,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <dialog id="chartDlg"><div class="chbox">
  <div class="chhead"><b id="chTitle"></b><div class="chtfs" id="chTfs"></div><button class="btn ghost" id="chClose">Close</button></div>
  <div class="chleg" id="chLeg"></div>
+ <div class="chtrade" id="chTrade"></div>
  <div id="chMsg" class="tkmsg" role="status"></div>
  <div id="chart"></div>
 </div></dialog>
@@ -7086,6 +7146,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div id="ogMsg" class="tkmsg" role="status"></div>
  <div class="wrap" id="ogSvg"></div>
  <div class="ogsum" id="ogSum"></div>
+ <div class="chtrade" id="ogTrade"></div>
 </div></dialog>
 <dialog id="ticket" aria-labelledby="tkTitle"><div class="tk">
  <h2 id="tkTitle">Order ticket</h2>
@@ -7196,21 +7257,18 @@ function render(){
  document.getElementById("note").textContent=(data.errors.length?`${data.errors.length} symbol(s) skipped: ${data.errors.slice(0,3).join("; ")}${data.errors.length>3?"…":""}. `:"")+`BUY and SELL show for ${data.fresh_bars} candles after a signal. Open trades are older signals whose stop and T4 have not been reached. Entry, SL and targets come from the latest signal for each symbol.`+(fut?" Futures signals come from the same indicator on the stock's or index's own candles (spot prices). The lot size and expiry shown are for the nearest-month contract, from Angel One's instrument list.":"");
 }
 // ── Options tab ──
-let mode="stocks",osym="",oexp="",oreq=0,ixTf="15m";
-try{ixTf=localStorage.getItem("ixTf")==="5m"?"5m":"15m"}catch(e){}
+let mode="stocks",osym="",oexp="",oreq=0;
 let optOverride="";
-const optTf=()=>mode==="index"?ixTf:(optOverride||tf||"");
+const optTf=()=>optOverride||tf||"";
 try{mode=localStorage.getItem("mode")||"stocks"}catch(e){}
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(a>=1e7?(a/1e7).toFixed(2)+" Cr":a>=1e5?(a/1e5).toFixed(2)+" L":a>=1e3?(a/1e3).toFixed(1)+" K":String(Math.round(a)))};
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
-function setMode(m){if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",options:"options",index:"options",scanner:"scanner",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
+function setMode(m){if(m==="index")m="options";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
+ const vm={stocks:"stocks",futures:"stocks",options:"options",scanner:"scanner",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
  ["stocks","options","scanner","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
- $("ogrid").classList.toggle("ix",m==="index");$("ixbar").hidden=m!=="index";
- if(m==="index"){if(!["NIFTY","BANKNIFTY","SENSEX"].includes(osym)){osym="NIFTY";oexp=""}ixPaint();ixLoad();loadChain()}
  if(m==="scanner"){scPaint();scLoad()}else clearTimeout(scTimer);
  if(m==="autopilot")botLoad();else clearTimeout(botTimer);
  if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
@@ -7338,6 +7396,7 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  </div>
  <div class="tkmsg" id="${p}Msg" role="status"></div>
  <div class="wrap"><table id="${p}Trades"></table></div>
+ <label class="sub" style="display:flex;gap:6px;align-items:center;margin:6px 0"><input type="checkbox" id="${p}Past"> Show trades from earlier days</label>
  <div class="ixrow"><b>Signals for manual trades</b><span class="sub" id="${p}SigNote">What this autopilot would trade right now, shown even while it is off.</span></div>
  <div class="wrap"><table id="${p}Sig"></table></div>
  <div class="sub" id="${p}Log"></div>
@@ -7349,7 +7408,8 @@ async function botLoad(){clearTimeout(botTimer);if(mode!=="autopilot")return;
   $(p+"State").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
   const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";const mm=$(p+"Msg");if(mm.textContent==="Running."&&d.state!=="running")mm.textContent="The autopilot is stopped (the server restarted or it was stopped elsewhere). Press Play to start it.";
   $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
-  $(p+"Trades").innerHTML=d.trades.length?`<thead><tr><th>Date</th><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+d.trades.map(t=>`<tr class="${t.past?"past":""}"><td>${t.past?esc(t.date||""):"Today"}</td><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"||t.etype==="continuation"?"Continuation":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No trades yet.</td></tr></tbody>`;
+  const showPast=$(p+"Past").checked,tr=d.trades.filter(t=>showPast||!t.past),np=d.trades.length-tr.length;$(p+"Past").nextSibling.textContent=" Show trades from earlier days"+(np?` (${np})`:"");
+  $(p+"Trades").innerHTML=tr.length?`<thead><tr><th>Date</th><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+tr.map(t=>`<tr class="${t.past?"past":""}"><td>${t.past?esc(t.date||""):"Today"}</td><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"||t.etype==="continuation"?"Continuation":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No trades today.</td></tr></tbody>`;
   const sg=d.signals||[];$(p+"Sig").innerHTML=sg.length?`<thead><tr><th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Grade</th><th></th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.taken?"taken":""}"><td><b>${esc(x.symbol)}</b></td><td><span class="pill ${x.side}">${x.right==="CE"?"CALL (CE)":"PUT (PE)"}</span>${x.taken?" <span class=sub>taken by the autopilot</span>":""}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td><td class="act"><button class="mini" data-ap="chart" data-s="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button> <button class="mini" data-ap="ochart" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Option chart</button> <button class="mini go" data-ap="trade" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Trade ${x.right}</button></td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No stock qualifies right now.</td></tr></tbody>`;
   $(p+"Sig").parentElement.hidden=false;
   $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
@@ -7364,17 +7424,18 @@ function initInstall(){const b=$("installBtn"),standalone=matchMedia("(display-m
  if(/iphone|ipad|ipod/i.test(navigator.userAgent)){b.hidden=false}
  b.onclick=async()=>{if(installEv){installEv.prompt();await installEv.userChoice;installEv=null;b.hidden=true}else alert("On iPhone: tap the Share button in Safari, then Add to Home Screen. On Android: open the browser menu and choose Install app.")};
  addEventListener("appinstalled",()=>{b.hidden=true})}
-async function apOption(b,p,what){const m=$(p+"Msg");const sy=b.dataset.s,right=b.dataset.r;b.disabled=true;m.textContent=`Loading the ${sy} option chain…`;
- try{const d=await (await api(`/api/options/chain?symbol=${encodeURIComponent(sy)}&tf=${b.dataset.tf||"15m"}`)).json();
+async function atmOption(sy,right,tf,m,what){m.textContent=`Loading the ${sy} option chain…`;
+ try{const d=await (await api(`/api/options/chain?symbol=${encodeURIComponent(sy)}&tf=${tf||"15m"}`)).json();
   if(d.error||!d.rows||!d.rows.length){m.textContent=d.error||"No option chain for "+sy+" right now.";return}
   const row=d.rows.reduce((a,r)=>Math.abs(r.strike-d.atm)<Math.abs(a.strike-d.atm)?r:a,d.rows[0]),leg=right==="CE"?row.ce:row.pe;
   lastChain=d;m.textContent="";
   if(what==="ochart"){openOptChart(row.strike);return}
   if(!leg||!leg.ltp){m.textContent=`No price for the ${sy} ${row.strike} ${right} yet, so no order was opened.`;return}
   openTicket({kind:"option",symbol:d.symbol,expiry:d.expiry,strike:row.strike,right,side:"BUY",price:+leg.ltp,label:`${d.symbol} ${row.strike} ${right} ${d.expiry}`})
- }catch(e){m.textContent="Could not load the option chain."}finally{b.disabled=false}}
+ }catch(e){m.textContent="Could not load the option chain."}}
+async function apOption(b,p,what){b.disabled=true;try{await atmOption(b.dataset.s,b.dataset.r,b.dataset.tf,$(p+"Msg"),what)}finally{b.disabled=false}}
 function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
- for(const p in BOTS){$(p+"Sig").onclick=e=>{const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
+ for(const p in BOTS){$(p+"Past").onchange=()=>botLoad();$(p+"Sig").onclick=e=>{const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
 function confBadge(r){const c=r&&r.conf;if(!c)return "";const tip=`Grade ${c.g}, score ${c.s} of 100\n`+c.w.map(x=>(x[0]?"✓ ":"✗ ")+x[1]).join("\n")+(c.n<8?"\n(Some checks could not be made)":"");return `<span class="cg cg${c.g}" title="${esc(tip)}">${c.g}<small> ${c.s}</small></span>`}
 let btTimer=null;
 const inr=x=>(x<0?"-":"")+"₹"+Math.abs(Math.round(x)).toLocaleString("en-IN");
@@ -7438,6 +7499,12 @@ function loadLW(){if(window.LightweightCharts)return Promise.resolve();
  return lwPromise||(lwPromise=new Promise((ok,no)=>{const s=document.createElement("script");s.src="/lw.js";s.onload=ok;s.onerror=()=>{lwPromise=null;no()};document.head.appendChild(s)}))}
 function openChart(sym,t,at){chSym=sym;chTf=t||tf||"15m";chAt=at||0;$("chTitle").textContent=sym;$("chTfs").innerHTML=(data?data.intervals:["5m","15m","1d"]).map(x=>`<button data-ct="${x}" aria-pressed="${x===chTf}">${tfName[x]||x}</button>`).join("");
  if(!$("chartDlg").open)$("chartDlg").showModal();drawChart()}
+function chTradeBar(d){const last=d.candles[d.candles.length-1].close,idx=d.index,sy=d.symbol,bt=(c,a,t)=>`<button class="${c}" data-ct2="${a}">${t}</button>`;
+ $("chTrade").innerHTML=(idx?"":bt("b","eq-BUY","Buy shares")+bt("s","eq-SELL","Sell shares")+bt("b","fut-BUY","Buy futures")+bt("s","fut-SELL","Sell futures"))+bt("b","opt-CE","Buy Call (CE)")+bt("s","opt-PE","Buy Put (PE)")+'<span class="sub">Opens the order ticket to review. Nothing is sent yet.</span>';
+ $("chTrade").onclick=async e=>{const b=e.target.closest("button[data-ct2]");if(!b)return;const [k,v]=b.dataset.ct2.split("-");
+  if(k==="eq")openTicket({kind:"equity",symbol:sy,label:sy,side:v,price:last});
+  else if(k==="fut")openTicket({kind:"future",symbol:sy,label:sy+" futures, nearest month",side:v,price:last,tf:chTf});
+  else{b.disabled=true;try{await atmOption(sy,v,chTf,$("chMsg"),"trade")}finally{b.disabled=false}}}}
 function initChart(){
  $("chTfs").onclick=e=>{const b=e.target.closest("button");if(b){chTf=b.dataset.ct;chAt=0;$("chTfs").querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.ct===chTf));drawChart()}};
  $("chClose").onclick=()=>$("chartDlg").close();
@@ -7454,6 +7521,8 @@ async function drawChart(){
  const ink=col("--ink","#222"),line=col("--line","#ddd"),up=col("--buy","#0a7d5a"),dn=col("--sell","#c0392b");
  const ch=LightweightCharts.createChart($("chart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:d.intraday,secondsVisible:false},crosshair:{mode:0}});
  chObj=ch;
+ if(d.lines){const sp=ch.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp.setData(d.lines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
+  const ep=ch.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ep.setData(d.lines.ema.map(([t,v])=>({time:t,value:v})))}
  const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(d.candles);
  cs.setMarkers(d.markers.map(m=>m.side==="BUY"?{time:m.time,position:"belowBar",color:up,shape:"arrowUp",text:"BUY"}:{time:m.time,position:"aboveBar",color:dn,shape:"arrowDown",text:"SELL"}));
  const sg=d.signal,last=d.candles[d.candles.length-1].time,leg=[];
@@ -7461,7 +7530,7 @@ async function drawChart(){
   lv(sg.entry,ink,"Entry",0);lv(sg.sl,dn,"SL"+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(sg.hits>i?" ✓":""),2));
   leg.unshift(`<b class="${sg.side==="BUY"?"up":"dn"}">${esc(sg.state)}</b> <span>signal candle ${esc(sg.time)}, ${esc(sg.status)}</span>`)}
  else leg.unshift("<span>No signal to show levels for on this timeframe.</span>");
- $("chLeg").innerHTML=leg.join("");
+ $("chLeg").innerHTML=leg.join("");chTradeBar(d);
  ch.timeScale().fitContent();if(d.candles.length>120)ch.timeScale().setVisibleLogicalRange({from:d.candles.length-120,to:d.candles.length+4})}
 const OC_M={oi:["Open interest","oi","n"],doi:["Change in OI","doi","n"],vol:["Volume","vol","n"],ltp:["Premium","ltp","p"]};
 let ocm="oi";try{ocm=localStorage.getItem("ocm")||"oi"}catch(e){}
@@ -7501,11 +7570,21 @@ async function ogLoad(){const my=++oreq2;$("ogMsg").textContent="Loading prices�
  try{const d=await (await api(`/api/options/history?symbol=${encodeURIComponent(lastChain.symbol)}&expiry=${encodeURIComponent(lastChain.expiry)}&strike=${og.k}&tf=${og.tf}&days=${og.days}`)).json();if(my!==oreq2)return;
   if(d.error){$("ogMsg").textContent=d.error;return}$("ogMsg").textContent="";og.data=d;ogDraw()}catch(e){if(my===oreq2)$("ogMsg").textContent="Cannot reach the server."}}
 let oreq2=0;
+function indSvg(pk,o){if(!pk)return "";const idx=new Map(o.tl.map((t,i)=>[t,i])),sg=pk.sig;let r="";
+ if(o.lines){const seg=[];let cur=null;for(const [t,v,dr] of pk.stop){const i=idx.get(t);if(i==null)continue;if(!cur||cur.dr!==dr){cur={dr,pts:[]};seg.push(cur)}cur.pts.push(`${o.x(i)},${o.y(v)}`)}
+  for(const g of seg)if(g.pts.length>1)r+=`<polyline fill="none" stroke="${g.dr===1?"var(--buy)":"var(--sell)"}" stroke-width="1.4" opacity=".8" points="${g.pts.join(" ")}"/>`;
+  const ep=pk.ema.map(([t,v])=>{const i=idx.get(t);return i==null?null:`${o.x(i)},${o.y(v)}`}).filter(Boolean);if(ep.length>1)r+=`<polyline fill="none" stroke="var(--mute)" stroke-width="1.2" stroke-dasharray="3 3" points="${ep.join(" ")}"/>`}
+ if(sg){const i0=idx.has(sg.t)?idx.get(sg.t):0,buy=sg.side==="BUY";
+  if(o.levels){const L=[["Entry",sg.entry,"var(--ink)",""],["SL"+(sg.sl_hit?" ✖":""),sg.sl,"var(--sell)",""],...sg.tps.map((q,k)=>["T"+(k+1)+(sg.hits>k?" ✓":""),q,"var(--buy)","4 3"])];
+   for(const [nm,v,c,da] of L){if(v<o.lo||v>o.hi)continue;r+=`<line x1="${o.x(i0)}" x2="${o.W-o.pr}" y1="${o.y(v)}" y2="${o.y(v)}" stroke="${c}" stroke-width="1.2" ${da?`stroke-dasharray="${da}"`:""}/><text x="${o.W-o.pr-3}" y="${o.y(v)-3}" text-anchor="end" fill="${c}">${nm}</text>`}}
+  if(sg.visible&&idx.has(sg.t)){const c=o.cand.get(sg.t);if(c){const px=o.x(idx.get(sg.t)),py=buy?o.y(c.l)+4:o.y(c.h)-4,cl=buy?"var(--buy)":"var(--sell)",dy=buy?9:-9;
+   r+=`<polygon points="${px},${py} ${px-6},${py+dy} ${px+6},${py+dy}" fill="${cl}"/><text x="${px}" y="${py+(buy?21:-13)}" text-anchor="middle" fill="${cl}" style="font-weight:700">${buy?"BUY":"SELL"}</text>`}}}
+ return `<g clip-path="url(#${o.clip})">${r}</g>`}
 function ogDraw(){const d=og.data;if(!d)return;og.und=null;const sides=og.view==="both"?["ce","pe"]:[og.view],col={ce:"#ff9f43",pe:"#35c9ff"};
  const maps={};for(const s of ["ce","pe"]){maps[s]=new Map((d[s]||[]).map(c=>[c.t,c]))}
  const tl=[...new Set(sides.flatMap(s=>(d[s]||[]).map(c=>c.t)))].sort((a,b)=>a-b),n=tl.length;if(!n){$("ogMsg").textContent="No candles for this side.";return}
  const U=d.und&&d.und.length?d.und:null,uh=U?170:0,W=Math.max($("ogSvg").clientWidth||700,Math.min(2400,n*(og.view==="both"?5:7)+70)),H0=sides.length===1?330:290,H=H0+uh,pl=64,pr=10,pt=10,pb=26,vh=sides.length===1?60:0,ph=H0-pt-pb-vh;
- const vals=sides.flatMap(s=>(d[s]||[]).flatMap(c=>og.view==="both"?[c.c]:[c.h,c.l])),mx=Math.max(...vals),mn=Math.min(...vals),pad=(mx-mn)*.06||1,hi=mx+pad,lo=Math.max(0,mn-pad);
+ const ipk=og.view==="both"?null:(d.ind||{})[og.view],isg=ipk&&ipk.sig,vals=sides.flatMap(s=>(d[s]||[]).flatMap(c=>og.view==="both"?[c.c]:[c.h,c.l])).concat(isg?[isg.entry,isg.sl,isg.tps[0]]:[]),mx=Math.max(...vals),mn=Math.min(...vals),pad=(mx-mn)*.06||1,hi=mx+pad,lo=Math.max(0,mn-pad);
  const y=v=>pt+(hi-v)/(hi-lo)*ph,step=(W-pl-pr)/n,x=i=>pl+(i+.5)*step;
  const tk=(()=>{const raw=(hi-lo)/5,p=Math.pow(10,Math.floor(Math.log10(raw||1))),m=raw/p;return (m<=1?1:m<=2?2:m<=5?5:10)*p})();
  let g="";for(let t=Math.ceil(lo/tk)*tk;t<=hi;t+=tk)g+=`<line class="ax" x1="${pl}" x2="${W-pr}" y1="${y(t)}" y2="${y(t)}"/><text x="${pl-5}" y="${y(t)+3}" text-anchor="end">${f2(t)}</text>`;
@@ -7518,17 +7597,24 @@ function ogDraw(){const d=og.data;if(!d)return;og.und=null;const sides=og.view==
   tl.forEach((t,i)=>{const c=maps[s].get(t);if(!c)return;const up=c.c>=c.o,cl=up?"var(--buy)":"var(--sell)",top=y(Math.max(c.o,c.c)),bh=Math.max(1,Math.abs(y(c.o)-y(c.c)));
    body+=`<line x1="${x(i)}" x2="${x(i)}" y1="${y(c.h)}" y2="${y(c.l)}" stroke="${cl}"/><rect x="${x(i)-bw/2}" y="${top}" width="${bw}" height="${bh}" fill="${cl}"/>`
    +`<rect x="${x(i)-bw/2}" y="${H0-pb-c.v/vmax*(vh-8)}" width="${bw}" height="${c.v/vmax*(vh-8)}" fill="${col[s]}" opacity=".45"/>`})}
- let und="";
- if(U){const um=new Map(U.map(c=>[c.t,c])),y0=H0-pb+22,ub=H-pb-4,uhh=ub-y0,vals2=tl.map(t=>um.get(t)).filter(Boolean).flatMap(c=>[c.h,c.l]);
+ const idc=s=>new Map((d[s]||[]).map(c=>[c.t,{h:c.h,l:c.l,c:c.c}]));
+ let ind="";
+ if(og.view==="both"){for(const s of ["ce","pe"]){const pk=(d.ind||{})[s];if(pk)ind+=indSvg({stop:[],ema:[],sig:pk.sig},{tl,x,y,lo,hi,W,pr,lines:false,levels:false,cand:new Map([...idc(s)].map(([t,c])=>[t,{h:c.c,l:c.c}])),clip:"ogcA"})}}
+ else if(ipk)ind=indSvg(ipk,{tl,x,y,lo,hi,W,pr,lines:true,levels:true,cand:idc(og.view),clip:"ogcA"});
+ let und="",defs=`<clipPath id="ogcA"><rect x="${pl}" y="${pt}" width="${W-pl-pr}" height="${ph}"/></clipPath>`;
+ if(U){const um=new Map(U.map(c=>[c.t,c])),y0=H0-pb+22,ub=H-pb-4,uhh=ub-y0,upk=(d.ind||{}).und,usg=upk&&upk.sig,vals2=tl.map(t=>um.get(t)).filter(Boolean).flatMap(c=>[c.h,c.l]).concat(usg?[usg.entry,usg.sl,usg.tps[0]]:[]);
   if(vals2.length){const mx2=Math.max(...vals2),mn2=Math.min(...vals2),pd2=(mx2-mn2)*.08||1,h2=mx2+pd2,l2=mn2-pd2,uy=v=>y0+(h2-v)/(h2-l2)*uhh,raw=(h2-l2)/4,pw=Math.pow(10,Math.floor(Math.log10(raw||1))),mm=raw/pw,tk2=(mm<=1?1:mm<=2?2:mm<=5?5:10)*pw,bw2=Math.max(1,Math.min(14,step*.7));
    und+=`<text x="${pl}" y="${y0-8}" class="ugl" style="font-weight:700">${esc(d.symbol)} (parent script, same time axis)</text><line class="ax" x1="${pl}" x2="${W-pr}" y1="${y0}" y2="${y0}"/>`;
    for(let t=Math.ceil(l2/tk2)*tk2;t<=h2;t+=tk2)und+=`<line class="ax" x1="${pl}" x2="${W-pr}" y1="${uy(t)}" y2="${uy(t)}"/><text x="${pl-5}" y="${uy(t)+3}" text-anchor="end">${f2(t)}</text>`;
    tl.forEach((t,i)=>{const c=um.get(t);if(!c)return;const cl=c.c>=c.o?"var(--buy)":"var(--sell)";und+=`<line x1="${x(i)}" x2="${x(i)}" y1="${uy(c.h)}" y2="${uy(c.l)}" stroke="${cl}"/><rect x="${x(i)-bw2/2}" y="${uy(Math.max(c.o,c.c))}" width="${bw2}" height="${Math.max(1,Math.abs(uy(c.o)-uy(c.c)))}" fill="${cl}"/>`});
-   og.und=um}}
- $("ogSvg").innerHTML=`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(d.symbol)} ${d.strike} price chart with the parent script">${g}${body}${und}${xl}<line class="xh" id="ogx" x1="0" x2="0" y1="${pt}" y2="${H-pb}" visibility="hidden"/></svg>`;
+   und+=indSvg(upk,{tl,x,y:uy,lo:l2,hi:h2,W,pr,lines:true,levels:true,cand:new Map(U.map(c=>[c.t,{h:c.h,l:c.l,c:c.c}])),clip:"ogcB"});
+   defs+=`<clipPath id="ogcB"><rect x="${pl}" y="${y0}" width="${W-pl-pr}" height="${uhh}"/></clipPath>`;og.und=um}}
+ $("ogSvg").innerHTML=`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(d.symbol)} ${d.strike} price chart with the parent script"><defs>${defs}</defs>${g}${body}${ind}${und}${xl}<line class="xh" id="ogx" x1="0" x2="0" y1="${pt}" y2="${H-pb}" visibility="hidden"/></svg>`;
  og.geom={pl,step,n,tl,maps,W};
  const sm=s=>{const a=d[s]||[];if(!a.length)return `<div><b style="color:${col[s]}">${s==="ce"?"Call":"Put"}</b> no candles</div>`;const o=a[0].o,l=a[a.length-1].c,ch=(l-o)/o*100;
   return `<div><b style="color:${col[s]}">${s==="ce"?"Call (CE)":"Put (PE)"}</b> last <b>${f2(l)}</b> <span class="${ch>=0?"up":"dn"}">${ch>=0?"+":""}${ch.toFixed(1)}%</span><br>open ${f2(o)} · high ${f2(Math.max(...a.map(c=>c.h)))} · low ${f2(Math.min(...a.map(c=>c.l)))} · volume ${fk(a.reduce((q,c)=>q+c.v,0))}</div>`};
+ const lastC=s=>{const a=d[s]||[];return a.length?a[a.length-1].c:null},tb=(s,side,right)=>lastC(s)==null?"":`<button class="${side==="BUY"?"b":"s"}" data-ot="${side}-${right}">${side==="BUY"?"Buy":"Sell"} ${right==="CE"?"Call (CE)":"Put (PE)"} ${f2(lastC(s))}</button>`;
+ $("ogTrade").innerHTML=(og.view==="pe"?"":tb("ce","BUY","CE")+tb("ce","SELL","CE"))+(og.view==="ce"?"":tb("pe","BUY","PE")+tb("pe","SELL","PE"))+'<span class="sub">Opens the order ticket at this price to review. Nothing is sent yet.</span>';
  const um=U?(()=>{const o=U[0].o,l=U[U.length-1].c,ch=(l-o)/o*100;return `<div><b>${esc(d.symbol)}</b> last <b>${f2(l)}</b> <span class="${ch>=0?"up":"dn"}">${ch>=0?"+":""}${ch.toFixed(2)}%</span><br>open ${f2(o)} · high ${f2(Math.max(...U.map(c=>c.h)))} · low ${f2(Math.min(...U.map(c=>c.l)))}</div>`})():`<div class="sub">${esc(d.und_error||"No chart for the parent script.")}</div>`;
  $("ogSum").innerHTML=(og.view==="pe"?"":sm("ce"))+(og.view==="ce"?"":sm("pe"))+um}
 function ogHover(e){const gm=og.geom,sv=$("ogSvg").querySelector("svg");if(!gm||!sv)return;const r=sv.getBoundingClientRect(),px=(e.clientX-r.left)*(gm.W/r.width),i=Math.min(gm.n-1,Math.max(0,Math.floor((px-gm.pl)/gm.step)));
@@ -7539,6 +7625,8 @@ function initChainGraph(){
  $("ogClose").onclick=()=>$("optDlg").close();
  for(const [id,key] of [["ogView","view"],["ogTf","tf"],["ogDays","days"]])$(id).onclick=e=>{const b=e.target.closest("button[data-v]");if(!b)return;og[key]=key==="days"?+b.dataset.v:b.dataset.v;try{localStorage.setItem("og",JSON.stringify({tf:og.tf,days:og.days,view:og.view}))}catch(x){}ogSeg();if(key==="view"&&og.data)ogDraw();else ogLoad()};
  $("ogSvg").addEventListener("pointermove",ogHover);
+ $("ogTrade").onclick=e=>{const b=e.target.closest("button[data-ot]");if(!b||!og.data)return;const [side,right]=b.dataset.ot.split("-"),a=og.data[right.toLowerCase()]||[];if(!a.length)return;
+  openTicket({kind:"option",symbol:og.data.symbol,expiry:og.data.expiry,strike:og.k,right,side,price:a[a.length-1].c,label:`${og.data.symbol} ${og.k} ${right} ${og.data.expiry}`})};
 $("ocSeg").onclick=e=>{const b=e.target.closest("button[data-m]");if(!b||b.disabled)return;ocm=b.dataset.m;try{localStorage.setItem("ocm",ocm)}catch(x){}drawChain(lastChain)};
  $("ocOn").checked=(()=>{try{return localStorage.getItem("ocOn")!=="0"}catch(e){return true}})();
  $("ocOn").onchange=()=>{try{localStorage.setItem("ocOn",$("ocOn").checked?"1":"0")}catch(x){}drawChain(lastChain)}}
@@ -7581,32 +7669,7 @@ function renderChain(d){
  tb.innerHTML=`<thead><tr><th class="g" colspan="${cH.length}">Calls</th><th class="k" rowspan="2">Strike</th><th class="g" colspan="${pH.length}">Puts</th></tr><tr>${cH.map(h=>`<th>${h}</th>`).join("")}${pH.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${rows}</tbody>`;
  box.textContent=(d.note?d.note+" ":"")+(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The signal is calculated on the underlying's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click B or S beside a price to buy or sell that option.";
 }
-setInterval(()=>{if((mode==="options"||mode==="index")&&osym)loadChain(true)},60000);
-// ── Index Options tab: NIFTY and BANKNIFTY on 5 min and 15 min ──
-let ixData=null,ixTimer=null;
-function ixPaint(){$("ixSym").innerHTML=["NIFTY","BANKNIFTY","SENSEX"].map(x=>`<button data-s="${x}" aria-pressed="${x===osym}">${x}</button>`).join("");
- $("ixTfs").innerHTML=["5m","15m"].map(x=>`<button data-t="${x}" aria-pressed="${x===ixTf}">${tfName[x]||x}</button>`).join("");ixMatrix()}
-function ixMatrix(){const box=$("ixMat");if(!ixData){box.innerHTML="";return}
- box.innerHTML=ixData.symbols.flatMap(sy=>ixData.tfs.map(t=>{const r=(ixData.data[t]||{})[sy],sg=r?r.signal:"–",fr=sg==="BUY"||sg==="SELL";
-  const c=r&&r.chg!=null?`<span class="${r.chg>=0?"up":"dn"}">${r.chg>0?"+":""}${r.chg.toFixed(2)}%</span>`:"";
-  return `<button class="ixc ${fr?"fresh "+sg:""}" data-s="${sy}" data-t="${t}" aria-pressed="${sy===osym&&t===ixTf}"><span class="t">${sy} · ${tfName[t]||t}</span><span><span class="pill ${sg.replace(" ","_")}">${sg}</span></span><span class="px">${r?f2(r.price)+" ":""}${c}${r&&r.signal_time!=="–"?" · "+esc(r.signal_time):""}</span></button>`})).join("");
- $("ixNote").textContent=ixData.scanning?"Scanning the latest candles…":""}
-async function ixLoad(){clearTimeout(ixTimer);if(mode!=="index")return;
- try{ixData=await (await api("/api/index/overview")).json();ixMatrix()}catch(e){}
- ixSignals();
- ixTimer=setTimeout(ixLoad,ixData&&ixData.scanning?3000:20000)}
-async function ixSignals(){const sy=osym,t=ixTf;$("ixHTitle").textContent=`Last 10 signals · ${sy} · ${tfName[t]||t}`;
- try{const d=await (await api(`/api/index/signals?symbol=${sy}&tf=${t}`)).json();if(sy!==osym||t!==ixTf)return;
-  const tb=$("ixHist");if(d.error||!d.signals.length){tb.innerHTML=`<tbody><tr><td class="empty">${d.error?esc(d.error):d.scanned?"No signals in the candles loaded for this timeframe.":"Scanning the latest candles…"}</td></tr></tbody>`;return}
-  tb.innerHTML="<thead><tr><th>Signal candle</th><th>Side</th><th>Entry</th><th>SL</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Result</th><th></th></tr></thead><tbody>"+d.signals.map(r=>{const tp=(p,i)=>`<td class="${r.hits>i?"up":""}">${f2(p)}${r.hits>i?" ✓":""}</td>`;
-   return `<tr><td>${esc(r.time)}</td><td><span class="pill ${r.side}">${r.side}</span></td><td>${f2(r.entry)}</td><td class="${r.sl_hit?"dn":""}">${f2(r.sl)}${r.sl_hit?" ✖":""}</td>${r.tps.map(tp).join("")}<td>${esc(r.status)}</td><td><button class="mini" data-at="${r.t}">Chart</button></td></tr>`}).join("")+"</tbody>"}catch(e){}}
-function ixPick(sym,t){if(sym)osym=sym;if(t){ixTf=t;try{localStorage.setItem("ixTf",t)}catch(e){}}oexp="";ixPaint();loadChain();ixSignals()}
-function initIndex(){
- $("ixSym").onclick=e=>{const b=e.target.closest("button");if(b)ixPick(b.dataset.s,null)};
- $("ixTfs").onclick=e=>{const b=e.target.closest("button");if(b)ixPick(null,b.dataset.t)};
- $("ixMat").onclick=e=>{const b=e.target.closest(".ixc");if(b)ixPick(b.dataset.s,b.dataset.t)};
- $("ixChart").onclick=()=>openChart(osym,ixTf);
- $("ixHist").onclick=e=>{const b=e.target.closest("[data-at]");if(b)openChart(osym,ixTf,+b.dataset.at)}}
+setInterval(()=>{if(mode==="options"&&osym)loadChain(true)},60000);
 // ── Orders and order ticket ──
 let tk=null,tkToken=null,tradeInfo={mode:"paper",caps:{}},lastChain=null;
 const $=id=>document.getElementById(id);
@@ -7649,7 +7712,7 @@ $("tkQty").addEventListener("input",fundsPaint);
 $("tkFunds").onclick=e=>{if(e.target.id==="tkMax"&&fundsInfo&&fundsInfo.max_qty!=null){$("tkQty").value=Math.max(1,fundsInfo.max_qty);resetReview();fundsPaint()}};
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-initChart();initFlash();initModes();initIndex();initScanner();initBot();initBacktest();initConf();initInstall();initChainGraph();
+initChart();initFlash();initModes();initScanner();initBot();initBacktest();initConf();initInstall();initChainGraph();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
