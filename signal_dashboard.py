@@ -2817,11 +2817,20 @@ def bot_opt_ltp(u, pos):
 # the stop moves to the entry at T1, to T1 at T2, to T2 at T3, and everything is sold at T4 or at the stop. Closed by OPTBOT_SQUAREOFF.
 OPTBOT_FRESH_BARS = int(os.getenv("OPTBOT_FRESH_BARS", "1"))   # a signal counts as fresh while it is at most this many candles old
 AUTO_TFS = ("5m", "15m")
+AUTO_CONT_START = os.getenv("AUTO_CONT_START", "09:15")   # continuation trades (yesterday's signal still open, price back near the 20 EMA) are only taken in this window
+AUTO_CONT_END = os.getenv("AUTO_CONT_END", "09:45")
+
+
+def cont_window_open():
+    t = ist_now().strftime("%H:%M")
+    return AUTO_CONT_START <= t < AUTO_CONT_END
+
+
 AUTO_MOVE_MIN = float(os.getenv("AUTO_MOVE_MIN", "1"))   # the scanner autopilot only trades stocks whose move today (up or down) is between these percentages
 AUTO_MOVE_MAX = float(os.getenv("AUTO_MOVE_MAX", "3"))
 AUTO_SEEN = {}   # (user id, bot, symbol, timeframe, signal time, side) -> True: each signal is acted on once
-AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 or 15 minute chart (a 5 minute BUY is taken only while the 15 minute chart is also in a BUY zone, and a 5 minute SELL only in a SELL zone), "
-              "or when a signal from an earlier day is still open and the price is back near its 20 EMA. Stop-loss and targets T1 to T4 are the indicator's own: "
+AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 or 15 minute chart (the 5 and the 15 minute charts must both be in the same direction: a BUY only while the other chart is also in a BUY zone, a SELL only while it is in a SELL zone, for fresh and continuation trades alike), "
+              f"or, only from {AUTO_CONT_START} to {AUTO_CONT_END}, when a signal from an earlier day is still open and the price is back near its 20 EMA. Stop-loss and targets T1 to T4 are the indicator's own: "
               "the stop moves to the entry at T1, to T1 at T2, to T2 at T3, and it sells everything at T4 or at the stop.")
 
 
@@ -2849,10 +2858,13 @@ def auto_candidates(u, cfg, kind, why=None, manual=False):
     def no(label, text):
         if why is not None:
             why.append(f"{label}: {text}")
-    big = auto_rows(kind, "15m")   # the 15 minute chart is the zone filter for 5 minute entries
-    zone = {r["symbol"]: r.get("side") for r in (big or []) if (r.get("signal") or "–") != "–" and not r.get("sl_hit")}
+    cont_window, cont_noted = cont_window_open(), False
+    tfrows = {tf: auto_rows(kind, tf) for tf in AUTO_TFS}
+    zones = {tf: {r["symbol"]: r.get("side") for r in (tfrows[tf] or []) if (r.get("signal") or "–") != "–" and not r.get("sl_hit")} for tf in AUTO_TFS}   # who is in a BUY or SELL zone on each chart
     for tf in AUTO_TFS:
-        rows = big if tf == "15m" else auto_rows(kind, tf)
+        rows = tfrows[tf]
+        other = "15m" if tf == "5m" else "5m"
+        zone = zones[other]
         if rows is None:
             no(tf, "no data yet")
             continue
@@ -2866,15 +2878,20 @@ def auto_candidates(u, cfg, kind, why=None, manual=False):
                 if mv is None or not (AUTO_MOVE_MIN <= abs(mv) <= AUTO_MOVE_MAX):
                     no(label, f"{side} skipped: moved {'%+.2f%%' % mv if mv is not None else 'unknown'} today, needs {AUTO_MOVE_MIN:g}% to {AUTO_MOVE_MAX:g}% either way")
                     continue
-            if tf == "5m" and zone.get(sym) != side:
+            if zone.get(sym) != side:   # the 5 and the 15 minute charts must point the same way, for fresh and continuation entries alike
                 z = zone.get(sym)
-                no(label, f"{side} on 5 min skipped: the 15 minute chart is " + (f"in a {z} zone" if z else "not in any zone"))
+                no(label, f"{side} on {tf[:-1]} min skipped: the {other[:-1]} minute chart is " + (f"in a {z} zone" if z else "not in any zone"))
                 continue
             sdate = r.get("signal_date")
             fresh = r.get("bars_ago") is not None and r["bars_ago"] <= OPTBOT_FRESH_BARS and sdate == today
             cont = not fresh and sig.startswith("Open") and bool(sdate) and sdate < today
             if not fresh and not cont:
                 continue   # a signal from earlier today that is no longer fresh is not traded
+            if cont and not cont_window:
+                if not cont_noted:
+                    no("continuation", f"yesterday's open signals are only traded from {AUTO_CONT_START} to {AUTO_CONT_END}")
+                    cont_noted = True
+                continue
             if (fresh and ent == "gap") or (cont and ent == "fresh"):
                 continue
             if r.get("hits"):
