@@ -2817,6 +2817,7 @@ def bot_opt_ltp(u, pos):
 # the stop moves to the entry at T1, to T1 at T2, to T2 at T3, and everything is sold at T4 or at the stop. Closed by OPTBOT_SQUAREOFF.
 OPTBOT_FRESH_BARS = int(os.getenv("OPTBOT_FRESH_BARS", "1"))   # a signal counts as fresh while it is at most this many candles old
 AUTO_TFS = ("5m", "15m")
+AUTO_ENTRY_TFS = tuple(t for t in os.getenv("AUTO_ENTRY_TFS", "5m").replace(" ", "").split(",") if t in AUTO_TFS) or ("5m",)   # entries are only taken on these charts; the other chart is still read for the same-direction zone check
 AUTO_CONT_START = os.getenv("AUTO_CONT_START", "09:15")   # continuation trades (yesterday's signal still open, price back near the 20 EMA) are only taken in this window
 AUTO_CONT_END = os.getenv("AUTO_CONT_END", "09:45")
 
@@ -2829,7 +2830,7 @@ def cont_window_open():
 AUTO_MOVE_MIN = float(os.getenv("AUTO_MOVE_MIN", "1"))   # the scanner autopilot only trades stocks whose move today (up or down) is between these percentages
 AUTO_MOVE_MAX = float(os.getenv("AUTO_MOVE_MAX", "3"))
 AUTO_SEEN = {}   # (user id, bot, symbol, timeframe, signal time, side) -> True: each signal is acted on once
-AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 or 15 minute chart (the 5 and the 15 minute charts must both be in the same direction: a BUY only while the other chart is also in a BUY zone, a SELL only while it is in a SELL zone, for fresh and continuation trades alike), "
+AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 minute chart (entries are taken on the 5 minute chart only; the 15 minute chart must be in the same direction: a BUY only while the other chart is also in a BUY zone, a SELL only while it is in a SELL zone, for fresh and continuation trades alike), "
               f"or, only from {AUTO_CONT_START} to {AUTO_CONT_END}, when a signal from an earlier day is still open and the price is back near its 20 EMA. Stop-loss and targets T1 to T4 are the indicator's own: "
               "the stop moves to the entry at T1, to T1 at T2, to T2 at T3, and it sells everything at T4 or at the stop.")
 
@@ -2862,6 +2863,8 @@ def auto_candidates(u, cfg, kind, why=None, manual=False):
     tfrows = {tf: auto_rows(kind, tf) for tf in AUTO_TFS}
     zones = {tf: {r["symbol"]: r.get("side") for r in (tfrows[tf] or []) if (r.get("signal") or "–") != "–" and not r.get("sl_hit")} for tf in AUTO_TFS}   # who is in a BUY or SELL zone on each chart
     for tf in AUTO_TFS:
+        if tf not in AUTO_ENTRY_TFS:
+            continue
         rows = tfrows[tf]
         other = "15m" if tf == "5m" else "5m"
         zone = zones[other]
@@ -6144,6 +6147,8 @@ def replay_run(data, kind, day, cfg):
             prev = float(S5["c"][d0 - 1]) if d0 > 0 else None
             chg = (ltp / prev - 1) * 100 if prev else None
             for tf in ("5m", "15m"):
+                if tf not in AUTO_ENTRY_TFS:
+                    continue
                 g = st[tf]
                 if not g or not g["open"]:
                     continue
