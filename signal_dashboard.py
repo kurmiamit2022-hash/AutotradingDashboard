@@ -6260,6 +6260,58 @@ def replay_run_range(data, kind, days, cfg):
             "skips": sorted(skips.items(), key=lambda x: -x[1]), "per_day": per_day, "equity": eq, "max_trades": int(cfg.get("max_trades", 3)), "entries": cfg.get("entries", "both")}
 
 
+def _bs_call_put(spot, strike, t, vol, right, rate=0.07):
+    """Black-Scholes price of a European option."""
+    if t <= 0 or vol <= 0:
+        return max(0.0, (spot - strike) if right == "CE" else (strike - spot))
+    d1 = (math.log(spot / strike) + (rate + vol * vol / 2) * t) / (vol * math.sqrt(t))
+    d2 = d1 - vol * math.sqrt(t)
+    cdf = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
+    if right == "CE":
+        return spot * cdf(d1) - strike * math.exp(-rate * t) * cdf(d2)
+    return strike * math.exp(-rate * t) * cdf(-d2) - spot * cdf(-d1)
+
+
+def _expiry_after(symbol, d):
+    """The next NSE expiry on or after date d: every Tuesday for NIFTY, the last Tuesday of the month for stocks."""
+    if symbol == "NIFTY":
+        return d + timedelta(days=(1 - d.weekday()) % 7)
+    for add in (0, 1):
+        y, m = d.year + (d.month + add - 1) // 12, (d.month + add - 1) % 12 + 1
+        last = (datetime(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1)).date()
+        last -= timedelta(days=(last.weekday() - 1) % 7)
+        if last >= d:
+            return last
+    return d
+
+
+def replay_option(symbol, S, k0, k1, day, entry, exit_px, dr):
+    """An estimate of what the at-the-money option bought at the signal would have been worth at the exit.
+    Past option prices are not available here, so this prices the option with Black-Scholes: strike = the entry price,
+    volatility = the stock's own recent 5 minute volatility, the nearest expiry, and time passing between entry and exit."""
+    try:
+        c = np.asarray(S["c"][max(0, k0 - 375):k0 + 1], dtype=float)
+        rets = np.diff(np.log(c[c > 0]))
+        vol = float(np.std(rets) * math.sqrt(75 * 252)) if len(rets) > 20 else 0.3
+        vol = min(0.9, max(0.15, vol))
+        d = datetime.strptime(str(day)[:10], "%Y-%m-%d").date()
+        days = (_expiry_after(symbol, d) - d).days
+        t_in = (S["close_ts"][k0]); t_out = (S["close_ts"][k1])
+        mins = max(0.0, (float(t_out) - float(t_in)) / 60.0)
+        hr = pd.Timestamp(t_in, unit="s", tz="UTC").tz_convert(IST)
+        left = max(0.0, (15.5 - (hr.hour + hr.minute / 60)) / 24)
+        t0 = max(0.5, days + left) / 365.0
+        t1 = max(0.25 / 365.0, t0 - mins / 1440.0 / 365.0)
+        right = "CE" if dr == 1 else "PE"
+        p0 = _bs_call_put(entry, entry, t0, vol, right)
+        p1 = _bs_call_put(exit_px, entry, t1, vol, right)
+        if p0 <= 0:
+            return {}
+        return {"opt_in": round(p0, 2), "opt_out": round(p1, 2), "opt_pct": round((p1 / p0 - 1) * 100, 1), "opt_iv": round(vol * 100)}
+    except Exception:
+        return {}
+
+
 def replay_trade(c, day):
     """Follow one entry on the stock or index itself: stop-loss first, then T1 to T4 with the stop moving up behind them, out at 15:15."""
     g, S = c["g"], c["S5"]
@@ -6269,11 +6321,13 @@ def replay_trade(c, day):
     stop, step = g["sl"], 0
     start = c["k5"]
     exit_px, exit_at, why = None, None, None
+    kx = start
     sq = OPTBOT_SQUAREOFF.strftime("%H:%M")
     for k in range(start + 1, S["n"]):
         if S["dates"][k] != day:
             break
         ck = _hm(S["close_ts"][k])
+        kx = k
         hi, lo = S["hi"][k], S["lo"][k]
         if (dr == 1 and lo <= stop) or (dr == -1 and hi >= stop):
             exit_px, exit_at, why = stop, ck, "stop-loss" if step == 0 else ("back to the entry after T1" if step == 1 else f"back to the stop after T{step}")
@@ -6290,10 +6344,12 @@ def replay_trade(c, day):
     if exit_px is None:
         k = max(k for k in range(S["n"]) if S["dates"][k] == day)
         exit_px, exit_at, why = float(S["c"][k]), _hm(S["close_ts"][k]), "end of data"
+        kx = k
+    op = replay_option(c["symbol"], S, start, kx, day, entry, exit_px, dr)
     r = round((exit_px - entry) * dr / risk, 2) if risk else 0.0
     return {"symbol": c["symbol"], "side": g["side"], "right": "CE" if g["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "entered": c["at"], "entry": round(entry, 2),
             "sl": round(g["sl"], 2), "t1": round(lv[0], 2), "t4": round(lv[3], 2), "exit": round(exit_px, 2), "exit_at": exit_at, "exit_hhmm": exit_at, "reason": why, "targets": step,
-            "r": r, "pct": round((exit_px / entry - 1) * 100 * dr, 2), "ts": c["sts"], "day": day}
+            "r": r, "pct": round((exit_px / entry - 1) * 100 * dr, 2), "ts": c["sts"], "day": day, **op}
 
 
 def replay_job(uid, kind, day):
@@ -7840,7 +7896,7 @@ async function rpRun(p){const b=$(p+"RRun"),m=$(p+"RMsg");b.disabled=true;$(p+"R
 const rpInr=v=>(v<0?"-":"")+"₹"+Math.abs(Math.round(v)).toLocaleString("en-IN");
 function rpSim(r,cap,feePct){const tr=r.trades.slice().sort((a,b)=>(a.day||r.day)<(b.day||r.day)?-1:(a.day||r.day)>(b.day||r.day)?1:a.entered<b.entered?-1:1),out={};
  for(const comp of [true,false]){let eq=cap,peak=cap,dd=0,ddp=0;const curve=[cap],days={};
-  for(const t of tr){const pnl=(comp?eq:cap)*((t.pct||0)-feePct)/100;eq+=pnl;const d=t.day||r.day;days[d]=(days[d]||0)+pnl;curve.push(eq);peak=Math.max(peak,eq);dd=Math.max(dd,peak-eq);ddp=Math.max(ddp,(peak-eq)/peak*100)}
+  for(const t of tr){const pnl=(comp?eq:cap)*(((t.opt_pct!=null?t.opt_pct:(t.pct||0)))-feePct)/100;eq+=pnl;const d=t.day||r.day;days[d]=(days[d]||0)+pnl;curve.push(eq);peak=Math.max(peak,eq);dd=Math.max(dd,peak-eq);ddp=Math.max(ddp,(peak-eq)/peak*100)}
   out[comp?"c":"f"]={end:eq,curve,dd,ddp,days:Object.entries(days).map(([day,v])=>({day,v}))}}
  return out}
 function rpCharts(eq,pd,fmt,base,title){if(eq.length<2)return "";const W=640,H=150,pl=52,pr=8,pt=8,pb=18,n=eq.length,lo=Math.min(base,...eq),hi=Math.max(base,...eq),sp=(hi-lo)||1,x=i=>pl+i/(n-1)*(W-pl-pr),y=v=>pt+(hi-v)/sp*(H-pt-pb);
@@ -7851,24 +7907,24 @@ function rpCharts(eq,pd,fmt,base,title){if(eq.length<2)return "";const W=640,H=1
   bars=`<svg viewBox="0 0 ${W} ${H2}" role="img" aria-label="Result of each day"><line class="ax" x1="${pl}" x2="${W-pr}" y1="${mid}" y2="${mid}"/><text x="${pl-4}" y="${pt+8}" text-anchor="end">+${fmt(m,1)}</text><text x="${pl-4}" y="${H2-pb}" text-anchor="end">-${fmt(m,1)}</text>`+pd.map((d,i)=>{const h=Math.abs(d.v)*sc,yy=d.v>=0?mid-h:mid;return `<rect x="${pl+i*bw+1}" y="${yy}" width="${Math.max(2,bw-2)}" height="${Math.max(1,h)}" fill="${d.v>=0?"var(--buy)":"var(--sell)"}"><title>${d.day}: ${d.v>0?"+":""}${fmt(d.v,1)}</title></rect>`}).join("")+`<text x="${pl}" y="${H2-4}">${pd[0].day.slice(5)}</text><text x="${W-pr}" y="${H2-4}" text-anchor="end">${pd[pd.length-1].day.slice(5)}</text></svg>`}
  return `<div class="rpch"><div class="sub">${title}</div>${svg}${bars?`<div class="sub">Result of each day</div>${bars}`:""}</div>`}
 function rpTrade(r,x){return x.taken?r.trades.find(t=>(t.day||r.day)===(x.day||r.day)&&t.symbol===x.symbol&&t.tf===x.tf&&t.entered===x.at):null}
-function rpByTf(r){const o={};for(const t of r.trades){const k=o[t.tf]=o[t.tf]||{n:0,w:0,l:0,tr:0,pct:0,gw:0,gl:0};k.n++;k.tr+=t.r;k.pct+=t.pct||0;if(t.r>0){k.w++;k.gw+=t.r}else if(t.r<0){k.l++;k.gl-=t.r}}
+function rpByTf(r){const o={};for(const t of r.trades){const k=o[t.tf]=o[t.tf]||{n:0,w:0,l:0,tr:0,pct:0,op:0,gw:0,gl:0};k.n++;k.op+=t.opt_pct||0;k.tr+=t.r;k.pct+=t.pct||0;if(t.r>0){k.w++;k.gw+=t.r}else if(t.r<0){k.l++;k.gl-=t.r}}
  const ks=Object.keys(o).sort();if(!ks.length)return "";const f=(v,d=2)=>(v>0?"+":"")+v.toFixed(d);
- return `<div class="wrap"><table><thead><tr><th>Chart</th><th>Trades</th><th>Win rate</th><th>Total R</th><th>Avg R / trade</th><th>Profit factor</th><th>Avg price move</th></tr></thead><tbody>`+ks.map(k=>{const a=o[k];return `<tr><td><b>${k==="5m"?"5 min":"15 min"}</b></td><td>${a.n}</td><td>${(a.w/a.n*100).toFixed(0)}%</td><td class="${a.tr>=0?"up":"dn"}">${f(a.tr,1)}R</td><td>${f(a.tr/a.n)}R</td><td>${a.gl?(a.gw/a.gl).toFixed(2):"–"}</td><td>${f(a.pct/a.n)}%</td></tr>`}).join("")+`</tbody></table></div>`}
+ return `<div class="wrap"><table><thead><tr><th>Chart</th><th>Trades</th><th>Win rate</th><th>Total R</th><th>Avg R / trade</th><th>Profit factor</th><th>Avg stock move</th><th>Avg option P&amp;L</th></tr></thead><tbody>`+ks.map(k=>{const a=o[k];return `<tr><td><b>${k==="5m"?"5 min":"15 min"}</b></td><td>${a.n}</td><td>${(a.w/a.n*100).toFixed(0)}%</td><td class="${a.tr>=0?"up":"dn"}">${f(a.tr,1)}R</td><td>${f(a.tr/a.n)}R</td><td>${a.gl?(a.gw/a.gl).toFixed(2):"–"}</td><td>${f(a.pct/a.n)}%</td><td class="${a.op>=0?"up":"dn"}">${f(a.op/a.n,1)}%</td></tr>`}).join("")+`</tbody></table></div>`}
 function rpShow(p,r){window.rpLast=window.rpLast||{};window.rpLast[p]=r;const cap=Math.max(1000,+$(p+"RCap").value||100000),fee=+$(p+"RFee").value||0,sim=rpSim(r,cap,fee),sc=sim.c,sf=sim.f,pc=(sc.end/cap-1)*100,when=r.mode==="range"?"by the end of the month":"by the end of the day";
- const money=`<div class="rpcap"><div class="rpbig"><span class="sub">Starting with ${rpInr(cap)}, putting the whole account into each trade with the stop-loss the system sets${fee?`, less ${fee}% charges and slippage per trade`:""}</span><div>${rpInr(cap)} → <b class="${sc.end>=cap?"up":"dn"}">${rpInr(sc.end)}</b> <span class="${pc>=0?"up":"dn"}">${pc>=0?"+":""}${pc.toFixed(1)}%</span> <span class="sub">${when}</span></div></div>
+ const money=`<div class="rpcap"><div class="rpbig"><span class="sub">Starting with ${rpInr(cap)}, buying the at-the-money call (CE) or put (PE) with the whole account on each trade, exiting at the stop-loss or target the system sets${fee?`, less ${fee}% charges and slippage per trade`:""}</span><div>${rpInr(cap)} → <b class="${sc.end>=cap?"up":"dn"}">${rpInr(sc.end)}</b> <span class="${pc>=0?"up":"dn"}">${pc>=0?"+":""}${pc.toFixed(1)}%</span> <span class="sub">${when}</span></div></div>
   <div class="sub">Profit ${rpInr(sc.end-cap)} · biggest fall from a peak ${rpInr(-sc.dd)} (${sc.ddp.toFixed(1)}%) · without compounding (${rpInr(cap)} in every trade): ${rpInr(sf.end)} (${((sf.end/cap-1)*100).toFixed(1)}%)</div></div>`;
  const s=r.summary,rg=r.mode==="range",R=x=>`<span class="${x>0?"up":x<0?"dn":""}">${x>0?"+":""}${x}R</span>`,why=t=>t==="fresh"?"Fresh":"Continuation",pill=(sd,rt)=>`<span class="pill ${sd}">${rt==="CE"?"CALL (CE)":"PUT (PE)"}</span>`,cb=(x)=>`<button class="mini" data-rc="${esc(x.symbol)}|${x.tf}|${x.ts}">Chart</button>`;
  const dy=x=>rg?`<td>${x.day.slice(5)}</td>`:"",dh=rg?"<th>Day</th>":"";
- const tr=r.trades.length?`<div class="wrap rpscroll"><table><thead><tr>${dh}<th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>In</th><th>Price</th><th>Stop</th><th>T1</th><th>T4</th><th>Out</th><th>Price</th><th>Result</th><th>Targets</th><th>Moved</th><th>R</th><th></th></tr></thead><tbody>`+r.trades.map(t=>`<tr>${dy(t)}<td><b>${esc(t.symbol)}</b></td><td>${pill(t.side,t.right)}</td><td>${t.tf==="5m"?"5 min":"15 min"}</td><td>${why(t.type)}</td><td>${t.entered}</td><td>${t.entry}</td><td>${t.sl}</td><td>${t.t1}</td><td>${t.t4}</td><td>${t.exit_at}</td><td>${t.exit}</td><td>${esc(t.reason)}</td><td>${t.targets}</td><td class="${t.pct>=0?"up":"dn"}">${t.pct>0?"+":""}${t.pct}%</td><td>${R(t.r)}</td><td>${cb(t)}</td></tr>`).join("")+"</tbody></table></div>":`<div class="sub">The rules would not have taken any trade on ${esc(r.day)}.</div>`;
+ const tr=r.trades.length?`<div class="wrap rpscroll"><table><thead><tr>${dh}<th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>In</th><th>Price</th><th>Stop</th><th>T1</th><th>T4</th><th>Out</th><th>Price</th><th>Result</th><th>Targets</th><th>Stock moved</th><th>Option bought</th><th>Option sold</th><th>Option P&amp;L</th><th>R</th><th></th></tr></thead><tbody>`+r.trades.map(t=>`<tr>${dy(t)}<td><b>${esc(t.symbol)}</b></td><td>${pill(t.side,t.right)}</td><td>${t.tf==="5m"?"5 min":"15 min"}</td><td>${why(t.type)}</td><td>${t.entered}</td><td>${t.entry}</td><td>${t.sl}</td><td>${t.t1}</td><td>${t.t4}</td><td>${t.exit_at}</td><td>${t.exit}</td><td>${esc(t.reason)}</td><td>${t.targets}</td><td class="${t.pct>=0?"up":"dn"}">${t.pct>0?"+":""}${t.pct}%</td>${t.opt_pct==null?"<td>–</td><td>–</td><td>–</td>":`<td>${t.opt_in}</td><td>${t.opt_out}</td><td class="${t.opt_pct>=0?"up":"dn"}">${t.opt_pct>0?"+":""}${t.opt_pct}%</td>`}<td>${R(t.r)}</td><td>${cb(t)}</td></tr>`).join("")+"</tbody></table></div>":`<div class="sub">The rules would not have taken any trade on ${esc(r.day)}.</div>`;
  const shown=r.signals.slice(0,300),tot=r.signals_total||r.signals.length;
  const sg=r.signals.length?`<details><summary>All ${tot} signal${tot>1?"s":""} that qualified${tot>shown.length?` (first ${shown.length} shown, the CSV has them all)`:""}</summary><div class="wrap rpscroll"><table><thead><tr>${dh}<th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>Signal candle</th><th>Qualified at</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Day move</th><th>Taken</th><th></th></tr></thead><tbody>`+shown.map(x=>`<tr class="${x.taken?"":"past"}">${dy(x)}<td><b>${esc(x.symbol)}</b></td><td>${pill(x.side,x.right)}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${why(x.type)}</td><td>${esc(x.signal_time)}</td><td>${x.at}</td><td>${x.price}</td><td>${x.sl}</td>${x.tps.map(v=>`<td>${v}</td>`).join("")}<td>${x.move==null?"–":(x.move>0?"+":"")+x.move+"%"}</td><td>${x.taken?"Yes":esc(x.why_not||"No")}</td><td>${cb(x)}</td></tr>`).join("")+"</tbody></table></div></details>":"";
  const sk=r.skips.length?`<details><summary>Why other signals were left out</summary><ul>${r.skips.map(([k,n])=>`<li>${esc(k)}: ${n}</li>`).join("")}</ul></details>`:"";
  const head=rg?`<div><b>${esc(r.day)}</b> · ${s.days} trading days<br>${s.trades} trades from ${tot} qualifying signals · ${s.wins} won, ${s.losses} lost, ${s.flat} flat · win rate ${s.win_rate}%</div><div>Total <b>${R(s.total_r)}</b> · average ${R(s.avg_r)} a trade · profit factor ${s.profit_factor==null?"–":s.profit_factor}<br>max drawdown ${s.max_drawdown}R · ${s.green_days} green and ${s.red_days} red days · best day ${R(s.best_day.r)} (${s.best_day.day.slice(5)}), worst ${R(s.worst_day.r)} (${s.worst_day.day.slice(5)})</div>`
   :`<div><b>${r.day}</b> · ${s.trades} trade${s.trades===1?"":"s"} from ${s.signals} qualifying signal${s.signals===1?"":"s"}<br>${s.wins} won, ${s.losses} lost, ${s.flat} flat · win rate ${s.win_rate}%</div><div>Total <b>${R(s.total_r)}</b> · average ${R(s.avg_r)} a trade<br>best ${R(s.best)} · worst ${R(s.worst)}</div>`;
  $(p+"RRes").innerHTML=`<div class="ogsum">${head}</div>${money}<div class="sub">5 min against 15 min, for the trades taken</div>${rpByTf(r)}${rpCharts(sc.curve,sc.days,(v,d)=>d?rpInr(v).replace("₹","₹"):rpInr(v),cap,"Account value, trade by trade")}${tr}${sg}${sk}
- <div class="sub">Results follow the stock or index price, with the whole account in each trade and the system stop-loss. R is the stop-loss distance (a stop-out is −1R, T4 is +4R), not option rupees. The grade filter is not applied. Daily limit ${r.max_trades} trade${r.max_trades===1?"":"s"} a day, ${r.entries==="both"?"fresh and continuation entries":r.entries==="fresh"?"fresh entries only":"continuation only"}.${r.loaded?` ${r.loaded} stocks loaded`:""}${r.errors&&r.errors.length?`; some failed: ${esc(r.errors.slice(0,2).join("; "))}`:""}. Each Chart button opens that stock with the signal's levels.</div><button class="btn ghost" id="${p}RCsv">Download the signals as CSV</button>`;
+ <div class="sub">The stock columns follow the stock or index price. The option prices are estimated, not taken from the exchange: each at-the-money option is priced with Black-Scholes using the stock's own recent volatility, the nearest expiry and the time between entry and exit, so real premiums, spreads and slippage will differ. R is the stop-loss distance (a stop-out is −1R, T4 is +4R), the stock's stop distance. The grade filter is not applied. Daily limit ${r.max_trades} trade${r.max_trades===1?"":"s"} a day, ${r.entries==="both"?"fresh and continuation entries":r.entries==="fresh"?"fresh entries only":"continuation only"}.${r.loaded?` ${r.loaded} stocks loaded`:""}${r.errors&&r.errors.length?`; some failed: ${esc(r.errors.slice(0,2).join("; "))}`:""}. Each Chart button opens that stock with the signal's levels.</div><button class="btn ghost" id="${p}RCsv">Download the signals as CSV</button>`;
  $(p+"RRes").onclick=e=>{const b=e.target.closest("[data-rc]");if(!b)return;const [sy,t,ts]=b.dataset.rc.split("|");openChart(sy,t,+ts)};
- $(p+"RCsv").onclick=()=>{const h=["day","stock","buy","chart","type","signal candle","qualified at","price","stop","T1","T2","T3","T4","day move %","taken","why not","result R","price move %","how it ended"],rows=r.signals.map(x=>{const t=rpTrade(r,x);return [x.day||r.day,x.symbol,x.right,x.tf,x.type,x.signal_time,x.at,x.price,x.sl,...x.tps,x.move,x.taken?"yes":"no",x.why_not||"",t?t.r:"",t?t.pct:"",t?t.reason:""]});
+ $(p+"RCsv").onclick=()=>{const h=["day","stock","buy","chart","type","signal candle","qualified at","price","stop","T1","T2","T3","T4","day move %","taken","why not","result R","price move %","option bought","option sold","option P&L %","how it ended"],rows=r.signals.map(x=>{const t=rpTrade(r,x);return [x.day||r.day,x.symbol,x.right,x.tf,x.type,x.signal_time,x.at,x.price,x.sl,...x.tps,x.move,x.taken?"yes":"no",x.why_not||"",t?t.r:"",t?t.pct:"",t&&t.opt_in!=null?t.opt_in:"",t&&t.opt_out!=null?t.opt_out:"",t&&t.opt_pct!=null?t.opt_pct:"",t?t.reason:""]});
   const csv=[h,...rows].map(l=>l.map(v=>`"${String(v==null?"":v).replace(/"/g,'""')}"`).join(",")).join("\n"),a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=`autopilot_replay_${r.bot}_${r.day.replace(/ /g,"_")}.csv`;a.click()}}
 async function atmOption(sy,right,tf,m,what){m.textContent=`Loading the ${sy} option chain…`;
  try{const d=await (await api(`/api/options/chain?symbol=${encodeURIComponent(sy)}&tf=${tf||"15m"}`)).json();
