@@ -5968,6 +5968,340 @@ def bot_view(u, kind="scanner"):
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
 
 
+# ── Autopilot replay: what the rules would have done on a past day ──
+# It runs the same entry rules over that day's 5 and 15 minute candles, one 5 minute step at a time, and follows each trade on the stock or index itself
+# (stop-loss, T1 to T4 with the stop moving up behind them, square-off at 15:15). Results are in R, the stop-loss distance, not in option rupees.
+REPLAY_DATA = {}   # bot -> (time, {symbol: {"5m": series, "15m": series}}, errors, loaded days)
+REPLAY_JOB = {}    # (user id, bot) -> {"status", "msg", "done", "total", "result"}
+REPLAY_LOCK = threading.Lock()
+
+
+def _hm(ts):
+    return pd.Timestamp(int(ts), unit="s", tz="UTC").tz_convert(IST).strftime("%H:%M")
+
+
+def replay_series(df, tf):
+    """Everything the replay needs from one symbol's candles: the indicator's signals with where each one's stop and targets were first reached."""
+    df = df.dropna(subset=["Close", "High", "Low", "Open"]).copy()
+    if df.empty:
+        return None
+    df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
+    if CONFIRMED_ONLY:
+        df = drop_forming(df, tf)
+    n = len(df)
+    if n < MIN_BARS:
+        return None
+    c, hi, lo = df["Close"].to_numpy(float), df["High"].to_numpy(float), df["Low"].to_numpy(float)
+    ls, ss, d, atr = chandelier(df)
+    ema = df["Close"].ewm(span=EMA_LEN, adjust=False).mean().to_numpy()
+    green, red = qqe_states(df["Close"])
+    up = np.zeros(n, bool)
+    dn = np.zeros(n, bool)
+    up[1:] = (d[1:] == 1) & (d[:-1] == -1)
+    dn[1:] = (d[1:] == -1) & (d[:-1] == 1)
+    buy = up & (c > ema) & within_lookback(green)
+    sell = dn & (c < ema) & within_lookback(red)
+    mins = 5 if tf == "5m" else 15
+    ts = np.array([int(t.timestamp()) for t in df.index])
+    sg = []
+    for j in np.nonzero(buy | sell)[0]:
+        j = int(j)
+        side = 1 if buy[j] else -1
+        entry = float(c[j])
+        raw = ls[j] if side == 1 else ss[j]
+        risk = max(MIN_RISK_ATR * atr[j], min(abs(entry - raw), MAX_RISK_ATR * atr[j]))
+        sl = entry - side * risk
+        tps = [entry + side * risk * r for r in R_MULTIPLES]
+        sl_i, tidx, hits = None, [None] * 4, 0
+        for k in range(j + 1, n):   # same order as the live indicator: the stop first, then the targets
+            if (lo[k] <= sl) if side == 1 else (hi[k] >= sl):
+                sl_i = k
+                break
+            reached = sum(1 for t in tps if ((hi[k] >= t) if side == 1 else (lo[k] <= t)))
+            for r in range(hits, reached):
+                tidx[r] = k
+            hits = max(hits, reached)
+            if hits == 4:
+                break
+        sg.append({"j": j, "side": "BUY" if side == 1 else "SELL", "dir": side, "entry": entry, "sl": float(sl), "tps": [float(t) for t in tps], "risk": float(risk), "sl_i": sl_i, "tidx": tidx,
+                   "date": df.index[j].strftime("%Y-%m-%d"), "time": df.index[j].strftime("%H:%M")})
+    return {"n": n, "ts": ts, "close_ts": ts + mins * 60, "c": c, "hi": hi, "lo": lo, "ema": ema, "atr": atr, "sg": sg, "sig_idx": [g["j"] for g in sg],
+            "dates": [t.strftime("%Y-%m-%d") for t in df.index], "tm": [t.strftime("%H:%M") for t in df.index]}
+
+
+def replay_state(S, i):
+    """The last signal on this chart as of candle i, and how far it had got by then."""
+    from bisect import bisect_right
+    k = bisect_right(S["sig_idx"], i) - 1
+    if k < 0:
+        return None
+    g = S["sg"][k]
+    sl_hit = g["sl_i"] is not None and g["sl_i"] <= i
+    hits = sum(1 for x in g["tidx"] if x is not None and x <= i)
+    return dict(g, sl_hit=sl_hit, hits=hits, open=not sl_hit and hits < 4, bars_ago=i - g["j"])
+
+
+def replay_fetch(names, tf, progress):
+    out, errors = {}, []
+    for i in range(0, len(names), YF_BATCH):
+        part = names[i:i + YF_BATCH]
+        try:
+            if use_dhan():
+                frames, errs = dhan_frames(part, tf, _days(PERIODS[tf]))
+                errors.extend(errs)
+                out.update({k: v for k, v in frames.items() if v is not None})
+            else:
+                import yfinance as yf
+                data = yf.download([yf_ticker(x) for x in part], period=PERIODS[tf], interval=tf, group_by="ticker", auto_adjust=False, threads=True, progress=False)
+                for x in part:
+                    try:
+                        df = data[yf_ticker(x)] if len(part) > 1 else data
+                        if df is not None and not df.empty:
+                            out[x] = df
+                    except Exception:
+                        errors.append(f"{x}: no data")
+        except Exception as e:
+            errors.append(f"batch {i // YF_BATCH + 1}: {e}")
+        progress(min(i + YF_BATCH, len(names)))
+    return out, errors
+
+
+def replay_names(kind):
+    return ["NIFTY"] if kind == "nifty" else [s for s in UNIVERSE if s not in INDICES and s not in SCANNER_EXCLUDE and s not in INDEX_YF]
+
+
+def replay_load(kind, set_progress):
+    hit = REPLAY_DATA.get(kind)
+    if hit and time.time() - hit[0] < 600:
+        return hit
+    names = replay_names(kind)
+    total = len(names) * 2
+    base = [0]
+    data, errors = {}, []
+    for tf in ("5m", "15m"):
+        frames, errs = replay_fetch(names, tf, lambda n, b=base: set_progress(b[0] + n, total))
+        base[0] += len(names)
+        errors.extend(errs)
+        for sname, df in frames.items():
+            try:
+                S = replay_series(df, tf)
+            except Exception as e:
+                errors.append(f"{sname} {tf}: {e}")
+                continue
+            if S:
+                data.setdefault(sname, {})[tf] = S
+    days = sorted({d for v in data.values() if "5m" in v for d in v["5m"]["dates"]})[-8:]
+    REPLAY_DATA[kind] = hit = (time.time(), data, errors, days)
+    return hit
+
+
+def replay_run(data, kind, day, cfg):
+    """One day, one 5 minute step at a time. Returns the signals that qualified, the trades the autopilot would have taken, and why the others were left out."""
+    ent = cfg.get("entries", "both")
+    max_trades = int(cfg.get("max_trades", 3))
+    syms = [s for s, v in data.items() if "5m" in v and "15m" in v]
+    steps = {}
+    for s in syms:
+        S5 = data[s]["5m"]
+        idx = [k for k in range(S5["n"]) if S5["dates"][k] == day]
+        if idx:
+            steps[s] = idx
+    if not steps:
+        return {"error": f"No candles for {day} in the data loaded."}
+    ref = max(steps, key=lambda s: len(steps[s]))
+    grid = [(data[ref]["5m"]["close_ts"][k], data[ref]["5m"]["tm"][k]) for k in steps[ref]]
+    first = OPTBOT_FIRST_ENTRY.strftime("%H:%M")
+    last = OPTBOT_LAST_ENTRY.strftime("%H:%M")
+    seen, signals, skips, trades, taken_keys = set(), [], {}, [], set()
+    pos = {}
+    from bisect import bisect_right
+
+    def skip(why, key):
+        if (why, key) not in skips_seen:
+            skips_seen.add((why, key))
+            skips[why] = skips.get(why, 0) + 1
+    skips_seen = set()
+    for T, hhmm in grid:
+        endt = _hm(T)
+        if endt < first or endt > last:
+            continue
+        cands = []
+        for s in syms:
+            S5, S15 = data[s]["5m"], data[s]["15m"]
+            k5 = bisect_right(S5["close_ts"], T) - 1
+            k15 = bisect_right(S15["close_ts"], T) - 1
+            if k5 < 0 or k15 < 0 or S5["dates"][k5] != day:
+                continue
+            st = {"5m": replay_state(S5, k5), "15m": replay_state(S15, k15)}
+            ser = {"5m": (S5, k5), "15m": (S15, k15)}
+            ltp = float(S5["c"][k5])
+            d0 = next((k for k in range(S5["n"]) if S5["dates"][k] == day), 0)
+            prev = float(S5["c"][d0 - 1]) if d0 > 0 else None
+            chg = (ltp / prev - 1) * 100 if prev else None
+            for tf in ("5m", "15m"):
+                g = st[tf]
+                if not g or not g["open"]:
+                    continue
+                other = st["15m" if tf == "5m" else "5m"]
+                S, k = ser[tf]
+                fresh = g["bars_ago"] <= OPTBOT_FRESH_BARS and g["date"] == day
+                cont = not fresh and g["date"] < day
+                if not fresh and not cont:
+                    continue
+                key = (s, tf, g["date"], g["time"], g["side"])
+                if (fresh and ent == "gap") or (cont and ent == "fresh"):
+                    continue
+                if cont and not (AUTO_CONT_START <= endt < AUTO_CONT_END):
+                    skip(f"continuation outside {AUTO_CONT_START}-{AUTO_CONT_END}", key)
+                    continue
+                if kind == "scanner" and (chg is None or not (AUTO_MOVE_MIN <= abs(chg) <= AUTO_MOVE_MAX)):
+                    skip(f"stock moved outside {AUTO_MOVE_MIN:g}-{AUTO_MOVE_MAX:g}% today", key)
+                    continue
+                if not other or not other["open"] or other["side"] != g["side"]:
+                    skip("5 and 15 minute charts not in the same direction", key)
+                    continue
+                if g["hits"]:
+                    skip("already reached T1", key)
+                    continue
+                if (g["dir"] == 1 and not (g["sl"] < ltp < g["tps"][0])) or (g["dir"] == -1 and not (g["tps"][0] < ltp < g["sl"])):
+                    skip("price already past T1 or the stop", key)
+                    continue
+                dist = None
+                if cont:
+                    em, at = float(S["ema"][k]), float(S["atr"][k])
+                    dist = abs(ltp - em) / at if at == at and at else None
+                    if dist is None or (g["dir"] == 1 and ltp < em) or (g["dir"] == -1 and ltp > em):
+                        skip("continuation: price on the wrong side of the 20 EMA", key)
+                        continue
+                    if dist > OPTBOT_NEAR_ATR:
+                        skip("continuation: not back near the 20 EMA", key)
+                        continue
+                cands.append({"symbol": s, "tf": tf, "g": g, "px": ltp, "key": key, "etype": "fresh" if fresh else "continuation", "dist": dist if dist is not None else 9.9, "at": endt, "chg": chg, "S5": S5, "k5": k5})
+        cands.sort(key=lambda c: (c["etype"] != "fresh", c["dist"]))
+        for c in cands:
+            g = c["g"]
+            if c["key"] not in seen:
+                seen.add(c["key"])
+                signals.append({"symbol": c["symbol"], "side": g["side"], "right": "CE" if g["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "at": c["at"], "signal_time": f"{g['date']} {g['time']}",
+                                "price": round(c["px"], 2), "sl": round(g["sl"], 2), "tps": [round(t, 2) for t in g["tps"]], "move": None if c["chg"] is None else round(c["chg"], 2), "taken": False, "why_not": None})
+            sig = next(x for x in signals if (x["symbol"], x["tf"], x["signal_time"], x["side"]) == (c["symbol"], c["tf"], f"{g['date']} {g['time']}", g["side"]))
+            if c["key"] in taken_keys or sig["taken"]:
+                continue
+            if c["symbol"] in pos and pos[c["symbol"]]["open"]:
+                sig["why_not"] = "already in a trade on this stock"
+                continue
+            if len(trades) >= max_trades:
+                sig["why_not"] = f"daily limit of {max_trades} trades reached"
+                continue
+            tr = replay_trade(c, day)
+            tr["open"] = True
+            pos[c["symbol"]] = tr
+            sig["taken"] = True
+            taken_keys.add(c["key"])
+            trades.append(tr)
+        for s, tr in pos.items():   # a trade is "open" until its exit time has passed
+            if tr["open"] and tr["exit_hhmm"] <= endt:
+                tr["open"] = False
+    for sg_ in signals:
+        if not sg_["taken"] and not sg_["why_not"]:
+            sg_["why_not"] = "a better-ranked trade was taken first or the limit was reached"
+    for tr in trades:
+        tr.pop("open", None)
+    tot = round(sum(t["r"] for t in trades), 2)
+    win = [t for t in trades if t["r"] > 0]
+    summ = {"signals": len(signals), "trades": len(trades), "wins": len(win), "losses": sum(1 for t in trades if t["r"] < 0), "flat": sum(1 for t in trades if t["r"] == 0),
+            "total_r": tot, "avg_r": round(tot / len(trades), 2) if trades else 0.0, "win_rate": round(len(win) / len(trades) * 100) if trades else 0,
+            "best": max((t["r"] for t in trades), default=0), "worst": min((t["r"] for t in trades), default=0)}
+    return {"day": day, "bot": kind, "summary": summ, "trades": trades, "signals": signals, "skips": sorted(skips.items(), key=lambda x: -x[1]), "max_trades": max_trades, "entries": ent}
+
+
+def replay_trade(c, day):
+    """Follow one entry on the stock or index itself: stop-loss first, then T1 to T4 with the stop moving up behind them, out at 15:15."""
+    g, S = c["g"], c["S5"]
+    dr, entry, risk = g["dir"], c["px"], g["risk"]
+    lv = g["tps"]
+    # the signal's own stop and targets, measured from the signal candle as the indicator does
+    stop, step = g["sl"], 0
+    start = c["k5"]
+    exit_px, exit_at, why = None, None, None
+    sq = OPTBOT_SQUAREOFF.strftime("%H:%M")
+    for k in range(start + 1, S["n"]):
+        if S["dates"][k] != day:
+            break
+        ck = _hm(S["close_ts"][k])
+        hi, lo = S["hi"][k], S["lo"][k]
+        if (dr == 1 and lo <= stop) or (dr == -1 and hi >= stop):
+            exit_px, exit_at, why = stop, ck, "stop-loss" if step == 0 else ("back to the entry after T1" if step == 1 else f"back to the stop after T{step}")
+            break
+        while step < 4 and ((dr == 1 and hi >= lv[step]) or (dr == -1 and lo <= lv[step])):
+            step += 1
+            stop = entry if step == 1 else lv[step - 2]
+        if step >= 4:
+            exit_px, exit_at, why = lv[3], ck, "T4 reached"
+            break
+        if ck >= sq:
+            exit_px, exit_at, why = float(S["c"][k]), ck, "end of day"
+            break
+    if exit_px is None:
+        k = max(k for k in range(S["n"]) if S["dates"][k] == day)
+        exit_px, exit_at, why = float(S["c"][k]), _hm(S["close_ts"][k]), "end of data"
+    r = round((exit_px - entry) * dr / risk, 2) if risk else 0.0
+    return {"symbol": c["symbol"], "side": g["side"], "right": "CE" if g["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "entered": c["at"], "entry": round(entry, 2),
+            "sl": round(g["sl"], 2), "t1": round(lv[0], 2), "t4": round(lv[3], 2), "exit": round(exit_px, 2), "exit_at": exit_at, "exit_hhmm": exit_at, "reason": why, "targets": step,
+            "r": r, "pct": round((exit_px / entry - 1) * 100 * dr, 2)}
+
+
+def replay_job(uid, kind, day):
+    j = REPLAY_JOB[(uid, kind)]
+    try:
+        def prog(done, total):
+            j["done"], j["total"] = done, total
+        j["status"], j["msg"] = "running", "Loading the 5 and 15 minute candles…"
+        _, data, errors, days = replay_load(kind, prog)
+        if not data:
+            j.update(status="error", msg="No candles could be loaded. " + ("; ".join(errors[:3]) if errors else "Check the data feed."))
+            return
+        day = day if day in days else (days[-2] if len(days) > 1 and days[-1] == ist_now().strftime("%Y-%m-%d") else days[-1])
+        j["msg"] = f"Replaying {day}…"
+        res = replay_run(data, kind, day, bot_cfg(uid, kind))
+        res["days"] = days
+        res["loaded"] = len(data)
+        res["errors"] = errors[:5]
+        j.update(status="error" if res.get("error") else "done", msg=res.get("error", ""), result=res)
+    except Exception as e:
+        j.update(status="error", msg=f"The replay failed: {type(e).__name__}: {str(e)[:120]}")
+
+
+@app.post("/api/optbot/replay")
+def api_replay_start(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    kind = bot_kind(payload.get("bot"))
+    day = str(payload.get("day") or "")
+    cur = REPLAY_JOB.get((u["id"], kind))
+    if cur and cur["status"] == "running":
+        return {"status": "running", "msg": cur["msg"], "done": cur.get("done", 0), "total": cur.get("total", 0)}
+    if not REPLAY_LOCK.acquire(blocking=False):
+        return {"error": "Another replay is loading data. Try again in a minute."}
+    REPLAY_JOB[(u["id"], kind)] = job = {"status": "running", "msg": "Starting…", "done": 0, "total": 0, "result": None}
+
+    def go():
+        try:
+            replay_job(u["id"], kind, day)
+        finally:
+            REPLAY_LOCK.release()
+    threading.Thread(target=go, daemon=True).start()
+    return {"status": "running", "msg": job["msg"], "done": 0, "total": 0}
+
+
+@app.get("/api/optbot/replay")
+def api_replay_get(request: Request, bot: str = "scanner"):
+    u = request.state.user
+    j = REPLAY_JOB.get((u["id"], bot_kind(bot)))
+    if not j:
+        return {"status": "idle"}
+    return {"status": j["status"], "msg": j["msg"], "done": j.get("done", 0), "total": j.get("total", 0), "result": j.get("result") if j["status"] == "done" else None}
+
+
 MANUAL_SIG = {}   # (user id, bot) -> (time, list). The signal list for manual trading is recomputed at most every 10 seconds.
 
 
@@ -7416,6 +7750,8 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <label class="sub" style="display:flex;gap:6px;align-items:center;margin:6px 0"><input type="checkbox" id="${p}Past"> Show trades from earlier days</label>
  <div class="ixrow"><b>Signals for manual trades</b><span class="sub" id="${p}SigNote">What this autopilot would trade right now, shown even while it is off.</span></div>
  <div class="wrap"><table id="${p}Sig"></table></div>
+ <div class="ixrow"><b>Replay a past day</b><select id="${p}RDay" aria-label="Day to replay"></select><button class="btn" id="${p}RRun">Replay</button><span class="sub" id="${p}RMsg">Runs the rules above over that day's 5 and 15 minute candles. Nothing is traded.</span></div>
+ <div id="${p}RRes"></div>
  <div class="sub" id="${p}Log"></div>
 </div>`}
 async function botLoad(){clearTimeout(botTimer);if(mode!=="autopilot")return;
@@ -7441,6 +7777,22 @@ function initInstall(){const b=$("installBtn"),standalone=matchMedia("(display-m
  if(/iphone|ipad|ipod/i.test(navigator.userAgent)){b.hidden=false}
  b.onclick=async()=>{if(installEv){installEv.prompt();await installEv.userChoice;installEv=null;b.hidden=true}else alert("On iPhone: tap the Share button in Safari, then Add to Home Screen. On Android: open the browser menu and choose Install app.")};
  addEventListener("appinstalled",()=>{b.hidden=true})}
+function rpDays(p,days,sel){const el=$(p+"RDay"),cur=sel||el.value;if(!days){days=[];const d=new Date();while(days.length<6){d.setDate(d.getDate()-1);if(d.getDay()%6)days.unshift(d.toISOString().slice(0,10))}}
+ el.innerHTML=days.slice().reverse().map(x=>`<option value="${x}"${x===cur?" selected":""}>${x}</option>`).join("")}
+async function rpRun(p){const b=$(p+"RRun"),m=$(p+"RMsg");b.disabled=true;$(p+"RRes").innerHTML="";m.textContent="Starting…";
+ try{let r=await post("/api/optbot/replay",{bot:BOTS[p].kind,day:$(p+"RDay").value});if(r.error){m.textContent=r.error;b.disabled=false;return}
+  const poll=async()=>{const g=await (await api("/api/optbot/replay?bot="+BOTS[p].kind)).json();
+   if(g.status==="running"){m.textContent=(g.msg||"Working…")+(g.total?` ${g.done} of ${g.total} candle sets`:"");setTimeout(poll,2000);return}
+   b.disabled=false;if(g.status==="done"){m.textContent=`Replayed ${g.result.day}.`;rpDays(p,g.result.days,g.result.day);rpShow(p,g.result)}else m.textContent=g.msg||"The replay could not run."};
+  poll()}catch(e){m.textContent="The replay could not run.";b.disabled=false}}
+function rpShow(p,r){const s=r.summary,R=x=>`<span class="${x>0?"up":x<0?"dn":""}">${x>0?"+":""}${x}R</span>`,why=t=>t==="fresh"?"Fresh":"Continuation",pill=(sd,rt)=>`<span class="pill ${sd}">${rt==="CE"?"CALL (CE)":"PUT (PE)"}</span>`;
+ const tr=r.trades.length?`<div class="wrap"><table><thead><tr><th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>In</th><th>Price</th><th>Stop</th><th>T1</th><th>T4</th><th>Out</th><th>Price</th><th>Result</th><th>Targets</th><th>Moved</th><th>R</th></tr></thead><tbody>`+r.trades.map(t=>`<tr><td><b>${esc(t.symbol)}</b></td><td>${pill(t.side,t.right)}</td><td>${t.tf==="5m"?"5 min":"15 min"}</td><td>${why(t.type)}</td><td>${t.entered}</td><td>${t.entry}</td><td>${t.sl}</td><td>${t.t1}</td><td>${t.t4}</td><td>${t.exit_at}</td><td>${t.exit}</td><td>${esc(t.reason)}</td><td>${t.targets}</td><td class="${t.pct>=0?"up":"dn"}">${t.pct>0?"+":""}${t.pct}%</td><td>${R(t.r)}</td></tr>`).join("")+"</tbody></table></div>":`<div class="sub">The rules would not have taken any trade on ${r.day}.</div>`;
+ const sg=r.signals.length?`<details><summary>All ${r.signals.length} signal${r.signals.length>1?"s":""} that qualified</summary><div class="wrap"><table><thead><tr><th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>Signal candle</th><th>Qualified at</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Day move</th><th>Taken</th></tr></thead><tbody>`+r.signals.map(x=>`<tr class="${x.taken?"":"past"}"><td><b>${esc(x.symbol)}</b></td><td>${pill(x.side,x.right)}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${why(x.type)}</td><td>${esc(x.signal_time)}</td><td>${x.at}</td><td>${x.price}</td><td>${x.sl}</td>${x.tps.map(v=>`<td>${v}</td>`).join("")}<td>${x.move==null?"–":(x.move>0?"+":"")+x.move+"%"}</td><td>${x.taken?"Yes":esc(x.why_not||"No")}</td></tr>`).join("")+"</tbody></table></div></details>":"";
+ const sk=r.skips.length?`<details><summary>Why other signals were left out</summary><ul>${r.skips.map(([k,n])=>`<li>${esc(k)}: ${n}</li>`).join("")}</ul></details>`:"";
+ $(p+"RRes").innerHTML=`<div class="ogsum"><div><b>${r.day}</b> · ${s.trades} trade${s.trades===1?"":"s"} from ${s.signals} qualifying signal${s.signals===1?"":"s"}<br>${s.wins} won, ${s.losses} lost, ${s.flat} flat · win rate ${s.win_rate}%</div><div>Total <b>${R(s.total_r)}</b> · average ${R(s.avg_r)} a trade<br>best ${R(s.best)} · worst ${R(s.worst)}</div></div>${tr}${sg}${sk}
+ <div class="sub">Results follow the stock or index price. R is the stop-loss distance (a stop-out is −1R, T4 is +4R), not option rupees. The grade filter is not applied. Daily limit ${r.max_trades} trade${r.max_trades===1?"":"s"}, ${r.entries==="both"?"fresh and continuation entries":r.entries==="fresh"?"fresh entries only":"continuation only"}. ${r.loaded} stocks loaded${r.errors&&r.errors.length?`; some failed: ${esc(r.errors.slice(0,2).join("; "))}`:""}.</div><button class="btn ghost" id="${p}RCsv">Download the signals as CSV</button>`;
+ $(p+"RCsv").onclick=()=>{const h=["day","stock","buy","chart","type","signal candle","qualified at","price","stop","T1","T2","T3","T4","day move %","taken","why not"],rows=r.signals.map(x=>[r.day,x.symbol,x.right,x.tf,x.type,x.signal_time,x.at,x.price,x.sl,...x.tps,x.move,x.taken?"yes":"no",x.why_not||""]);
+  const csv=[h,...rows].map(l=>l.map(v=>`"${String(v==null?"":v).replace(/"/g,'""')}"`).join(",")).join("\n"),a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=`autopilot_replay_${r.bot}_${r.day}.csv`;a.click()}}
 async function atmOption(sy,right,tf,m,what){m.textContent=`Loading the ${sy} option chain…`;
  try{const d=await (await api(`/api/options/chain?symbol=${encodeURIComponent(sy)}&tf=${tf||"15m"}`)).json();
   if(d.error||!d.rows||!d.rows.length){m.textContent=d.error||"No option chain for "+sy+" right now.";return}
@@ -7452,7 +7804,7 @@ async function atmOption(sy,right,tf,m,what){m.textContent=`Loading the ${sy} op
  }catch(e){m.textContent="Could not load the option chain."}}
 async function apOption(b,p,what){b.disabled=true;try{await atmOption(b.dataset.s,b.dataset.r,b.dataset.tf,$(p+"Msg"),what)}finally{b.disabled=false}}
 function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
- for(const p in BOTS){$(p+"Past").onchange=()=>botLoad();$(p+"Sig").onclick=e=>{const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
+ for(const p in BOTS){rpDays(p);$(p+"RRun").onclick=()=>rpRun(p);$(p+"Past").onchange=()=>botLoad();$(p+"Sig").onclick=e=>{const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
 function confBadge(r){const c=r&&r.conf;if(!c)return "";const tip=`Grade ${c.g}, score ${c.s} of 100\n`+c.w.map(x=>(x[0]?"✓ ":"✗ ")+x[1]).join("\n")+(c.n<8?"\n(Some checks could not be made)":"");return `<span class="cg cg${c.g}" title="${esc(tip)}">${c.g}<small> ${c.s}</small></span>`}
 let btTimer=null;
 const inr=x=>(x<0?"-":"")+"₹"+Math.abs(Math.round(x)).toLocaleString("en-IN");
