@@ -1598,7 +1598,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD = "2026-11-11h"   # shown next to the user name so it is clear which version a server is running
+BUILD = "2026-11-11j"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2316,6 +2316,29 @@ def _dhan_master():
 MASTER_LOCK = threading.Lock()
 
 
+def opt_find(opt, symbol, exp_key, strike, right):
+    """A contract from a broker's list. When the exact expiry is missing, the same strike a few days either side is used: when the exchange
+    moves an expiry for a holiday, the option chain shows the new day while a broker's list can still carry the original day."""
+    hit = opt.get((symbol, exp_key, strike, right))
+    if hit:
+        return hit
+    try:
+        want = datetime.strptime(exp_key, "%d%b%Y").date()
+    except ValueError:
+        return None
+    best = None
+    for (sym, ek, k, r), v in opt.items():
+        if sym != symbol or r != right or abs(k - strike) > 1e-6:
+            continue
+        try:
+            gap = abs((datetime.strptime(ek, "%d%b%Y").date() - want).days)
+        except ValueError:
+            continue
+        if gap <= 4 and (best is None or gap < best[0]):
+            best = (gap, v)
+    return best[1] if best else None
+
+
 def load_master(name="angel"):
     """Instrument list: ids, lot sizes, futures and option contracts for the dashboard's symbols. Cached for the day."""
     today = ist_now().date()
@@ -2325,9 +2348,17 @@ def load_master(name="angel"):
     with MASTER_LOCK:   # the list is a large download: one thread fetches it while the others wait, instead of every thread fetching its own copy
         if m["day"] == today:
             return True
+        if time.time() - m.get("tried", 0) < 60:   # a failed or partial download is not repeated on every call
+            return m["day"] is not None
+        m["tried"] = time.time()
         try:
             eq, opt, fut = _dhan_master() if name == "dhan" else _angel_master()
         except Exception:
+            return m["day"] is not None
+        if not eq or not opt:   # an interrupted download gives a list with the equities but no contracts: do not keep it for the day
+            print(f"{name} instrument list looks incomplete ({len(eq)} shares, {len(opt)} option contracts); it will be fetched again", flush=True)
+            if m["day"] is None:
+                m.update(eq=eq, opt=opt, fut=fut)
             return m["day"] is not None
         for lst in fut.values():
             lst.sort()
@@ -2449,7 +2480,7 @@ def make_order(p, u, dry=False, force=None):
             return fail("Product must be Intraday or Carry forward.")
         if not load_master(mname):
             return fail("Could not load Angel One's instrument list. Try again in a minute.")
-        inst = M(mname)["opt"].get((symbol, exp_key, strike, right))
+        inst = M(mname)["opt"].get((symbol, exp_key, strike, right))   # exact day only: a real order must never go to a different expiry
         if not inst or not inst[2]:
             return fail("This contract was not found in Angel One's instrument list.")
         chain = chain_for(symbol, expiry, u)
@@ -5707,7 +5738,7 @@ def dhan_option_candles(symbol, expiry, strike, right, minutes, days):
     ek = datetime.strptime(expiry, EXPIRY_FMT).strftime("%d%b%Y").upper()
     if not load_master("dhan"):
         raise DhanDataError("Dhan's instrument list could not be loaded")
-    inst = M("dhan")["opt"].get((symbol, ek, float(strike), right))
+    inst = opt_find(M("dhan")["opt"], symbol, ek, float(strike), right)
     if not inst:
         raise DhanDataError(f"{symbol} {strike:g} {right} is not in Dhan's instrument list")
     end = ist_now().date() + timedelta(days=1)
@@ -6154,14 +6185,17 @@ def paper_option_prices(u, orders):
         for label, o in pending.items():
             try:
                 ek = datetime.strptime(o["expiry"], EXPIRY_FMT).strftime("%d%b%Y").upper()
-                inst = opt.get((o["symbol"], ek, float(o["strike"]), o["right"]))
+                inst = opt_find(opt, o["symbol"], ek, float(o["strike"]), o["right"])
             except (TypeError, ValueError, KeyError):
                 inst = None
             if inst:
                 ref[label] = (inst[3], str(inst[0]))
         for label in pending:
             if label not in ref:
-                why.append(f"{label} is not in {name}'s instrument list")
+                o_ = pending[label]
+                have = sorted({e for (sy, e, k, r_) in opt if sy == o_["symbol"]}, key=lambda e: datetime.strptime(e, "%d%b%Y"))[:4]
+                why.append(f"{label} is not in {name}'s instrument list ("
+                           + (f"it has {o_['symbol']} contracts expiring " + ", ".join(have) if have else f"it has no {o_['symbol']} option contracts at all; {sum(1 for _ in opt)} option contracts loaded") + ")")
         if not ref:
             continue
         items = sorted(set(ref.values()))
