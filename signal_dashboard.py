@@ -1598,7 +1598,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD = "2026-11-11m"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-11n"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -7207,7 +7207,7 @@ def api_me(request: Request):
     mode, note = user_mode(u)
     hints = {r["broker"]: r["hint"] for r in q("SELECT broker, hint FROM creds WHERE user_id=?", (u["id"],))}
     return {"user": public_user(u), "csrf": u["csrf"], "mode": mode, "note": note, "hints": hints, "default_password": u["id"] in DEFAULT_PW_USERS,
-            "broker_fields": BROKER_FIELDS, "broker_names": BROKER_NAMES, "build": BUILD}
+            "broker_fields": BROKER_FIELDS, "broker_names": BROKER_NAMES, "build": BUILD_ID}
 
 
 @app.post("/api/account/password")
