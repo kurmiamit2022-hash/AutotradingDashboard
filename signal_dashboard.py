@@ -1058,9 +1058,12 @@ def yahoo_frames(symbols, interval, days):
 def dhan_frames(symbols, interval, days, progress=None):
     """({symbol: candles}, [problems]) from Dhan, with Yahoo filling the gaps only when YAHOO_FALLBACK is on."""
     out, errs = {}, []
+    DHAN_STAT["step"] = "loading Dhan's instrument list"
     if not load_master("dhan"):
+        DHAN_STAT["step"] = "Dhan's instrument list could not be loaded"
         return out, ["Dhan's instrument list could not be loaded."]
     for i, s in enumerate(symbols):
+        DHAN_STAT["step"] = f"asking Dhan for {s} ({interval})"
         try:
             d = dhan_candles(s, interval, days)
             if d is None or d.empty:
@@ -1078,6 +1081,7 @@ def dhan_frames(symbols, interval, days, progress=None):
             errs.append(f"{s}: {type(e).__name__}: {str(e)[:80]}")
         if progress:
             progress(i + 1, len(symbols))
+    DHAN_STAT["step"] = None
     if out:
         DHAN_STAT["hist_error"] = None
     elif errs:
@@ -1289,7 +1293,8 @@ def fetch_all(interval, progress=None):
         names = UNIVERSE[i:i + YF_BATCH]
         tickers = [yf_ticker(n) for n in names]
         if use_dhan():
-            frames, errs = dhan_frames(names, interval, _days(PERIODS[interval]))
+            frames, errs = dhan_frames(names, interval, _days(PERIODS[interval]),
+                                       progress=(lambda a, b, i=i: progress(list(rows), list(errors), i + a)) if progress else None)
             errors.extend(errs)
             for sname in names:
                 df = frames.get(sname)
@@ -1593,7 +1598,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD = "2026-11-11f"   # shown next to the user name so it is clear which version a server is running
+BUILD = "2026-11-11h"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2308,19 +2313,25 @@ def _dhan_master():
     return eq, opt, fut
 
 
+MASTER_LOCK = threading.Lock()
+
+
 def load_master(name="angel"):
     """Instrument list: ids, lot sizes, futures and option contracts for the dashboard's symbols. Cached for the day."""
     today = ist_now().date()
     m = MASTERS[name]
     if m["day"] == today:
         return True
-    try:
-        eq, opt, fut = _dhan_master() if name == "dhan" else _angel_master()
-    except Exception:
-        return m["day"] is not None
-    for lst in fut.values():
-        lst.sort()
-    m.update(day=today, eq=eq, opt=opt, fut=fut)
+    with MASTER_LOCK:   # the list is a large download: one thread fetches it while the others wait, instead of every thread fetching its own copy
+        if m["day"] == today:
+            return True
+        try:
+            eq, opt, fut = _dhan_master() if name == "dhan" else _angel_master()
+        except Exception:
+            return m["day"] is not None
+        for lst in fut.values():
+            lst.sort()
+        m.update(day=today, eq=eq, opt=opt, fut=fut)
     return True
 
 
@@ -4279,7 +4290,7 @@ def api_history(tf: str = DEFAULT_INTERVAL, symbol: str = "", sector: str = "", 
     sym_rows = hist_groups(recs, "symbol", 3)
     by_rate = sorted([r for r in sym_rows if r["exp2"] is not None], key=lambda r: (r["exp2"], r["t2"] or 0, r["n"]), reverse=True)
     half = len(by_rate) // 2  # the two lists never share a symbol
-    return {"tf": tf, "scanned": scanned, "progress": progress, "stats": hist_stats(recs),
+    return {"tf": tf, "scanned": scanned, "progress": progress, "step": DHAN_STAT.get("step") if progress else None, "stats": hist_stats(recs),
             "by_side": hist_groups(recs, "side"), "by_sector": sorted(hist_groups(recs, "sector"), key=lambda r: -r["n"]),
             "best": [r for r in by_rate[:min(8, half)] if r["exp2"] > 0], "worst": [r for r in reversed(by_rate[len(by_rate) - min(8, half):]) if r["exp2"] < 0] if half else [],
             "by_hour": sorted(hist_groups([r for r in recs if r["hour"] is not None], "hour"), key=lambda r: r["key"]) if tf != "1d" else [],
@@ -4678,7 +4689,20 @@ def start_worker():
     init_db()
     start_alerts()
     start_engine()
-    threading.Thread(target=refresh, args=(DEFAULT_INTERVAL,), daemon=True).start()
+    threading.Thread(target=warm_scans, daemon=True).start()
+
+
+def warm_scans():
+    """Scan the chart timeframes the autopilot and the page start on, one after another, so nobody has to press Scan after a restart."""
+    order = []
+    for tf in (DEFAULT_INTERVAL, *AUTO_TFS):
+        if tf in INTERVALS and tf not in order:
+            order.append(tf)
+    for tf in order:
+        try:
+            refresh(tf)
+        except Exception as e:
+            print("start-up scan failed:", tf, type(e).__name__, flush=True)
 
 
 @app.post("/api/login")
@@ -4832,6 +4856,7 @@ def api_signals(tf: str = DEFAULT_INTERVAL):
     with LOCK:
         snap = dict(STATES[tf])
         snap["rows"] = apply_live(snap["rows"])
+        snap["step"] = DHAN_STAT.get("step") if snap.get("refreshing") else None
     snap["rows"] = add_conf(snap["rows"], tf)
     return JSONResponse({
         **snap,
@@ -8712,7 +8737,7 @@ function grpTable(id,rows,label,fmt){const t=$(id);t.className="gt";
 function renderHistory(d){
  const ss=$("hSec");if(ss.options.length!==d.sector_names.length+1){const v=ss.value;ss.innerHTML='<option value="ALL">All sectors</option>'+d.sector_names.map(n=>`<option>${esc(n)}</option>`).join("");ss.value=v}
  const st=d.stats;
- $("hNote").textContent=!d.scanned?(d.progress?`Scanning ${d.progress[0]} of ${d.progress[1]} symbols…`:"The first scan is running. This page updates on its own."):
+ $("hNote").textContent=!d.scanned?(d.progress?`Scanning ${d.progress[0]} of ${d.progress[1]} symbols…`+(d.step?` (now ${d.step})`:""):"The first scan is running. This page updates on its own."):
   st.n?`${tfName[d.tf]||d.tf} candles · ${st.n} signals${d.since?" since "+d.since:""} · ${st.open} still open`:"No signals match these filters.";
  const tile=(l,v,s,w)=>`<div><span class="l">${l}</span><span class="v">${v}</span><span class="s">${s}</span>${w!=null?`<span class="bar2"><i style="width:${w}%"></i></span>`:""}</div>`;
  $("hKpi").innerHTML=st.n?tile("Signals",st.n,`${st.open} open`)+st.t.map(t=>tile(`Reached T${t.k}`,pct(t.rate),`${t.wins} of ${t.done} closed · ${t.exp==null?"–":(t.exp>0?"+":"")+t.exp.toFixed(2)+"R"} per trade`,t.rate)).join("")+tile("Stopped out first",pct(st.sl_rate),`${st.sl_first} of ${st.n}`):"";
