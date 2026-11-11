@@ -967,6 +967,9 @@ def dhan_inst(sym):
     ix = INDEX_FEED["dhan"].get(sym)
     if ix:
         return ix[1], ix[0], "INDEX"
+    if sym in COMMODITIES:
+        f = near_future(sym, "dhan")
+        return (str(f[1]), "MCX_COMM", "FUTCOM") if f else None
     eq = M("dhan")["eq"].get(sym)
     return (str(eq[0]), "NSE_EQ", "EQUITY") if eq else None
 
@@ -1598,7 +1601,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-11n"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-11o"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2275,8 +2278,13 @@ def _parse_date(v):
     return None
 
 
+COMMODITIES = {"GOLD": "Gold", "GOLDM": "Gold Mini", "SILVER": "Silver", "SILVERM": "Silver Mini", "CRUDEOIL": "Crude Oil",
+               "CRUDEOILM": "Crude Oil Mini", "NATURALGAS": "Natural Gas", "COPPER": "Copper", "ZINC": "Zinc", "ALUMINIUM": "Aluminium",
+               "LEAD": "Lead", "NICKEL": "Nickel"}   # MCX futures shown on the Commodities tab (the nearest contract of each)
+
+
 def _dhan_master():
-    names, eq, opt, fut = set(UNIVERSE), {}, {}, {}
+    names, eq, opt, fut = set(UNIVERSE) | set(COMMODITIES), {}, {}, {}
     g = lambda row, *keys: next((str(row[k]).strip() for k in keys if row.get(k) not in (None, "")), "")
     with requests.get(DHAN_MASTER_URL, stream=True, timeout=120) as r:
         r.raise_for_status()
@@ -2297,6 +2305,10 @@ def _dhan_master():
             seg = "NSE_FNO" if exch == "NSE" else "BSE_FNO" if exch == "BSE" else ""
             if inst == "EQUITY" and exch == "NSE" and g(row, "SERIES", "SEM_SERIES").upper() in ("EQ", ""):
                 eq[sym] = (sid, label)
+            elif inst == "FUTCOM" and exch == "MCX" and sym in COMMODITIES:
+                exp = _parse_date(g(row, "SM_EXPIRY_DATE", "SEM_EXPIRY_DATE"))
+                if exp:
+                    fut.setdefault(sym, []).append((exp, sid, label, lot, "MCX_COMM"))
             elif inst in ("FUTSTK", "FUTIDX") and seg:
                 exp = _parse_date(g(row, "SM_EXPIRY_DATE", "SEM_EXPIRY_DATE"))
                 if exp:
@@ -5683,7 +5695,7 @@ def chart_data(symbol, tf, at=0):
         start = min(start, max(0, past - 60))   # an older signal opened from a list or a replay is shown with some candles before it
     t = [tm(df.index[i]) for i in range(start, n)]
 
-    out = {"symbol": symbol, "tf": tf, "intraday": tf != "1d", "index": symbol in INDEX_YF,
+    out = {"symbol": symbol, "tf": tf, "intraday": tf != "1d", "index": symbol in INDEX_YF, "commodity": symbol in COMMODITIES,
            "candles": [{"time": t[k], "open": round(float(df["Open"].iloc[i]), 2), "high": round(float(df["High"].iloc[i]), 2),
                         "low": round(float(df["Low"].iloc[i]), 2), "close": round(float(c[i]), 2)} for k, i in enumerate(range(start, n))],
            "markers": [{"time": t[i - start], "side": "BUY" if buy[i] else "SELL"} for i in range(start, n) if buy[i] or sell[i]][-1:],
@@ -5713,7 +5725,7 @@ def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0):
     symbol = symbol.upper().strip()
     if tf not in INTERVALS:
         tf = DEFAULT_INTERVAL
-    if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol) or (symbol not in UNIVERSE and symbol not in INDEX_YF):
+    if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol) or (symbol not in UNIVERSE and symbol not in INDEX_YF and symbol not in COMMODITIES):
         return JSONResponse({"error": "Unknown symbol."}, status_code=400)
     key = (symbol, tf, at)
     hit = CHART_CACHE.get(key)
@@ -5981,6 +5993,94 @@ def nse_most_active(by):
     names = [str(i.get("symbol", "")).upper() for i in items if i.get("symbol")]
     ACTIVE_CACHE[by] = (time.time(), names)
     return names
+
+
+# ── Commodities: the nearest MCX future of each metal and energy product, scanned with the same signal rules. Prices only; no orders. ──
+COM_STATES = {tf: {"rows": [], "updated": None, "errors": [], "refreshing": False, "checked": 0.0} for tf in INTERVALS}
+COM_PX = {"t": 0.0, "p": {}, "err": None}
+
+
+def com_refresh(tf):
+    st = COM_STATES[tf]
+    with LOCK:
+        if st["refreshing"]:
+            return
+        st["refreshing"] = True
+    rows, errors = [], []
+    try:
+        if not use_dhan():
+            errors.append("Commodities need Dhan as the data source (DATA_BROKER=dhan).")
+        else:
+            frames, errs = dhan_frames(list(COMMODITIES), tf, _days(PERIODS[tf]))
+            errors.extend(errs)
+            for sym in COMMODITIES:
+                df = frames.get(sym)
+                if df is None:
+                    continue
+                try:
+                    row = analyse(sym, df, tf)
+                    if not row:
+                        errors.append(f"{sym}: not enough data")
+                        continue
+                    row.pop("hist", None)
+                    f = near_future(sym, "dhan")
+                    row.update(type="commodity", name=COMMODITIES[sym], sector="Commodity", lot=f[3] if f else None,
+                               fexp=f[0].strftime("%d-%b-%Y") if f else None, sid=str(f[1]) if f else None)
+                    rows.append(row)
+                except Exception as e:
+                    errors.append(f"{sym}: {e}")
+    except Exception as e:
+        errors.append(f"Commodity scan failed: {type(e).__name__}: {str(e)[:100]}")
+    finally:
+        with LOCK:
+            if rows:
+                st.update(rows=rows, updated=ist_now().strftime("%d %b %H:%M:%S"))
+            st["errors"] = errors
+            st["refreshing"] = False
+            st["checked"] = time.time()
+
+
+def com_ensure_fresh(tf):
+    st = COM_STATES[tf]
+    with LOCK:
+        stale = not st["refreshing"] and time.time() - st["checked"] > REFRESH_SECONDS
+    if stale:
+        threading.Thread(target=com_refresh, args=(tf,), daemon=True).start()
+
+
+def com_prices(rows):
+    """{symbol: last price} for the contracts in the rows, read from Dhan at most every 8 seconds."""
+    if time.time() - COM_PX["t"] < 8 or not rows or not use_dhan():
+        return COM_PX["p"], COM_PX["err"]
+    COM_PX["t"] = time.time()
+    try:
+        items = [("MCX_COMM", r["sid"]) for r in rows if r.get("sid")]
+        got = feed_account().ltp(items)
+        COM_PX["p"] = {r["symbol"]: float(got[("MCX_COMM", r["sid"])]) for r in rows if r.get("sid") and got.get(("MCX_COMM", r["sid"]))}
+        COM_PX["err"] = None
+    except Exception as e:
+        COM_PX["err"] = f"Live prices could not be read ({type(e).__name__}: {str(e)[:90]}). Candle closes are shown."
+    return COM_PX["p"], COM_PX["err"]
+
+
+@app.get("/api/commodities")
+def api_commodities(tf: str = "15m"):
+    if tf not in INTERVALS:
+        tf = "15m"
+    com_ensure_fresh(tf)
+    with LOCK:
+        st = COM_STATES[tf]
+        rows, upd, busy, errs = [dict(r) for r in st["rows"]], st["updated"], st["refreshing"] or not st["updated"], list(st["errors"])
+    prices, perr = com_prices(rows)
+    for r in rows:
+        p = prices.get(r["symbol"])
+        if p:
+            r["ltp"] = round(p, 2)
+            if r.get("prev_close"):
+                r["ltp_chg"] = round((p / r["prev_close"] - 1) * 100, 2)
+    missing = [k for k in COMMODITIES if k not in {r["symbol"] for r in rows}] if upd else []
+    return {"tf": tf, "rows": rows, "updated": upd, "scanning": busy, "errors": errs[:6], "price_error": perr, "missing": missing,
+            "intervals": INTERVALS, "fresh_bars": FRESH_BARS}
 
 
 @app.get("/api/scanner")
@@ -7828,7 +7928,7 @@ h1::before{content:"";width:12px;height:26px;border-radius:4px;background:linear
 .seg{border-radius:12px;box-shadow:var(--shadow)}
 .seg button[aria-pressed=true]{background:var(--g);color:#fff}
 .mode{border-bottom:0;gap:6px;background:var(--panel);padding:5px;border-radius:14px;box-shadow:var(--shadow);width:fit-content;max-width:100%;overflow-x:auto}
-.mode button{border-radius:10px;border-bottom:0;margin:0;padding:8px 16px}
+.mode button{border-radius:10px;border-bottom:0;margin:0;padding:8px 16px;white-space:nowrap}
 .mode button[aria-pressed=true]{background:var(--g);color:#fff}
 .mode button:hover{background:var(--flat)}.mode button[aria-pressed=true]:hover{background:var(--g)}
 .idx div{border:0;box-shadow:var(--shadow);position:relative;overflow:hidden;background:linear-gradient(160deg,var(--panel),var(--flat))}
@@ -7912,7 +8012,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -7949,6 +8049,12 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label> <label class="chk"><input type="checkbox" id="scConf"> Grade A only</label><span class="sub" id="scMeta"></span></div>
 <div class="wrap"><table id="scTable"></table></div>
 
+</section>
+<section id="view-commodities" hidden>
+<div class="ixrow"><div class="seg" id="cmTfs" role="group" aria-label="Timeframe"></div>
+ <b class="scttl">Commodities: nearest MCX futures</b><span class="sub" id="cmMeta"></span></div>
+<div class="wrap"><table id="cmTable"></table></div>
+<p class="sub" id="cmNote"></p>
 </section>
 <section id="view-autopilot" hidden>
 <div id="botHost"></div>
@@ -8236,8 +8342,9 @@ const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
 function setMode(m){if(m==="index")m="options";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",options:"options",scanner:"scanner",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
- ["stocks","options","scanner","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ const vm={stocks:"stocks",futures:"stocks",options:"options",scanner:"scanner",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","options","scanner","commodities","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ if(m==="commodities"){cmPaint();cmLoad()}else clearTimeout(cmTimer);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
  if(m==="scanner"){scPaint();scLoad()}else clearTimeout(scTimer);
  if(m==="autopilot")botLoad();else clearTimeout(botTimer);
@@ -8320,6 +8427,25 @@ function initModes(){paintTheme();
   else{const d=await post("/api/trading/mode",{mode:"paper"});if(d.error){alert(d.error);return}}
   await loadTrading();if(typeof loadOrders==="function")try{loadOrders()}catch(x){}}}
 // ── Intraday Scanner tab ──
+let cmTf="15m",cmTimer=null,cmData=null;
+try{const t=localStorage.getItem("cmTf");if(["5m","15m","1d"].includes(t))cmTf=t}catch(e){}
+function cmPaint(){$("cmTfs").innerHTML=["5m","15m","1d"].map(x=>`<button data-t="${x}" aria-pressed="${x===cmTf}">${tfName[x]||x}</button>`).join("")}
+async function cmLoad(){clearTimeout(cmTimer);if(mode!=="commodities")return;const my=cmTf;
+ try{const d=await (await api(`/api/commodities?tf=${cmTf}`)).json();if(my!==cmTf)return;cmData=d;cmRender()}
+ catch(e){$("cmMeta").textContent="Cannot reach the server."}
+ cmTimer=setTimeout(cmLoad,cmData&&cmData.scanning?3000:10000)}
+function cmRender(){const d=cmData,tb=$("cmTable");if(!d)return;
+ $("cmMeta").textContent=(d.updated?`candles updated ${d.updated}`:"")+(d.scanning?" · scanning…":"");
+ const head="<thead><tr><th>Commodity</th><th>Signal</th><th>Status</th><th>Signal candle</th><th></th><th>Price</th><th>Day %</th><th>Entry</th><th>SL</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Contract</th></tr></thead>";
+ if(!d.rows.length){tb.innerHTML=head+`<tbody><tr><td colspan="14" class="empty">${d.scanning?"First scan is running. This page updates on its own.":"No commodity data yet."}</td></tr></tbody>`}
+ else tb.innerHTML=head+"<tbody>"+d.rows.map(r=>{const tp=n=>`<td class="${r.hits>=n?"up":""}">${fmt(r["tp"+n])}${r.hits>=n?" ✓":""}</td>`,c=r.ltp_chg!=null?r.ltp_chg:r.chg;
+  return `<tr${rowCls(r)}><td><b>${esc(r.name||r.symbol)}</b> <span class="sub">${esc(r.symbol)}</span></td><td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span></td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>`+
+  `<td class="act"><button class="mini" data-cmchart="${esc(r.symbol)}">Chart</button></td><td>${r.ltp!=null?`<b>${fmt(r.ltp)}</b>`:fmt(r.close)}</td>`+
+  `<td class="${c==null?"":c>=0?"up":"dn"}">${c==null?"–":(c>0?"+":"")+c.toFixed(2)+"%"}</td><td>${fmt(r.entry)}</td><td class="${r.sl_hit?"dn":""}">${fmt(r.sl)}${r.sl_hit?" ✖":""}</td>${tp(1)}${tp(2)}${tp(3)}${tp(4)}<td class="sub">${esc(r.fexp||"")}</td></tr>`}).join("")+"</tbody>";
+ const notes=[];if(d.errors&&d.errors.length&&!d.rows.length)notes.push(d.errors.slice(0,3).join("; "));
+ if(d.price_error)notes.push(d.price_error);if(d.missing&&d.missing.length&&d.rows.length)notes.push("No data for: "+d.missing.join(", ")+(d.errors.length?" ("+d.errors.slice(0,2).join("; ")+")":""));
+ $("cmNote").textContent=(notes.length?notes.join(" · ")+" · ":"")+"Commodities are view-only here: signals, stop and targets on the nearest MCX future. Orders are not available yet."}
+document.addEventListener("click",e=>{const b=e.target.closest("[data-cmchart]");if(b)openChart(b.dataset.cmchart,cmTf);const t=e.target.closest("#cmTfs button");if(t){cmTf=t.dataset.t;try{localStorage.setItem("cmTf",cmTf)}catch(_){}cmPaint();cmLoad()}});
 let scTf="15m",scTimer=null,scData=null;
 try{scTf=localStorage.getItem("scTf")==="5m"?"5m":"15m"}catch(e){}
 function scPaint(){$("scTfs").innerHTML=["5m","15m"].map(x=>`<button data-t="${x}" aria-pressed="${x===scTf}">${tfName[x]||x}</button>`).join("");
@@ -8518,7 +8644,8 @@ function loadLW(){if(window.LightweightCharts)return Promise.resolve();
  return lwPromise||(lwPromise=new Promise((ok,no)=>{const s=document.createElement("script");s.src="/lw.js";s.onload=ok;s.onerror=()=>{lwPromise=null;no()};document.head.appendChild(s)}))}
 function openChart(sym,t,at){chSym=sym;chTf=t||tf||"15m";chAt=at||0;$("chTitle").textContent=sym;$("chTfs").innerHTML=(data?data.intervals:["5m","15m","1d"]).map(x=>`<button data-ct="${x}" aria-pressed="${x===chTf}">${tfName[x]||x}</button>`).join("");
  if(!$("chartDlg").open)$("chartDlg").showModal();drawChart()}
-function chTradeBar(d){const last=d.candles[d.candles.length-1].close,idx=d.index,sy=d.symbol,bt=(c,a,t)=>`<button class="${c}" data-ct2="${a}">${t}</button>`;
+function chTradeBar(d){if(d.commodity){$("chTrade").innerHTML='<span class="sub">Commodities are view-only here. Orders are not available yet.</span>';$("chTrade").onclick=null;return}
+ const last=d.candles[d.candles.length-1].close,idx=d.index,sy=d.symbol,bt=(c,a,t)=>`<button class="${c}" data-ct2="${a}">${t}</button>`;
  $("chTrade").innerHTML=(idx?"":bt("b","eq-BUY","Buy shares")+bt("s","eq-SELL","Sell shares")+bt("b","fut-BUY","Buy futures")+bt("s","fut-SELL","Sell futures"))+bt("b","opt-CE","Buy Call (CE)")+bt("s","opt-PE","Buy Put (PE)")+'<span class="sub">Opens the order ticket to review. Nothing is sent yet.</span>';
  $("chTrade").onclick=async e=>{const b=e.target.closest("button[data-ct2]");if(!b)return;const [k,v]=b.dataset.ct2.split("-");
   if(k==="eq")openTicket({kind:"equity",symbol:sy,label:sy,side:v,price:last});
