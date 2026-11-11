@@ -1598,7 +1598,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD = "2026-11-11j"   # shown next to the user name so it is clear which version a server is running
+BUILD = "2026-11-11k"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -6163,6 +6163,35 @@ def api_order_funds(request: Request, payload: dict = Body(...)):
 PF_OPT = {}   # (symbol, expiry) -> (time, chain rows): option prices for the paper portfolio, kept for a few seconds
 
 
+DHAN_OC = {}   # (symbol, expiry) -> (time, {(strike, right): last price}): Dhan's option chain, one request per contract list
+
+
+def dhan_oc_price(symbol, expiry, strike, right):
+    """Last price of one option contract from Dhan's option chain call (asked once per symbol and expiry, kept for 10 seconds).
+    It needs no instrument-list lookup of the contract. Returns None when Dhan has no price for it."""
+    key = (symbol, expiry)
+    hit = DHAN_OC.get(key)
+    if not hit or time.time() - hit[0] > 10:
+        inst = dhan_inst(symbol) if load_master("dhan") else None
+        if not inst:
+            raise DhanDataError(f"{symbol} is not in Dhan's instrument list")
+        d = datetime.strptime(expiry, EXPIRY_FMT).date().isoformat()
+        res = dhan_post("/optionchain", {"UnderlyingScrip": int(inst[0]), "UnderlyingSeg": inst[1], "Expiry": d})
+        oc = ((res or {}).get("data") or {}).get("oc") or {}
+        prices = {}
+        for k, v in oc.items():
+            try:
+                kf = round(float(k), 4)
+            except ValueError:
+                continue
+            for r_ in ("ce", "pe"):
+                lp = ((v or {}).get(r_) or {}).get("last_price")
+                if lp:
+                    prices[(kf, r_.upper())] = float(lp)
+        hit = DHAN_OC[key] = (time.time(), prices)
+    return hit[1].get((round(float(strike), 4), right))
+
+
 def paper_option_prices(u, orders):
     """({order label: last price}, [problems]) for the option contracts held in paper orders.
     The held contracts are priced directly from a broker (one small request). The person's own account is tried first; when it is refused
@@ -6194,8 +6223,10 @@ def paper_option_prices(u, orders):
             if label not in ref:
                 o_ = pending[label]
                 have = sorted({e for (sy, e, k, r_) in opt if sy == o_["symbol"]}, key=lambda e: datetime.strptime(e, "%d%b%Y"))[:4]
+                ek_ = datetime.strptime(o_["expiry"], EXPIRY_FMT).strftime("%d%b%Y").upper()
+                ks = sorted({k for (sy, e, k, r_) in opt if sy == o_["symbol"] and e == ek_ and r_ == o_["right"]}, key=lambda k: abs(k - float(o_["strike"])))[:3]
                 why.append(f"{label} is not in {name}'s instrument list ("
-                           + (f"it has {o_['symbol']} contracts expiring " + ", ".join(have) if have else f"it has no {o_['symbol']} option contracts at all; {sum(1 for _ in opt)} option contracts loaded") + ")")
+                           + (f"it has {o_['symbol']} contracts expiring " + ", ".join(have) + (f"; strikes nearest {o_['strike']:g} on that day: " + (", ".join(f"{k:g}" for k in ks) if ks else "none") if have else "") if have else f"it has no {o_['symbol']} option contracts at all; {sum(1 for _ in opt)} option contracts loaded") + ")")
         if not ref:
             continue
         items = sorted(set(ref.values()))
@@ -6219,7 +6250,18 @@ def paper_option_prices(u, orders):
                 out[label] = prices[k]
             else:
                 why.append(f"{name} sent no price for {label} (id {k[1]}, {k[0]})")
-    for label, o in want.items():   # anything not priced above: the option chain
+    for label, o in want.items():   # anything not priced above: Dhan's option chain call
+        if label in out:
+            continue
+        try:
+            px = dhan_oc_price(o["symbol"], o["expiry"], o["strike"], o["right"])
+            if px:
+                out[label] = px
+            else:
+                why.append(f"Dhan's option chain has no price for {label}")
+        except Exception as e:
+            why.append(f"Dhan's option chain call failed for {o.get('symbol')} ({str(e)[:90]})")
+    for label, o in want.items():   # anything still not priced: NSE's option chain
         if label in out:
             continue
         k = (o["symbol"], o.get("expiry"))
