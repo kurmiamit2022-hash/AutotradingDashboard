@@ -1598,7 +1598,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD = "2026-11-11k"   # shown next to the user name so it is clear which version a server is running
+BUILD = "2026-11-11l"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -6192,6 +6192,39 @@ def dhan_oc_price(symbol, expiry, strike, right):
     return hit[1].get((round(float(strike), 4), right))
 
 
+PF_BG = {}   # user id -> {"t": when the last look finished, "out": prices, "errs": problems, "busy": a look is running}
+
+
+def paper_prices_cached(u, orders):
+    """The Portfolio page must answer at once, but pricing can queue behind the candle scan's requests. The look runs in the background
+    and the page gets the latest result, refreshed about every 5 seconds."""
+    uid = (u or {}).get("id")
+    st = PF_BG.setdefault(uid, {"t": 0.0, "out": {}, "errs": [], "busy": False, "key": None})
+    key = tuple(sorted(o["label"] for o in orders))
+    if st["key"] != key:
+        st.update(key=key, out={}, errs=[], t=0.0)
+    if not orders:
+        return {}, []
+    if not st["busy"] and time.time() - st["t"] > 5:
+        st["busy"] = True
+
+        def go():
+            try:
+                out, errs = paper_option_prices(u, orders)
+                st.update(out=out, errs=errs, t=time.time())
+            except Exception as e:
+                st.update(errs=[f"Option prices could not be read ({type(e).__name__}: {str(e)[:80]})"], t=time.time())
+            finally:
+                st["busy"] = False
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        if not st["t"]:
+            th.join(3)   # the first look gets a few seconds; after that the page shows what is known and updates itself
+    if not st["t"]:
+        return {}, ["Reading the option prices…"]
+    return st["out"], st["errs"]
+
+
 def paper_option_prices(u, orders):
     """({order label: last price}, [problems]) for the option contracts held in paper orders.
     The held contracts are priced directly from a broker (one small request). The person's own account is tried first; when it is refused
@@ -6308,7 +6341,7 @@ def api_portfolio(request: Request):
         for o in recs:
             if o["kind"] == "option":
                 held[o["label"]] = held.get(o["label"], 0) + (o["qty"] if o["side"] == "BUY" else -o["qty"])
-        oprices, oerrs = paper_option_prices(u, [o for o in recs if o["kind"] == "option" and held.get(o["label"])])
+        oprices, oerrs = paper_prices_cached(u, [o for o in recs if o["kind"] == "option" and held.get(o["label"])])
         errors.extend(oerrs)
         for o in recs:
             g = groups.setdefault(o["label"], {"o": o, "bq": 0, "bv": 0.0, "sq": 0, "sv": 0.0})
