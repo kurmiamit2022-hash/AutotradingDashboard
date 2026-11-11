@@ -308,6 +308,7 @@ def eval_signals(symbol, df, interval, idxs, buy, c, hi, lo, atr, ls, ss):
     return out
 
 
+INTRA_CHG = {}   # symbol -> today's change from the latest 5 or 15 minute candles, used for the daily view when Dhan's daily history has no candle for today
 INTERNAL = {}   # (symbol, timeframe) -> values the options autopilot needs; never sent to the browser
 
 
@@ -318,6 +319,7 @@ def analyse(symbol, df, interval):
     df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
     chg = None  # change since the previous session's close, using the latest price (even a candle that is still forming)
     prev_close = None
+    stale_day = False
     vol = val_cr = None
     try:
         if interval != "1d" and "Volume" in df:
@@ -336,6 +338,7 @@ def analyse(symbol, df, interval):
             n_ = ist_now()
             if len(cl) and cl[-1] > 0 and df.index[-1].date() < n_.date() and n_.time() >= dtime(9, 15) and (n_.weekday() < 5 or special_session_now()):
                 prev_close = float(cl[-1])   # Dhan's daily history stops at yesterday: today's change is measured from that last candle, not the one before it
+                chg, stale_day = None, True   # and the last candle's own move is yesterday's, not today's
         else:
             days = np.array([t.date() for t in df.index])
             before = np.nonzero(days != days[-1])[0]
@@ -344,6 +347,8 @@ def analyse(symbol, df, interval):
                 prev_close = float(cl[before[-1]])
     except Exception:
         chg = None
+    if interval != "1d" and chg is not None:
+        INTRA_CHG[symbol] = chg
     if CONFIRMED_ONLY:
         df = drop_forming(df, interval)
     n = len(df)
@@ -371,7 +376,7 @@ def analyse(symbol, df, interval):
     INTERNAL[(symbol, interval)] = {"ema": float(ema[-1]), "atr": float(atr[-1]) if len(atr) and atr[-1] == atr[-1] else None}
     base = {"symbol": symbol, "hist": hist, "type": "index" if symbol in INDEX_YF else "stock", "close": round(float(c[-1]), 2), "signal": "–", "entry": None, "sl": None,
             "sector": sector_of(symbol), "chg": None if chg is None else round(float(chg), 2),
-            "prev_close": None if prev_close is None else round(prev_close, 2), "vol": vol, "val_cr": val_cr,
+            "prev_close": None if prev_close is None else round(prev_close, 2), "stale_day": stale_day, "vol": vol, "val_cr": val_cr,
             "tp1": None, "tp2": None, "tp3": None, "tp4": None, "hits": 0, "sl_hit": False,
             "status": "No signal yet", "bars_ago": None, "signal_time": "–"}
     if len(sig_idx) == 0:
@@ -570,8 +575,8 @@ def live_rescan(tf):
             out.append(row)
             n += 1
         with LOCK:
-            STATES[tf].update(rows=out, updated=datetime.now().strftime("%d %b %H:%M:%S"))
-        LIVEC[tf].update(at=datetime.now().strftime("%H:%M:%S"), n=n)
+            STATES[tf].update(rows=out, updated=ist_now().strftime("%d %b %H:%M:%S"))
+        LIVEC[tf].update(at=ist_now().strftime("%H:%M:%S"), n=n)
         try:
             check_alerts(tf, out)
         except Exception as e:
@@ -1363,7 +1368,7 @@ def refresh(interval):
         rows, errors, hist = fetch_all(interval, partial)
         with LOCK:
             if rows:  # never replace good data with an empty result
-                st.update(rows=rows, errors=errors, updated=datetime.now().strftime("%d %b %H:%M:%S"))
+                st.update(rows=rows, errors=errors, updated=ist_now().strftime("%d %b %H:%M:%S"))
                 HIST[interval] = hist
             else:
                 st["errors"] = errors or [f"{'Dhan' if use_dhan() else 'Yahoo'} returned no data."]
@@ -1503,7 +1508,7 @@ def build_chain(symbol, expiry=None):
     if hit and time.time() - hit["t"] < OPTION_TTL:
         return hit["v"]
 
-    today = datetime.now().date()
+    today = ist_now().date()
     info = nse.get_json("/api/option-chain-contract-info", {"symbol": symbol})
     expiries = _sorted_expiries((info or {}).get("expiryDates"))
     upcoming = [d for d in expiries if datetime.strptime(d, EXPIRY_FMT).date() >= today]
@@ -1588,6 +1593,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
+BUILD = "2026-11-11e"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2733,6 +2739,8 @@ def apply_live(rows):
                 pc = r["prev_close"] = round(ex["p"], 2)   # the exchange's own previous close, the figure every broker app uses
             if pc:
                 r["ltp_chg"] = round((p / pc - 1) * 100, 2)
+        elif r.get("stale_day") and INTRA_CHG.get(r["symbol"]) is not None:
+            r = {**r, "chg": round(float(INTRA_CHG[r["symbol"]]), 2)}   # no live price: today's change from the intraday candles
         out.append(r)
     return out
 
@@ -6126,6 +6134,9 @@ def paper_option_prices(u, orders):
                 inst = None
             if inst:
                 ref[label] = (inst[3], str(inst[0]))
+        for label in pending:
+            if label not in ref:
+                why.append(f"{label} is not in {name}'s instrument list")
         if not ref:
             continue
         items = sorted(set(ref.values()))
@@ -6147,6 +6158,8 @@ def paper_option_prices(u, orders):
         for label, k in ref.items():
             if prices.get(k):
                 out[label] = prices[k]
+            else:
+                why.append(f"{name} sent no price for {label} (id {k[1]}, {k[0]})")
     for label, o in want.items():   # anything not priced above: the option chain
         if label in out:
             continue
@@ -6164,7 +6177,7 @@ def paper_option_prices(u, orders):
     miss = [l for l in want if l not in out]
     if miss:
         errs.append("No live price for " + ", ".join(miss[:3]) + (f" and {len(miss) - 3} more" if len(miss) > 3 else "") + ". "
-                    + ("; ".join(dict.fromkeys(why)) + ". " if why else "") + "Profit and loss show once a price is available.")
+                    + ("Why: " + "; ".join(list(dict.fromkeys(why))[:3]) + ". " if why else "No broker account could be used to price them. ") + "Profit and loss show once a price is available.")
     return out, errs
 
 
@@ -7055,7 +7068,7 @@ def api_me(request: Request):
     mode, note = user_mode(u)
     hints = {r["broker"]: r["hint"] for r in q("SELECT broker, hint FROM creds WHERE user_id=?", (u["id"],))}
     return {"user": public_user(u), "csrf": u["csrf"], "mode": mode, "note": note, "hints": hints, "default_password": u["id"] in DEFAULT_PW_USERS,
-            "broker_fields": BROKER_FIELDS, "broker_names": BROKER_NAMES}
+            "broker_fields": BROKER_FIELDS, "broker_names": BROKER_NAMES, "build": BUILD}
 
 
 @app.post("/api/account/password")
@@ -8106,13 +8119,13 @@ function renderChips(){
   if(text&&!n.includes(text))return false;
   if(sec!=="ALL"&&((by[n]||{}).sector||(data.indices||[]).includes(n)&&"Indices"||"Others")!==sec)return false;
   return fl==="all"||(fl==="sig"?sg!=="–":sg.includes(fl))});
- const so=document.getElementById("osort").value,ch=n=>{const c=(by[n]||{}).chg;return c==null?null:c};
+ const so=document.getElementById("osort").value,ch=n=>{const r=by[n];if(!r)return null;const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?null:c};
  list.sort((a,b)=>{
   if(so!=="sig"&&so!=="name"){const ca=ch(a),cb=ch(b);if(ca==null||cb==null){if(ca!==cb)return ca==null?1:-1}else{const d=so==="up"?cb-ca:so==="down"?ca-cb:Math.abs(cb)-Math.abs(ca);if(d)return d}return a.localeCompare(b)}
   if(so==="name")return a.localeCompare(b);
   const ra=by[a]?rank[by[a].signal]:99,rb=by[b]?rank[by[b].signal]:99;return (ra??99)-(rb??99)||a.localeCompare(b)});
  box.innerHTML=list.length?list.map(n=>{const sg=(by[n]||{}).signal||"–";
-  const c=(by[n]||{}).chg;
+  const c=by[n]?(by[n].ltp_chg!=null?by[n].ltp_chg:by[n].chg):null;
   return `<button class="orow" data-s="${esc(n)}" aria-pressed="${n===osym}"><span>${esc(n)}</span><span class="ochg ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span>${sg==="–"?'<span class="none">–</span>':`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`}</button>`}).join(""):`<div class="sub" style="padding:12px">No scripts match.</div>`;
  box.scrollTop=keep;
 }
@@ -8634,7 +8647,7 @@ loadTrading();
 // ── Account and admin ──
 const send=async(m,u,b)=>(await api(u,{method:m,headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)})).json();
 async function loadMe(){const d=await (await api("/api/me")).json();me=d;csrf=d.csrf;
- $("dpBanner").hidden=!d.default_password;$("who").textContent=d.user.username+(d.user.role==="admin"?" (admin)":"");$("navAdmin").hidden=d.user.role!=="admin";renderAccount(d)}
+ $("dpBanner").hidden=!d.default_password;$("who").textContent=d.user.username+(d.user.role==="admin"?" (admin)":"")+(d.build?" · build "+d.build:"");$("navAdmin").hidden=d.user.role!=="admin";renderAccount(d)}
 function renderAccount(d){
  $("acctInfo").textContent=d.mode==="live"?"Live trading is enabled for your account.":d.note;
  $("recInfo").textContent=d.user.recovery_set?"You have a recovery key. If you forget your password, the Forgot password page accepts it once. Creating a new key cancels the old one.":"You have no recovery key yet, so you could not reset your own password. Create one and keep it somewhere safe.";
