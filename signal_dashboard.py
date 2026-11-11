@@ -12,6 +12,7 @@ Optional env vars:  INTERVAL=5m|15m|1d  REFRESH_SECONDS=300  PORT=8000  HOST=0.0
                      DATA_BROKER=dhan (one source: Dhan live stream + Dhan history)  CANDLE_SOURCE=dhan|yahoo  YAHOO_FALLBACK=0|1  LIVE_RESYNC_SECONDS=1800
   DATABASE_URL=<postgres address, keeps users across redeploys; also set SECRETS_KEY>
   DB_PATH=dashboard.db  ORDER_LOG=orders_log.jsonl  SECRETS_KEY=<Fernet key>  COOKIE_SECURE=1 (when served over https)
+  DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN (first token), DHAN_PIN, DHAN_TOTP_SECRET (optional: with DHAN_AUTO_RENEW=1 the server signs in by itself every day at DHAN_REFRESH_AT=06:00 IST; off by default)
   LIVE_TRADING=1 (switch live trading on for the server; an admin must still enable it for each person)
   MAX_ORDER_VALUE, MAX_QTY, MAX_ORDERS_PER_DAY, MAX_FUT_LOTS, MAX_FUT_VALUE, ALLOW_OPTION_SELLING  (default limits per person)
 Optional file:      symbols.txt  (one NSE symbol per line, e.g. RELIANCE) overrides the default stock list.
@@ -19,6 +20,7 @@ Optional file:      symbols.txt  (one NSE symbol per line, e.g. RELIANCE) overri
 Orders are simulated ("paper") unless live trading is on for the server and enabled for that person.
 Back up the database and the secret.key file together. Without the key, saved broker details cannot be read.
 """
+import base64
 import csv
 import math
 import hashlib
@@ -331,6 +333,9 @@ def analyse(symbol, df, interval):
             if len(cl) >= 2 and cl[-2] > 0:
                 chg = (cl[-1] / cl[-2] - 1) * 100
                 prev_close = float(cl[-2])
+            n_ = ist_now()
+            if len(cl) and cl[-1] > 0 and df.index[-1].date() < n_.date() and n_.time() >= dtime(9, 15) and (n_.weekday() < 5 or special_session_now()):
+                prev_close = float(cl[-1])   # Dhan's daily history stops at yesterday: today's change is measured from that last candle, not the one before it
         else:
             days = np.array([t.date() for t in df.index])
             before = np.nonzero(days != days[-1])[0]
@@ -690,10 +695,240 @@ def _dhan_reason(res, status):
     return (str(msg)[:120] if msg else f"HTTP {status}"), False
 
 
+# ── Dhan access token: the server renews it, so nobody has to paste a new one every day.
+# Needs DHAN_CLIENT_ID and a first DHAN_ACCESS_TOKEN. With DHAN_PIN and DHAN_TOTP_SECRET as well, it signs in again by itself every morning.
+# Without them it can still extend the token it has (Dhan's renew call) as long as that token has not yet expired.
+DHAN_AUTH_URL = os.getenv("DHAN_AUTH_URL", "https://auth.dhan.co/app/generateAccessToken")
+DHAN_REFRESH_AT = os.getenv("DHAN_REFRESH_AT", "06:00")           # IST, the daily sign-in time
+DHAN_AUTO_RENEW = os.getenv("DHAN_AUTO_RENEW", "0") == "1"   # off unless DHAN_AUTO_RENEW=1
+DHAN_RENEW_EVERY_H = float(os.getenv("DHAN_RENEW_EVERY_H", "12") or 12)   # renew-only mode: extend the token this often
+TOKEN = {"lock": threading.Lock(), "expiry": 0.0, "issued": 0.0, "generated": 0.0, "try": 0.0, "ok": 0.0, "error": None, "how": None,
+         "alerted": 0.0, "loaded": False}
+_TOKEN_SEED = hashlib.sha256(os.getenv("DHAN_ACCESS_TOKEN", "").encode()).hexdigest()[:16]   # the token that was pasted into the settings
+
+
+def _token_auto():
+    return bool(os.getenv("DHAN_PIN", "").strip() and os.getenv("DHAN_TOTP_SECRET", "").strip())
+
+
+def totp_code(secret, at=None, step=30, digits=6):
+    """The 6 digit code an authenticator app would show (RFC 6238)."""
+    sec = re.sub(r"\s+", "", secret).upper()
+    key = base64.b32decode(sec + "=" * (-len(sec) % 8))
+    n = int((time.time() if at is None else at) // step)
+    h = hmac.new(key, struct.pack(">Q", n), hashlib.sha1).digest()
+    o = h[-1] & 15
+    return str((struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)).zfill(digits)
+
+
+def _jwt_exp(tok):
+    try:
+        part = str(tok).split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(part))["exp"])
+    except Exception:
+        return 0.0
+
+
+def _scrub(text):
+    """Nothing secret may end up in a message: the PIN, the code, and any token are masked."""
+    t = str(text)
+    for v in (os.getenv("DHAN_PIN", ""), os.getenv("DHAN_TOTP_SECRET", ""), os.getenv("DHAN_ACCESS_TOKEN", ""), (FEED.get("acct").c.get("access_token") if FEED.get("acct") else "")):
+        if v and len(str(v)) >= 4:
+            t = t.replace(str(v), "…")
+    return re.sub(r"eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{5,}", "…", t)[:160]
+
+
+def _token_result(res):
+    d = res.get("data") if isinstance(res, dict) and isinstance(res.get("data"), dict) else res
+    tok = (d or {}).get("accessToken") or (d or {}).get("access_token") if isinstance(d, dict) else None
+    if not tok:
+        msg = None
+        if isinstance(res, dict):
+            msg = res.get("message") or res.get("errorMessage") or res.get("remarks") or res.get("status")
+            if isinstance(msg, dict):
+                msg = msg.get("message") or json.dumps(msg)
+        raise RuntimeError(_scrub(msg or "Dhan did not return a token"))
+    exp = _jwt_exp(tok)
+    if not exp:
+        try:
+            exp = pd.Timestamp(str(d.get("expiryTime")), tz=IST).timestamp()
+        except Exception:
+            exp = time.time() + 23 * 3600
+    return str(tok), float(exp)
+
+
+def dhan_generate(c):
+    """Sign in with the PIN and the authenticator code, the same as the Dhan web page does."""
+    pin, sec = os.getenv("DHAN_PIN", "").strip(), os.getenv("DHAN_TOTP_SECRET", "").strip()
+    if not (pin and sec):
+        raise RuntimeError("DHAN_PIN and DHAN_TOTP_SECRET are not set")
+    if time.time() % 30 > 27:
+        time.sleep(30 - time.time() % 30 + 0.5)     # do not send a code that is about to change
+    try:
+        r = requests.post(DHAN_AUTH_URL, params={"dhanClientId": c["client_id"], "pin": pin, "totp": totp_code(sec)}, timeout=20)
+        res = r.json()
+    except requests.RequestException as e:
+        raise RuntimeError("could not reach Dhan's sign-in page (" + type(e).__name__ + ")")
+    except ValueError:
+        raise RuntimeError(f"Dhan's sign-in page gave an unreadable answer (HTTP {r.status_code})")
+    return _token_result(res)
+
+
+def dhan_renew_call(c):
+    """Ask Dhan to extend the token that is still valid."""
+    try:
+        r = requests.get(DHAN_BASE + "/RenewToken", timeout=20, headers={"access-token": c["access_token"], "dhanClientId": str(c["client_id"])})
+        res = r.json()
+    except requests.RequestException as e:
+        raise RuntimeError("could not reach Dhan (" + type(e).__name__ + ")")
+    except ValueError:
+        raise RuntimeError(f"Dhan's renew call gave an unreadable answer (HTTP {r.status_code})")
+    return _token_result(res)
+
+
+def token_save(tok, exp, issued, generated):
+    try:
+        blob = fernet().encrypt(json.dumps({"token": tok, "expiry": exp, "issued": issued, "generated": generated, "seed": _TOKEN_SEED}).encode()).decode()
+        x("INSERT INTO creds(user_id, broker, blob, hint, updated) VALUES(?,?,?,?,?) "
+          "ON CONFLICT(user_id, broker) DO UPDATE SET blob=excluded.blob, hint=excluded.hint, updated=excluded.updated",
+          (0, "dhan-feed-token", blob, "", ist_now().isoformat()))
+    except Exception:
+        pass    # a failed save only means the next restart signs in again
+
+
+def token_load(c):
+    """Use the token this server last renewed (kept encrypted in the database) unless a newer one was pasted into the settings."""
+    if TOKEN["loaded"] or not DHAN_AUTO_RENEW:
+        return
+    TOKEN["loaded"] = True
+    try:
+        rows = q("SELECT blob FROM creds WHERE user_id=? AND broker=?", (0, "dhan-feed-token"))
+        if rows:
+            d = json.loads(fernet().decrypt(rows[0]["blob"].encode()).decode())
+            if d.get("seed") == _TOKEN_SEED and d.get("token"):
+                c["access_token"] = d["token"]
+                TOKEN.update(expiry=float(d.get("expiry") or 0), issued=float(d.get("issued") or 0), generated=float(d.get("generated") or 0), how="saved")
+                os.environ["DHAN_ACCESS_TOKEN"] = d["token"]
+                return
+    except Exception:
+        pass
+    exp = _jwt_exp(c.get("access_token", ""))
+    TOKEN.update(expiry=exp, issued=(exp - 24 * 3600) if exp else 0.0)
+
+
+def alert_admins(title, text):
+    try:
+        for r in q("SELECT id FROM users WHERE role='admin' AND active=1"):
+            notify_user(r["id"], title, text)
+    except Exception:
+        pass
+
+
+def dhan_token_refresh(why="", force=False):
+    """Get a fresh token now. Returns True when the server has a working token afterwards."""
+    if DATA_BROKER != "dhan" or not DHAN_AUTO_RENEW:
+        return False
+    with TOKEN["lock"]:
+        now = time.time()
+        if not force and now - TOKEN["try"] < 130:      # Dhan allows a sign-in only once in a couple of minutes
+            return TOKEN["error"] is None
+        acct = FEED.get("acct")
+        if acct is None:
+            return False
+        c = acct.c
+        token_load(c)
+        TOKEN["try"] = now
+        valid = bool(c.get("access_token")) and (not TOKEN["expiry"] or now < TOKEN["expiry"] - 30)
+        order = (["generate"] if _token_auto() else []) + (["renew"] if valid else [])
+        if not order:
+            TOKEN["error"] = "no way to renew: set DHAN_PIN and DHAN_TOTP_SECRET, or paste a new DHAN_ACCESS_TOKEN"
+        errs = []
+        for how in order:
+            try:
+                tok, exp = dhan_generate(c) if how == "generate" else dhan_renew_call(c)
+            except Exception as e:
+                errs.append(f"{'sign-in' if how == 'generate' else 'renew'}: {_scrub(e)}")
+                continue
+            c["access_token"] = tok
+            os.environ["DHAN_ACCESS_TOKEN"] = tok
+            TOKEN.update(expiry=exp, issued=time.time(), ok=time.time(), error=None, how="signed in" if how == "generate" else "renewed",
+                         generated=time.time() if how == "generate" else TOKEN["generated"])
+            token_save(tok, exp, TOKEN["issued"], TOKEN["generated"])
+            DHAN_STAT["error"] = None
+            FEED["error"] = None
+            return True
+        if errs:
+            TOKEN["error"] = "; ".join(errs)[:220]
+        if now - TOKEN["alerted"] > 6 * 3600:
+            TOKEN["alerted"] = now
+            alert_admins("Dhan token could not be renewed", f"{TOKEN['error']}. Prices and orders will stop when the current token runs out. "
+                                                              "Check DHAN_PIN and DHAN_TOTP_SECRET, or paste a new DHAN_ACCESS_TOKEN in Render.")
+        return False
+
+
+def dhan_token_due():
+    """Why the token should be renewed right now, or None."""
+    acct = FEED.get("acct")
+    if acct is None:
+        return None
+    c = acct.c
+    token_load(c)
+    now = time.time()
+    if not c.get("access_token"):
+        return "no token"
+    if TOKEN["expiry"] and now >= TOKEN["expiry"] - 600:
+        return "about to expire"
+    if _token_auto():
+        try:
+            hh, mm = [int(v) for v in DHAN_REFRESH_AT.split(":")]
+        except ValueError:
+            hh, mm = 6, 0
+        at = ist_now().replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp()
+        if now >= at and TOKEN["generated"] < at:
+            return "daily sign-in"
+    elif not TOKEN["issued"] or now - TOKEN["issued"] > DHAN_RENEW_EVERY_H * 3600:
+        return "extend"
+    return None
+
+
+def dhan_token_loop():
+    while True:
+        try:
+            if FEED.get("acct") is None and os.getenv("DHAN_CLIENT_ID", "").strip():
+                try:
+                    feed_account()      # builds the account (and signs in if there is no token yet)
+                except Exception:
+                    pass
+            why = dhan_token_due()
+            if why:
+                dhan_token_refresh(why)
+        except Exception as e:
+            TOKEN["error"] = _scrub(f"{type(e).__name__}: {e}")
+        time.sleep(60)
+
+
+def token_report():
+    now = time.time()
+    return {"enabled": DHAN_AUTO_RENEW, "auto": _token_auto(), "at": DHAN_REFRESH_AT, "how": TOKEN["how"], "error": TOKEN["error"],
+            "expires_in": int(TOKEN["expiry"] - now) if TOKEN["expiry"] else None,
+            "last_ok_age": int(now - TOKEN["ok"]) if TOKEN["ok"] else None}
+
+
 _HTHROT = {"lock": threading.Lock(), "last": 0.0}
 
 
 def dhan_post(path, body):
+    """A Dhan data request. When Dhan says the token has expired, the server gets a new one and asks again."""
+    try:
+        return _dhan_post_once(path, body)
+    except DhanDataError as e:
+        if e.auth and "subscribed" not in str(e) and dhan_token_refresh("a data request was refused"):
+            return _dhan_post_once(path, body)
+        raise
+
+
+def _dhan_post_once(path, body):
     """One Dhan data request, spaced to stay under the 5 a second limit that all threads share."""
     with _HTHROT["lock"]:
         wait = 0.21 - (time.time() - _HTHROT["last"])
@@ -879,6 +1114,8 @@ def dhan_parse(buf):
             elif code == 8 and i + 62 <= n:
                 pkt["ltp"] = struct.unpack_from("<f", buf, i + 8)[0]
                 pkt["vol"] = struct.unpack_from("<i", buf, i + 22)[0]
+            elif code == 6 and i + 12 <= n:
+                pkt["prev"] = struct.unpack_from("<f", buf, i + 8)[0]   # the exchange's previous close, sent when a script is subscribed
             elif code == 50 and i + 10 <= n:
                 pkt["disc"] = struct.unpack_from("<h", buf, i + 8)[0]
         except struct.error:
@@ -888,6 +1125,9 @@ def dhan_parse(buf):
     return out
 
 
+PREV_CLOSE = {}   # symbol -> {"p": the exchange's previous close, "d": the day it was received}
+
+
 def dhan_on_packets(pkts, lookup, now_ts=None):
     """Apply parsed packets: update the live prices and feed the candle builder."""
     now_ts = now_ts or time.time()
@@ -895,6 +1135,11 @@ def dhan_on_packets(pkts, lookup, now_ts=None):
     today = now.strftime("%Y-%m-%d")
     n = 0
     for p in pkts:
+        if "prev" in p:
+            sym = lookup.get((p["seg"], p["sid"]))
+            if sym and p["prev"] == p["prev"] and p["prev"] > 0:
+                PREV_CLOSE[sym] = {"p": float(p["prev"]), "d": today}
+            continue
         if "ltp" not in p:
             continue
         sym = lookup.get((p["seg"], p["sid"]))
@@ -996,6 +1241,8 @@ def dhan_ws_loop():
                 continue
             why = dhan_ws_session()
             DHAN_STAT["ws"] = "closed"
+            if why == "auth":
+                dhan_token_refresh("the live feed refused the token")
             wait = 3 if why == "closed" else 60 if why in ("auth", "refused") else 5
         except Exception as e:
             DHAN_STAT["ws"] = "error"
@@ -1004,6 +1251,7 @@ def dhan_ws_loop():
             status = getattr(resp, "status_code", None)
             if status in (401, 403):
                 text = "Dhan refused the live feed sign-in (the access token has probably expired)"
+                dhan_token_refresh("the live feed refused the token")
             elif status == 429:
                 text = "Dhan allows 5 live feed connections: close the others"
             DHAN_STAT["error"] = text
@@ -1719,6 +1967,7 @@ def save_creds(uid, broker_id, fields):
       "ON CONFLICT(user_id, broker) DO UPDATE SET blob=excluded.blob, hint=excluded.hint, updated=excluded.updated",
       (uid, broker_id, blob, hint, ist_now().isoformat()))
     ACCOUNTS.pop((uid, broker_id), None)
+    ACCT_BAD.pop((uid, broker_id), None)
 
 
 def delete_creds(uid, broker_id):
@@ -1872,8 +2121,12 @@ class DhanAccount:
         self.c = creds
 
     def request(self, method, path, body=None, extra=None):
-        r = requests.request(method, DHAN_BASE + path, json=body, timeout=15,
-                             headers={"access-token": self.c["access_token"], "Content-Type": "application/json", "Accept": "application/json", **(extra or {})})
+        for attempt in range(2):
+            r = requests.request(method, DHAN_BASE + path, json=body, timeout=15,
+                                 headers={"access-token": self.c["access_token"], "Content-Type": "application/json", "Accept": "application/json", **(extra or {})})
+            if r.status_code == 401 and attempt == 0 and self.c.get("_feed") and dhan_token_refresh("an order request was refused"):
+                continue    # the token had expired: nothing was placed, so it is safe to ask again with the new one
+            break
         try:
             data = r.json()
         except ValueError:
@@ -2411,9 +2664,14 @@ def feed_account():
         else:
             creds = {"client_id": os.getenv("DHAN_CLIENT_ID", "").strip(), "access_token": os.getenv("DHAN_ACCESS_TOKEN", "").strip()}
             FEED["acct"] = DhanAccount(creds)
+            token_load(creds)
+            if creds["client_id"] and not creds["access_token"] and _token_auto():
+                dhan_token_refresh("no token yet", force=True)
         if not all(creds.values()):
             FEED["acct"] = None
             raise RuntimeError("The data feed credentials are not all set in the environment.")
+        if DATA_BROKER == "dhan":
+            creds["_feed"] = True
     return FEED["acct"]
 
 
@@ -2469,8 +2727,12 @@ def apply_live(rows):
         p = fresh_ltp(r["symbol"])
         if p:
             r = {**r, "ltp": round(p, 2)}
-            if r.get("prev_close"):
-                r["ltp_chg"] = round((p / r["prev_close"] - 1) * 100, 2)
+            pc = r.get("prev_close")
+            ex = PREV_CLOSE.get(r["symbol"])
+            if ex and ex["d"] == ist_now().strftime("%Y-%m-%d") and (not pc or abs(ex["p"] / pc - 1) < 0.2):
+                pc = r["prev_close"] = round(ex["p"], 2)   # the exchange's own previous close, the figure every broker app uses
+            if pc:
+                r["ltp_chg"] = round((p / pc - 1) * 100, 2)
         out.append(r)
     return out
 
@@ -2619,27 +2881,49 @@ def start_engine():
         threading.Thread(target=feed_loop, daemon=True).start()
     if DATA_BROKER == "dhan":
         threading.Thread(target=dhan_ws_loop, daemon=True).start()
+        if DHAN_AUTO_RENEW:
+            threading.Thread(target=dhan_token_loop, daemon=True).start()
 
 
 # ── BSE index options (Sensex, Bankex): NSE's site has no BSE contracts, so the chain is built from the broker's instrument list
 # and priced with the broker's last-traded-price call. It shows prices only: open interest and IV are not available this way.
-def chain_account(u):
-    """A broker account that can price contracts: the person's own, else the shared data feed account. Returns (broker id, account)."""
+ACCT_BAD = {}   # (user id, broker) -> when that broker last refused the person's own sign-in (an expired token), so it is skipped for a few minutes
+
+
+def _auth_problem(e):
+    t = str(e).lower()
+    return any(w in t for w in ("access token", "invalid or expired", "authenticat", "unauthor", "dh-901", "token is invalid", "token has expired", "invalid token", "session expired"))
+
+
+def chain_accounts(u):
+    """Every broker account that can price contracts: the person's own (unless it was refused lately), then the shared data feed account."""
+    out, seen = [], set()
     for b in ([u.get("default_broker")] if u and u.get("default_broker") else []) + [x for x in (u or {}).get("brokers", [])]:
+        if b in seen or time.time() - ACCT_BAD.get((u["id"], b), 0) < 300:
+            continue
+        seen.add(b)
         try:
-            return b, get_account(u["id"], b)
+            out.append((b, get_account(u["id"], b)))
         except Exception:
             continue
     if DATA_BROKER in ("angel", "dhan"):
         try:
-            return DATA_BROKER, feed_account()
+            out.append((DATA_BROKER, feed_account()))
         except Exception:
             pass
-    return None, None
+    return out
+
+
+def chain_account(u):
+    """A broker account that can price contracts: the person's own, else the shared data feed account. Returns (broker id, account)."""
+    accts = chain_accounts(u)
+    return accts[0] if accts else (None, None)
 
 
 def broker_chain(symbol, expiry, u):
     bid, acct = chain_account(u)
+    if not acct and u and any(k[0] == u["id"] and time.time() - t < 300 for k, t in ACCT_BAD.items()):
+        return {"error": "Your broker refused the access token (it has probably expired). Paste a fresh one under Account."}
     if not acct:
         return {"error": f"{symbol} option prices come from your broker. Add Angel One or Dhan details under Account first (or set DATA_BROKER on the server)."}
     if not load_master(bid):
@@ -2691,6 +2975,9 @@ def broker_chain(symbol, expiry, u):
         try:
             prices = acct.ltp(items)
         except Exception as e:
+            if _auth_problem(e) and u and bid in (u.get("brokers") or []) and acct is not FEED.get("acct"):
+                ACCT_BAD[(u["id"], bid)] = time.time()
+                return broker_chain(symbol, expiry, u)   # tries the shared data feed account next, or says the token expired
             return {"error": f"{BROKER_NAMES[bid]} did not return prices ({str(e)[:120]})."}
         CHAIN_CACHE[key] = {"t": time.time(), "v": prices}
     leg = lambda k, r: {"oi": None, "doi": None, "vol": None, "iv": None, "ltp": prices.get(ref.get((k, r)))}
@@ -2831,7 +3118,7 @@ AUTO_MOVE_MIN = float(os.getenv("AUTO_MOVE_MIN", "1"))   # the scanner autopilot
 AUTO_MOVE_MAX = float(os.getenv("AUTO_MOVE_MAX", "3"))
 AUTO_SEEN = {}   # (user id, bot, symbol, timeframe, signal time, side) -> True: each signal is acted on once
 AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 minute chart (entries are taken on the 5 minute chart only; the 15 minute chart must be in the same direction: a BUY only while the other chart is also in a BUY zone, a SELL only while it is in a SELL zone, for fresh and continuation trades alike), "
-              f"or, only from {AUTO_CONT_START} to {AUTO_CONT_END}, when a signal from an earlier day is still open and the price is back near its 20 EMA. Stop-loss and targets T1 to T4 are the indicator's own: "
+              f"or, only from {AUTO_CONT_START} to {AUTO_CONT_END}, when a signal from an earlier day is still open and the price is back near its trend line. Stop-loss and targets T1 to T4 are the indicator's own: "
               "the stop moves to the entry at T1, to T1 at T2, to T2 at T3, and it sells everything at T4 or at the stop.")
 
 
@@ -2850,8 +3137,9 @@ def auto_rows(kind, tf):
     return add_conf(apply_live(rows), tf)
 
 
-def auto_candidates(u, cfg, kind, why=None, manual=False):
-    """Signals that qualify right now, fresh ones first and then by grade and closeness to the 20 EMA. `why` collects the reason a live signal was left out."""
+def auto_candidates(u, cfg, kind, why=None, manual=False, day=False):
+    """Signals that qualify right now, fresh ones first and then by grade and closeness to the trend line. `why` collects the reason a live signal was left out.
+    With day=True (the list for manual trading) every signal from today that fits the rules is returned, with a status: taken, open or passed."""
     ent = cfg.get("entries", "both")
     today = ist_now().strftime("%Y-%m-%d")
     out = []
@@ -2874,7 +3162,7 @@ def auto_candidates(u, cfg, kind, why=None, manual=False):
         for r in rows:
             sym, side, sig = r["symbol"], r.get("side"), r.get("signal") or "–"
             label = f"{sym} {tf}"
-            if sig == "–" or side not in ("BUY", "SELL") or not r.get("entry") or not r.get("sl") or r.get("sl_hit"):
+            if sig == "–" or side not in ("BUY", "SELL") or not r.get("entry") or not r.get("sl") or (r.get("sl_hit") and not day):
                 continue
             if kind == "scanner":
                 mv = r.get("ltp_chg", r.get("chg"))
@@ -2886,7 +3174,7 @@ def auto_candidates(u, cfg, kind, why=None, manual=False):
                 no(label, f"{side} on {tf[:-1]} min skipped: the {other[:-1]} minute chart is " + (f"in a {z} zone" if z else "not in any zone"))
                 continue
             sdate = r.get("signal_date")
-            fresh = r.get("bars_ago") is not None and r["bars_ago"] <= OPTBOT_FRESH_BARS and sdate == today
+            fresh = r.get("bars_ago") is not None and (day or r["bars_ago"] <= OPTBOT_FRESH_BARS) and sdate == today
             cont = not fresh and sig.startswith("Open") and bool(sdate) and sdate < today
             if not fresh and not cont:
                 continue   # a signal from earlier today that is no longer fresh is not traded
@@ -2897,25 +3185,29 @@ def auto_candidates(u, cfg, kind, why=None, manual=False):
                 continue
             if (fresh and ent == "gap") or (cont and ent == "fresh"):
                 continue
-            if r.get("hits"):
-                no(label, f"{side} signal already reached T{r['hits']}")
-                continue
+            passed = None
+            if r.get("sl_hit"):
+                passed = "the stop was hit"
+            elif r.get("hits"):
+                passed = f"already reached T{r['hits']}"
             px = float(r.get("ltp") or r["close"])
             lv = {k: r.get(k) for k in ("sl", "tp1", "tp2", "tp3", "tp4")}
-            if (side == "BUY" and not (lv["sl"] < px < lv["tp1"])) or (side == "SELL" and not (lv["tp1"] < px < lv["sl"])):
-                no(label, f"{side} price {px:.2f} is already past T1 or the stop")
+            if not passed and ((side == "BUY" and not (lv["sl"] < px < lv["tp1"])) or (side == "SELL" and not (lv["tp1"] < px < lv["sl"]))):
+                passed = "the price is already past T1 or the stop"
+            if passed and not day:
+                no(label, f"{side} signal {passed}")
                 continue
             it = INTERNAL.get((sym, tf)) or {}
             dist = abs(px - it["ema"]) / it["atr"] if it.get("ema") and it.get("atr") else None
-            if cont:
+            if cont and not passed:
                 if dist is None:
-                    no(label, "no 20 EMA yet")
+                    no(label, "no trend line yet")
                     continue
                 if (side == "BUY" and px < it["ema"]) or (side == "SELL" and px > it["ema"]):
-                    no(label, f"continuing {side} from {sdate}: waiting, price is on the wrong side of the 20 EMA")
+                    no(label, f"continuing {side} from {sdate}: waiting, price is on the wrong side of its trend line")
                     continue
                 if dist > OPTBOT_NEAR_ATR:
-                    no(label, f"continuing {side} from {sdate}: waiting for a pullback to the 20 EMA ({dist:.1f} ATR away, needs {OPTBOT_NEAR_ATR:g})")
+                    no(label, f"continuing {side} from {sdate}: waiting for a pullback to its trend line ({dist:.1f} away, needs {OPTBOT_NEAR_ATR:g})")
                     continue
             g = (r.get("conf") or {}).get("g")
             if not grade_ok(cfg, g):
@@ -2932,7 +3224,8 @@ def auto_candidates(u, cfg, kind, why=None, manual=False):
             cf = r.get("conf") or {}
             out.append({"symbol": sym, "side": side, "px": px, "levels": lv, "tf": tf, "etype": "fresh" if fresh else "continuation", "grade": g, "score": cf.get("s"),
                         "dist": dist if dist is not None else 9.9, "key": key, "sigkey": skey, "taken": bool(done), "time": r.get("signal_time"),
-                        "note": (f"fresh {tf} {side} signal at {r.get('signal_time')}" if fresh else f"{side} signal from {sdate} still open, back near its 20 EMA on {tf}")
+                        "status": "taken" if done else "passed" if passed else "open", "reason": passed,
+                        "note": (f"fresh {tf} {side} signal at {r.get('signal_time')}" if fresh else f"{side} signal from {sdate} still open, back near its trend line on {tf}")
                                 + (f", grade {g} ({cf.get('s')})" if g else "")})
     out.sort(key=lambda c: (c["etype"] != "fresh", -(c["score"] or 0), c["dist"]))
     return out
@@ -3262,14 +3555,14 @@ def cf_stretch(dist_atr, chg, side):
         pts += 5
     elif dist_atr <= 0.6:
         pts += 10
-        bits.append("close to its 20 EMA")
+        bits.append("close to its trend line")
     elif dist_atr <= 1.2:
         pts += 6
-        bits.append("a little away from its 20 EMA")
+        bits.append("a little away from its trend line")
         ok = False
     else:
         pts += 2
-        bits.append("stretched from its 20 EMA")
+        bits.append("stretched from its trend line")
         ok = False
     if chg is not None:
         m = chg if side == "BUY" else -chg
@@ -3824,7 +4117,7 @@ def bt_run(params, candles):
     res = bt_stats(done, p)
     res["found"] = len(trades)
     if p.get("min_grade") != "any":
-        notes.append("Grades in the backtest use only what a past candle can show (freshness, stretch from the 20 EMA, stop size, traded value, time of day). The live badge also checks NIFTY, the sector and higher timeframes, which a backtest cannot replay." if p["strategy"] == "signal" else "Grades do not apply to gap continuation trades, so the minimum grade was ignored.")
+        notes.append("Grades in the backtest use only what a past candle can show (freshness, stretch from the trend line, stop size, traded value, time of day). The live badge also checks NIFTY, the sector and higher timeframes, which a backtest cannot replay." if p["strategy"] == "signal" else "Grades do not apply to gap continuation trades, so the minimum grade was ignored.")
     res["skipped"] = [{"why": k, "n": v} for k, v in skipped.items()]
     res["problems"] = problems
     res["notes"] = notes
@@ -5749,7 +6042,8 @@ def api_trading_check(request: Request, which: str = ""):
     try:
         get_account(u["id"], b).book()
     except Exception as e:
-        return {"ok": False, "broker": name, "message": f"Could not connect to {name}: {str(e)[:200]}"}
+        return {"ok": False, "broker": name, "message": f"Could not connect to {name}: {str(e)[:200]}" + (". Paste a fresh access token under Account, then check again." if _auth_problem(e) else "")}
+    ACCT_BAD.pop((u["id"], b), None)
     loaded = load_master(b)
     m = M(b)
     miss = [t for t in SYMBOLS if t not in m["eq"]]
@@ -5807,17 +6101,24 @@ PF_OPT = {}   # (symbol, expiry) -> (time, chain rows): option prices for the pa
 
 def paper_option_prices(u, orders):
     """({order label: last price}, [problems]) for the option contracts held in paper orders.
-    The held contracts are priced directly from the broker (one small request); the option chain is the fallback."""
-    out, errs, want = {}, [], {}
+    The held contracts are priced directly from a broker (one small request). The person's own account is tried first; when it is refused
+    (an expired token, say) the shared data feed account is used, and the option chain is the last resort."""
+    out, errs, want, why = {}, [], {}, []
     for o in orders:
         want.setdefault(o["label"], o)
     if not want:
         return out, errs
-    bid, acct = chain_account(u)
-    ref = {}
-    if acct and load_master(bid):
-        opt = M(bid)["opt"]
-        for label, o in want.items():
+    own = {b for b in ((u or {}).get("brokers") or [])}
+    for bid, acct in chain_accounts(u):
+        pending = {l: o for l, o in want.items() if l not in out}
+        if not pending:
+            break
+        name = BROKER_NAMES.get(bid, bid)
+        if not load_master(bid):
+            why.append(f"{name}'s instrument list could not be loaded")
+            continue
+        opt, ref = M(bid)["opt"], {}
+        for label, o in pending.items():
             try:
                 ek = datetime.strptime(o["expiry"], EXPIRY_FMT).strftime("%d%b%Y").upper()
                 inst = opt.get((o["symbol"], ek, float(o["strike"]), o["right"]))
@@ -5825,21 +6126,27 @@ def paper_option_prices(u, orders):
                 inst = None
             if inst:
                 ref[label] = (inst[3], str(inst[0]))
-        if ref:
-            items = sorted(set(ref.values()))
-            hit = PF_OPT.get(("direct", bid, tuple(items)))
-            if hit and time.time() - hit[0] < 4:
-                prices = hit[1]
-            else:
-                try:
-                    prices = acct.ltp(items)
-                    PF_OPT[("direct", bid, tuple(items))] = (time.time(), prices)
-                except Exception as e:
-                    prices = {}
-                    errs.append(f"{BROKER_NAMES.get(bid, bid)} did not return option prices ({str(e)[:110]}).")
-            for label, k in ref.items():
-                if prices.get(k):
-                    out[label] = prices[k]
+        if not ref:
+            continue
+        items = sorted(set(ref.values()))
+        hit = PF_OPT.get(("direct", bid, id(acct), tuple(items)))
+        if hit and time.time() - hit[0] < 4:
+            prices = hit[1]
+        else:
+            try:
+                prices = acct.ltp(items)
+                PF_OPT[("direct", bid, id(acct), tuple(items))] = (time.time(), prices)
+            except Exception as e:
+                if _auth_problem(e):
+                    if bid in own and acct is not (FEED.get("acct")):
+                        ACCT_BAD[(u["id"], bid)] = time.time()
+                    why.append(f"{name} refused the access token: update it" + (" under Account" if bid in own and acct is not FEED.get("acct") else " in the server settings"))
+                else:
+                    why.append(f"{name} did not return option prices ({str(e)[:90]})")
+                continue
+        for label, k in ref.items():
+            if prices.get(k):
+                out[label] = prices[k]
     for label, o in want.items():   # anything not priced above: the option chain
         if label in out:
             continue
@@ -5856,7 +6163,8 @@ def paper_option_prices(u, orders):
             out[label] = leg["ltp"]
     miss = [l for l in want if l not in out]
     if miss:
-        errs.append("No live price for " + ", ".join(miss[:3]) + (f" and {len(miss) - 3} more" if len(miss) > 3 else "") + ". Profit and loss show once a price is available.")
+        errs.append("No live price for " + ", ".join(miss[:3]) + (f" and {len(miss) - 3} more" if len(miss) > 3 else "") + ". "
+                    + ("; ".join(dict.fromkeys(why)) + ". " if why else "") + "Profit and loss show once a price is available.")
     return out, errs
 
 
@@ -5968,7 +6276,7 @@ def bot_view(u, kind="scanner"):
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
     return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
-            "rules": AUTO_RULES + (" Trades NIFTY only." if kind == "nifty" else f" Looks at every F&O stock (not only the intraday scanner's list) whose move today is between {AUTO_MOVE_MIN:g}% and {AUTO_MOVE_MAX:g}%, up or down.") + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, a continuation needs the price within {OPTBOT_NEAR_ATR:g} ATR of its 20 EMA, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
+            "rules": AUTO_RULES + (" Trades NIFTY only." if kind == "nifty" else f" Looks at every F&O stock (not only the intraday scanner's list) whose move today is between {AUTO_MOVE_MIN:g}% and {AUTO_MOVE_MAX:g}%, up or down.") + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, a continuation needs the price near its trend line, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
             "signals": manual_signals(u, kind),
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
 
@@ -6181,10 +6489,10 @@ def replay_run(data, kind, day, cfg):
                     em, at = float(S["ema"][k]), float(S["atr"][k])
                     dist = abs(ltp - em) / at if at == at and at else None
                     if dist is None or (g["dir"] == 1 and ltp < em) or (g["dir"] == -1 and ltp > em):
-                        skip("continuation: price on the wrong side of the 20 EMA", key)
+                        skip("continuation: price on the wrong side of its trend line", key)
                         continue
                     if dist > OPTBOT_NEAR_ATR:
-                        skip("continuation: not back near the 20 EMA", key)
+                        skip("continuation: not back near its trend line", key)
                         continue
                 cands.append({"symbol": s, "tf": tf, "g": g, "px": ltp, "key": key, "etype": "fresh" if fresh else "continuation", "dist": dist if dist is not None else 9.9, "at": endt, "chg": chg, "S5": S5, "k5": k5, "sts": int(S["ts"][g["j"]])})
         cands.sort(key=lambda c: (c["etype"] != "fresh", c["dist"]))
@@ -6412,21 +6720,54 @@ def api_replay_get(request: Request, bot: str = "scanner"):
 MANUAL_SIG = {}   # (user id, bot) -> (time, list). The signal list for manual trading is recomputed at most every 10 seconds.
 
 
+MANUAL_DAY = {}   # (user id, bot) -> {"day": date, "rows": {key: row}}. Every signal seen today stays on the list, even after it stops qualifying.
+MANUAL_ORDER = {"open": 0, "taken": 1, "passed": 2, "earlier": 3}
+
+
 def manual_signals(u, kind):
-    """The trades this autopilot would consider right now, for someone trading by hand. Shown whether or not the autopilot is running."""
+    """Every signal from today that fits this autopilot's rules, for someone trading by hand, with what happened to it.
+    Shown whether or not the autopilot is running. Signals stay on the list for the rest of the day."""
     k = (u["id"], kind)
     hit = MANUAL_SIG.get(k)
     if hit and time.time() - hit[0] < 10:
         return hit[1]
     cfg = bot_cfg(u["id"], kind)
+    today = ist_now().strftime("%Y-%m-%d")
     try:
-        cands = auto_candidates(u, cfg, kind, manual=True)
+        cands = auto_candidates(u, cfg, kind, manual=True, day=True)
     except Exception as e:
         print("manual signals:", e)
         return hit[1] if hit else []
-    out = [{"symbol": c["symbol"], "side": c["side"], "right": "CE" if c["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "px": round(c["px"], 2), "time": c.get("time"),
-            "sl": c["levels"]["sl"], "t1": c["levels"]["tp1"], "t2": c["levels"]["tp2"], "t3": c["levels"]["tp3"], "t4": c["levels"]["tp4"], "grade": c.get("grade"), "score": c.get("score"),
-            "taken": c.get("taken", False), "note": c["note"]} for c in cands]
+    store = MANUAL_DAY.get(k)
+    if not store or store["day"] != today:
+        store = MANUAL_DAY[k] = {"day": today, "rows": {}}
+    rows, now = store["rows"], time.time()
+    seen = set()
+    for c in cands:
+        key = f"{c['sigkey']} {c['symbol']}"
+        seen.add(key)
+        old = rows.get(key)
+        rows[key] = {"symbol": c["symbol"], "side": c["side"], "right": "CE" if c["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "px": round(c["px"], 2),
+                     "time": c.get("time"), "sl": c["levels"]["sl"], "t1": c["levels"]["tp1"], "t2": c["levels"]["tp2"], "t3": c["levels"]["tp3"], "t4": c["levels"]["tp4"],
+                     "grade": c.get("grade"), "score": c.get("score"), "taken": c.get("taken", False), "status": c["status"], "reason": c.get("reason"), "note": c["note"],
+                     "ts": old["ts"] if old else now}
+        if old and old["status"] == "taken":
+            rows[key]["status"], rows[key]["taken"] = "taken", True
+    for key, row in rows.items():
+        if key not in seen and row["status"] == "open":
+            row["status"], row["reason"] = "earlier", "no longer meets the rules"
+    with ORDER_LOCK:
+        mine = [o for o in ORDERS if o.get("user") == u["id"] and o.get("bot") and o.get("bot_strategy", "scanner") == kind and o.get("date") == today]
+    for o in mine:   # a trade the autopilot made always stays on the list, even if the signal behind it no longer qualifies
+        key = f"{o.get('bot_sigkey')} {o['symbol']}"
+        if key in rows:
+            rows[key]["status"], rows[key]["taken"] = "taken", True
+            continue
+        dr = o.get("bot_dir") or "BUY"
+        rows[key] = {"symbol": o["symbol"], "side": dr, "right": o.get("bot_right") or ("CE" if dr == "BUY" else "PE"), "tf": o.get("bot_tf", "5m"), "type": o.get("bot_etype", "fresh"),
+                     "px": round(float(o.get("bot_entry_under") or 0), 2), "time": o.get("time"), "sl": o.get("bot_sl"), "t1": o.get("bot_t1"), "t2": o.get("bot_t2"),
+                     "t3": o.get("bot_t3"), "t4": o.get("bot_t4"), "grade": None, "score": None, "taken": True, "status": "taken", "reason": None, "note": "", "ts": now}
+    out = sorted(rows.values(), key=lambda r: (MANUAL_ORDER.get(r["status"], 9), -r["ts"]))
     MANUAL_SIG[k] = (time.time(), out)
     return out
 
@@ -6834,7 +7175,7 @@ def source_report():
     return {"dhan_available": on, "source": data_source(), "fallback": YAHOO_FALLBACK, "stream": DHAN_STAT["ws"], "healthy": dhan_ws_healthy(),
             "stream_error": DHAN_STAT["error"], "hist_error": DHAN_STAT["hist_error"], "subscribed": DHAN_STAT["subscribed"],
             "age": None if not DHAN_STAT["last"] else int(time.time() - DHAN_STAT["last"]), "connects": DHAN_STAT["connects"],
-            "hist_ok": DHAN_STAT["hist_ok"], "clock": DHAN_STAT["tz"]}
+            "hist_ok": DHAN_STAT["hist_ok"], "clock": DHAN_STAT["tz"], "token": token_report()}
 
 
 @app.get("/api/admin/source")
@@ -6843,6 +7184,23 @@ def api_admin_source(request: Request):
     if denied:
         return denied
     return source_report()
+
+
+@app.post("/api/admin/dhan-token")
+def api_admin_dhan_token(request: Request):
+    """Renew the Dhan token now."""
+    denied = need_admin(request)
+    if denied:
+        return denied
+    if DATA_BROKER != "dhan":
+        return {"error": "Dhan is not set up on this server."}
+    if FEED.get("acct") is None:
+        try:
+            feed_account()
+        except Exception as e:
+            return {"error": _scrub(e)}
+    ok = dhan_token_refresh("asked by the admin", force=True)
+    return {"ok": ok, **token_report()}
 
 
 @app.post("/api/admin/source")
@@ -7418,6 +7776,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <input id="osym" placeholder="Search a stock or index" aria-label="Search scripts" autocomplete="off">
   <select id="osec" aria-label="Sector"><option value="ALL">All sectors</option></select>
   <select id="ofilt" aria-label="Show"><option value="all">All scripts</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option></select>
+  <select id="osort" aria-label="Sort"><option value="sig">Sort: signal</option><option value="name">Sort: name A to Z</option><option value="up">Sort: gainers first</option><option value="down">Sort: losers first</option><option value="move">Sort: biggest move, up or down</option></select>
   <div class="orows" id="chips"></div>
  </aside>
  <div class="omain">
@@ -7747,7 +8106,11 @@ function renderChips(){
   if(text&&!n.includes(text))return false;
   if(sec!=="ALL"&&((by[n]||{}).sector||(data.indices||[]).includes(n)&&"Indices"||"Others")!==sec)return false;
   return fl==="all"||(fl==="sig"?sg!=="–":sg.includes(fl))});
- list.sort((a,b)=>{const ra=by[a]?rank[by[a].signal]:99,rb=by[b]?rank[by[b].signal]:99;return (ra??99)-(rb??99)||a.localeCompare(b)});
+ const so=document.getElementById("osort").value,ch=n=>{const c=(by[n]||{}).chg;return c==null?null:c};
+ list.sort((a,b)=>{
+  if(so!=="sig"&&so!=="name"){const ca=ch(a),cb=ch(b);if(ca==null||cb==null){if(ca!==cb)return ca==null?1:-1}else{const d=so==="up"?cb-ca:so==="down"?ca-cb:Math.abs(cb)-Math.abs(ca);if(d)return d}return a.localeCompare(b)}
+  if(so==="name")return a.localeCompare(b);
+  const ra=by[a]?rank[by[a].signal]:99,rb=by[b]?rank[by[b].signal]:99;return (ra??99)-(rb??99)||a.localeCompare(b)});
  box.innerHTML=list.length?list.map(n=>{const sg=(by[n]||{}).signal||"–";
   const c=(by[n]||{}).chg;
   return `<button class="orow" data-s="${esc(n)}" aria-pressed="${n===osym}"><span>${esc(n)}</span><span class="ochg ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span>${sg==="–"?'<span class="none">–</span>':`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`}</button>`}).join(""):`<div class="sub" style="padding:12px">No scripts match.</div>`;
@@ -7757,6 +8120,8 @@ document.getElementById("chips").onclick=e=>{const b=e.target.closest(".orow");i
 document.getElementById("osym").oninput=renderChips;
 document.getElementById("ofilt").onchange=renderChips;
 document.getElementById("osec").onchange=renderChips;
+try{const sv=localStorage.getItem("osort");if(sv&&[...document.getElementById("osort").options].some(o=>o.value===sv))document.getElementById("osort").value=sv}catch(e){}
+document.getElementById("osort").onchange=()=>{try{localStorage.setItem("osort",document.getElementById("osort").value)}catch(e){}renderChips()};
 document.getElementById("osym").onkeydown=e=>{if(e.key!=="Enter")return;
  const t=e.target.value.trim().toUpperCase();if(!t)return;
  const all=((data&&data.indices)||[]).concat((data&&data.symbols)||[]);
@@ -7841,7 +8206,7 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="botrow">
   <label>Mode<select id="${p}Mode"><option value="paper">Paper</option><option value="live">Live</option></select></label>
   <label>Only trade grade<select id="${p}Grade"><option value="any">Any (A, B or C)</option><option value="B">B or better</option><option value="A">A only</option></select></label>
-  <label>Entries<select id="${p}Ent"><option value="both">Fresh + continuation</option><option value="fresh">Fresh 5/15 min signals only</option><option value="gap">Continuation only (yesterday's signal near the 20 EMA)</option></select></label>
+  <label>Entries<select id="${p}Ent"><option value="both">Fresh + continuation</option><option value="fresh">Fresh 5/15 min signals only</option><option value="gap">Continuation only (yesterday's signal near its trend line)</option></select></label>
   <label>Trades a day<input id="${p}Max" type="number" min="1" max="10" step="1"></label>
   <label>Lots each<input id="${p}Lots" type="number" min="1" step="1"></label>
   <label>Stop for the day at a loss of ₹<input id="${p}Loss" type="number" min="0" step="500"></label>
@@ -7856,7 +8221,7 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="tkmsg" id="${p}Msg" role="status"></div>
  <div class="wrap"><table id="${p}Trades"></table></div>
  <label class="sub" style="display:flex;gap:6px;align-items:center;margin:6px 0"><input type="checkbox" id="${p}Past"> Show trades from earlier days</label>
- <div class="ixrow"><b>Signals for manual trades</b><span class="sub" id="${p}SigNote">What this autopilot would trade right now, shown even while it is off.</span></div>
+ <div class="ixrow"><b>Signals for manual trades</b><span class="sub" id="${p}SigNote">Every signal from today that fits this autopilot's rules, and what happened to it. Shown even while it is off.</span></div>
  <div class="wrap"><table id="${p}Sig"></table></div>
  <div class="ixrow"><b>Replay past days</b><select id="${p}RDay" aria-label="Day to replay"></select><button class="btn" id="${p}RRun">Replay</button><label class="sub">Capital ₹ <input id="${p}RCap" type="number" min="1000" step="1000" value="100000" style="width:90px"></label><label class="sub">Charges per trade (%) <input id="${p}RFee" type="number" min="0" max="2" step="0.01" value="0.05" style="width:60px"></label><span class="sub" id="${p}RMsg">Runs the rules above over the last month of 5 and 15 minute candles, or one day. Nothing is traded.</span></div>
  <div id="${p}RRes"></div>
@@ -7871,7 +8236,7 @@ async function botLoad(){clearTimeout(botTimer);if(mode!=="autopilot")return;
   $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
   const showPast=$(p+"Past").checked,tr=d.trades.filter(t=>showPast||!t.past),np=d.trades.length-tr.length;$(p+"Past").nextSibling.textContent=" Show trades from earlier days"+(np?` (${np})`:"");
   $(p+"Trades").innerHTML=tr.length?`<thead><tr><th>Date</th><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+tr.map(t=>`<tr class="${t.past?"past":""}"><td>${t.past?esc(t.date||""):"Today"}</td><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"||t.etype==="continuation"?"Continuation":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No trades today.</td></tr></tbody>`;
-  const sg=d.signals||[];$(p+"Sig").innerHTML=sg.length?`<thead><tr><th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Grade</th><th></th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.taken?"taken":""}"><td><b>${esc(x.symbol)}</b></td><td><span class="pill ${x.side}">${x.right==="CE"?"CALL (CE)":"PUT (PE)"}</span>${x.taken?" <span class=sub>taken by the autopilot</span>":""}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td><td class="act"><button class="mini" data-ap="chart" data-s="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button> <button class="mini" data-ap="ochart" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Option chart</button> <button class="mini go" data-ap="trade" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Trade ${x.right}</button></td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No stock qualifies right now.</td></tr></tbody>`;
+  const sg=d.signals||[];$(p+"Sig").innerHTML=sg.length?`<thead><tr><th>Stock</th><th>Buy</th><th>Status</th><th>Chart</th><th>Why</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Grade</th><th></th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.status==="passed"||x.status==="earlier"?"past":""}"><td><b>${esc(x.symbol)}</b></td><td><span class="pill ${x.side}">${x.right==="CE"?"CALL (CE)":"PUT (PE)"}</span></td><td>${x.status==="taken"?"<b>Bought by the autopilot</b>":x.status==="open"?"<b>Open now</b>":x.status==="passed"?"Passed: "+esc(x.reason||""):"Earlier today: "+esc(x.reason||"")}</td><td>${x.tf==="5m"?"5 min":"15 min"}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td><td class="act"><button class="mini" data-ap="chart" data-s="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button> <button class="mini" data-ap="ochart" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Option chart</button> <button class="mini go" data-ap="trade" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Trade ${x.right}</button></td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No signal that fits the rules yet today.</td></tr></tbody>`;
   $(p+"Sig").parentElement.hidden=false;
   $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
  botTimer=setTimeout(botLoad,8000)}
@@ -8296,7 +8661,10 @@ async function loadOverview(){const d=await (await api("/api/admin/overview")).j
 async function loadSession(){try{const d=await (await api("/api/admin/session")).json();if(d.error)return;$("ssNote").textContent=(d.override?`Special session open today ${d.override.start} to ${d.override.end}. `:"")+(d.env.length?`From settings: ${d.env.join(", ")}. `:"")+(d.open_now?"The market counts as open right now.":"The market counts as closed right now.")}catch(e){}}
 async function loadSource(){try{const d=await (await api("/api/admin/source")).json();if(d.error){$("srcNote").textContent=d.error;return}
  const sm={connected:"connected",idle:"waiting for the market",closed:"reconnecting",error:"error",off:"off"};
- $("srcNote").innerHTML=`Now using <b>${d.source==="dhan"?"Dhan":"Yahoo"}</b>`+(d.dhan_available?(`. Live stream: ${sm[d.stream]||esc(d.stream)}`+(d.subscribed?`, ${d.subscribed} instruments`:"")+(d.age!=null&&d.healthy?`, last price ${d.age}s ago`:"")+(d.stream_error?`. <span style="color:var(--sell)">${esc(d.stream_error)}</span>`:"")+(d.hist_error?`. <span style="color:var(--sell)">Dhan history: ${esc(d.hist_error)}</span>`:"")+(d.clock?`. Candle clock: ${esc(d.clock)}`:"")+(d.fallback?". Yahoo fills any gap.":"")):". Dhan is not set up on this server.")}catch(e){}}
+ $("srcNote").innerHTML=`Now using <b>${d.source==="dhan"?"Dhan":"Yahoo"}</b>`+(d.dhan_available?(`. Live stream: ${sm[d.stream]||esc(d.stream)}`+(d.subscribed?`, ${d.subscribed} instruments`:"")+(d.age!=null&&d.healthy?`, last price ${d.age}s ago`:"")+(d.stream_error?`. <span style="color:var(--sell)">${esc(d.stream_error)}</span>`:"")+(d.hist_error?`. <span style="color:var(--sell)">Dhan history: ${esc(d.hist_error)}</span>`:"")+(d.clock?`. Candle clock: ${esc(d.clock)}`:"")+(d.fallback?". Yahoo fills any gap.":"")+tokTxt(d.token)):". Dhan is not set up on this server.")}catch(e){}}
+function tokTxt(t){if(!t||!t.enabled)return "";const h=s=>s==null?"":s>=3600?Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m":Math.max(0,Math.floor(s/60))+"m";
+ return `. Dhan token: ${t.expires_in==null?"expiry unknown":t.expires_in>0?"valid for "+h(t.expires_in):'<span style="color:var(--sell)">expired</span>'}, ${t.auto?"signs in by itself every day at "+esc(t.at)+" IST":"extended automatically (add DHAN_PIN and DHAN_TOTP_SECRET to sign in by itself)"}${t.how&&t.last_ok_age!=null?`, last ${esc(t.how)} ${h(t.last_ok_age)} ago`:""}${t.error?`. <span style="color:var(--sell)">${esc(t.error)}</span>`:""} <button class="btn" onclick="tokNow(this)">Renew now</button>`}
+async function tokNow(b){b.disabled=true;b.textContent="Renewing…";const d=await post("/api/admin/dhan-token",{});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
 async function srcSet(w){const d=await post("/api/admin/source",{source:w});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
 async function ssSet(b){const d=await post("/api/admin/session",b);if(d.error)$("ssNote").textContent=d.error;else loadSession()}
 async function loadUsers(){loadSession();loadSource();loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
