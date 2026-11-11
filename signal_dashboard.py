@@ -1004,6 +1004,29 @@ def dhan_to_df(res, daily):
     return df.dropna(subset=["Close", "High", "Low", "Open"])
 
 
+def add_today_candle(sym, sid, seg, kind, df, now):
+    """Dhan's daily history stops at yesterday. Once the cash market has closed, today's finished daily candle is built from today's
+    intraday candles, so the daily scan, the stock/futures/index values and the % change are today's, not a day old."""
+    try:
+        if df is None or df.empty or sym in COMMODITIES:
+            return df
+        if now.weekday() >= 5 or now.time() < dtime(15, 30) or df.index[-1].date() >= now.date():
+            return df
+        res = dhan_post("/charts/intraday", {"securityId": sid, "exchangeSegment": seg, "instrument": kind, "interval": 15, "oi": False,
+                                             "fromDate": f"{now.date().isoformat()} 00:00:00", "toDate": f"{(now.date() + timedelta(days=1)).isoformat()} 00:00:00"})
+        d = dhan_to_df(res, False)
+        if d is None or d.empty:
+            return df
+        d = d[[t.date() == now.date() for t in d.index]]
+        if d.empty:
+            return df
+        row = pd.DataFrame({"Open": [d["Open"].iloc[0]], "High": [d["High"].max()], "Low": [d["Low"].min()], "Close": [d["Close"].iloc[-1]],
+                            "Volume": [d["Volume"].sum()]}, index=pd.DatetimeIndex([now.date()]))
+        return pd.concat([df, row])
+    except Exception:
+        return df
+
+
 def dhan_candles(sym, interval, days):
     """Candles of one symbol from Dhan: intraday in pieces of up to 80 days, daily in one request."""
     inst = dhan_inst(sym)
@@ -1017,7 +1040,7 @@ def dhan_candles(sym, interval, days):
         res = dhan_post("/charts/historical", {"securityId": sid, "exchangeSegment": seg, "instrument": kind, "expiryCode": 0, "oi": False,
                                                "fromDate": (end - timedelta(days=days + 2)).isoformat(), "toDate": end.isoformat()})
         df = dhan_to_df(res, True)
-        return df
+        return add_today_candle(sym, sid, seg, kind, df, now)
     mins = {"5m": 5, "15m": 15, "1h": 60}[interval]
     start = end - timedelta(days=days)
     while start < end:
@@ -1601,7 +1624,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-11o"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-11p"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
