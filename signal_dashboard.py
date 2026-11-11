@@ -1598,7 +1598,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD = "2026-11-11l"   # shown next to the user name so it is clear which version a server is running
+BUILD = "2026-11-11m"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2584,7 +2584,8 @@ def new_record(o, oid, status, variety="NORMAL", is_exit=False, note=""):
            "sl_order_id": None, "risk": o.get("risk"), "variety": variety, "broker": o.get("broker", "paper"),
            "auto_sl": bool(o.get("auto_sl")) and not is_exit, "trail": bool(o.get("trail")) and not is_exit,
            "sl_state": None, "trail_level": 0, "trail_fail": 0, "trail_done": False,
-           "is_exit": is_exit, "key": o.get("key"), "note": note}
+           "is_exit": is_exit, "key": o.get("key"), "note": note,
+           "expiry": o.get("expiry"), "strike": o.get("strike"), "right": o.get("right")}
     with ORDER_LOCK:
         ORDERS.append(rec)
     append_log(rec)
@@ -6231,6 +6232,10 @@ def paper_option_prices(u, orders):
     (an expired token, say) the shared data feed account is used, and the option chain is the last resort."""
     out, errs, want, why = {}, [], {}, []
     for o in orders:
+        if not (o.get("expiry") and o.get("strike") is not None and o.get("right")):
+            m_ = re.match(r"^(\S+) ([\d.]+) (CE|PE) (\d{2}-[A-Za-z]{3}-\d{4})$", str(o.get("label", "")))   # orders saved before these fields existed
+            if m_:
+                o = {**o, "symbol": m_.group(1), "strike": float(m_.group(2)), "right": m_.group(3), "expiry": m_.group(4)}
         want.setdefault(o["label"], o)
     if not want:
         return out, errs
