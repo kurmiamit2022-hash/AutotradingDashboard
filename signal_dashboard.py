@@ -1312,9 +1312,71 @@ def _one(data, ticker, n_tickers):
     return data if n_tickers == 1 else None
 
 
+SECTOR_CHARTS = {tf: {} for tf in INTERVALS}   # tf -> {sector: chart payload}: an equal-weight index of the stocks in each sector
+
+
+def sector_keep(store, sym, df):
+    """Keep a compact copy of one stock's candles for the sector charts."""
+    try:
+        sec = SECTOR_OF.get(sym)
+        if sec and df is not None and len(df):
+            d = df[["Open", "High", "Low", "Close"]].dropna().astype("float32")
+            if getattr(d.columns, "nlevels", 1) > 1:
+                return
+            d.index = d.index.tz_localize("UTC").tz_convert(IST) if d.index.tz is None else d.index.tz_convert(IST)
+            store.setdefault(sec, []).append((sym, d.tail(CHART_BARS_N)))
+    except Exception:
+        pass
+
+
+def sector_build(store, interval):
+    """Per sector: candles of an equal-weight index (every stock rebased to 100), a trend line, and how many stocks agree."""
+    out = {}
+    for sec, items in store.items():
+        if len(items) < 2:
+            continue
+        reb, flags, moves = {}, [], []
+        for sym, d in items:
+            if CONFIRMED_ONLY:
+                d = drop_forming(d, interval)
+            if len(d) < 25 or not d["Close"].iloc[0] > 0:
+                continue
+            base = float(d["Close"].iloc[0])
+            reb[sym] = d / base * 100.0
+            cl = d["Close"]
+            ema = cl.ewm(span=EMA_LEN, adjust=False).mean()
+            days = np.array([t.date() for t in d.index])
+            before = np.nonzero(days != days[-1])[0] if interval != "1d" else np.array([len(d) - 2])
+            ch = (float(cl.iloc[-1]) / float(cl.iloc[before[-1]]) - 1) * 100 if len(before) and before[-1] >= 0 and cl.iloc[before[-1]] > 0 else None
+            flags.append(bool(cl.iloc[-1] > ema.iloc[-1]))
+            moves.append((sym, None if ch is None else round(ch, 2), bool(cl.iloc[-1] > ema.iloc[-1])))
+        if len(reb) < 2:
+            continue
+        idx = sorted(set().union(*[set(v.index) for v in reb.values()]))
+        cols = {k: pd.concat([v[k].rename(sym) for sym, v in reb.items()], axis=1).reindex(idx).mean(axis=1) for k in ("Open", "High", "Low", "Close")}
+        comp = pd.DataFrame(cols).dropna()
+        if len(comp) < 25:
+            continue
+        ema = comp["Close"].ewm(span=EMA_LEN, adjust=False).mean()
+        up_now, rising = comp["Close"].iloc[-1] > ema.iloc[-1], ema.iloc[-1] > ema.iloc[-4]
+        above = round(100 * sum(flags) / len(flags))
+        direction = "Up" if up_now and rising else "Down" if (not up_now) and (not rising) else "Mixed"
+        tm = (lambda t: t.strftime("%Y-%m-%d")) if interval == "1d" else (lambda t: int(t.timestamp()) + 19800)
+        mv = sorted([m for m in moves if m[1] is not None], key=lambda m: -m[1])
+        out[sec] = {"sector": sec, "tf": interval, "n": len(reb), "direction": direction, "above_pct": above,
+                    "chg": round(float(comp["Close"].iloc[-1] / comp["Close"].iloc[-2] - 1) * 100, 2) if interval == "1d" else None,
+                    "intraday": interval != "1d", "commodity": False, "index": True,
+                    "candles": [{"time": tm(t), "open": round(float(r.Open), 2), "high": round(float(r.High), 2), "low": round(float(r.Low), 2), "close": round(float(r.Close), 2)}
+                                for t, r in comp.iterrows()],
+                    "trend": [[tm(t), round(float(v), 2)] for t, v in ema.items()] if CHART_INDICATOR else None,
+                    "leaders": mv[:min(3, len(mv) // 2)], "laggards": mv[::-1][:min(3, len(mv) // 2)]}
+    return out
+
+
 def fetch_all(interval, progress=None):
     """Download in small batches, retry a failed batch once, and report partial results as they arrive."""
     rows, errors, hist = [], [], []
+    sec_items = {}
     for i in range(0, len(UNIVERSE), YF_BATCH):
         names = UNIVERSE[i:i + YF_BATCH]
         tickers = [yf_ticker(n) for n in names]
@@ -1324,6 +1386,7 @@ def fetch_all(interval, progress=None):
             errors.extend(errs)
             for sname in names:
                 df = frames.get(sname)
+                sector_keep(sec_items, sname, df)
                 try:
                     row = analyse(sname, df, interval) if df is not None else None
                     if row and LIVE_CANDLES and interval in LIVE_TFS:
@@ -1363,6 +1426,7 @@ def fetch_all(interval, progress=None):
             for sname, t in zip(names, tickers):
                 try:
                     df = _one(data, t, len(tickers))
+                    sector_keep(sec_items, sname, df)
                     row = analyse(sname, df.dropna(how="all"), interval) if df is not None else None
                     if row and LIVE_CANDLES and interval in LIVE_TFS:
                         tl = live_tail(df)
@@ -1378,6 +1442,11 @@ def fetch_all(interval, progress=None):
         if progress:
             progress(list(rows), list(errors), min(i + YF_BATCH, len(UNIVERSE)))
         time.sleep(0.5)
+    try:
+        if rows:
+            SECTOR_CHARTS[interval] = sector_build(sec_items, interval)
+    except Exception as e:
+        print("sector charts failed:", e, flush=True)
     return rows, errors, hist
 
 
@@ -1624,7 +1693,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-11p"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-11q"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5639,6 +5708,7 @@ def lw_js(request: Request):
 # ── Chart popup: candles, EMA, Chandelier line, signal markers and the latest signal's levels ──
 CHART_CACHE = {}
 CHART_BARS = {"5m": 400, "15m": 400, "1d": 500}
+CHART_BARS_N = 500
 
 
 CHART_INDICATOR = os.getenv("CHART_INDICATOR", "1") != "0"   # draw the indicator's lines on charts (set 0 to show only the latest signal and its levels)
@@ -5741,6 +5811,21 @@ def chart_data(symbol, tf, at=0):
                              "from": t[max(j, start) - start], "entry": row["entry"], "sl": row["sl"], "sl_hit": row["sl_hit"], "hits": row["hits"],
                              "tps": [row["tp1"], row["tp2"], row["tp3"], row["tp4"]]}
     return out
+
+
+@app.get("/api/sectors")
+def api_sectors(tf: str = DEFAULT_INTERVAL):
+    tf = tf if tf in INTERVALS else DEFAULT_INTERVAL
+    return JSONResponse({"tf": tf, "sectors": {k: {"direction": v["direction"], "above_pct": v["above_pct"], "n": v["n"]} for k, v in SECTOR_CHARTS.get(tf, {}).items()}})
+
+
+@app.get("/api/sector_chart")
+def api_sector_chart(sector: str, tf: str = DEFAULT_INTERVAL):
+    tf = tf if tf in INTERVALS else DEFAULT_INTERVAL
+    d = SECTOR_CHARTS.get(tf, {}).get(sector)
+    if not d:
+        return JSONResponse({"error": "The sector chart is not ready for this timeframe yet. It appears after the scan finishes."})
+    return JSONResponse(d)
 
 
 @app.get("/api/chart")
@@ -7806,6 +7891,7 @@ button,input{font:inherit;color:inherit}
 .sectors .sn{font-size:13px;color:var(--mute);line-height:1.25}
 .sectors .sc{font-size:18px;font-weight:700}
 .sectors .ss{font-size:12px;color:var(--mute)}
+.dir{font-style:normal;font-size:11px}.dir.Up{color:var(--buy)}.dir.Down{color:var(--sell)}.dir.Mixed{color:var(--mute)}
 .idx{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:10px}
 .idx div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px;display:flex;flex-direction:column;gap:2px}
 .idx .sn{font-size:13px;color:var(--mute);font-weight:600}.idx .sc{font-size:20px;font-weight:700}.idx .ss{font-size:13px;font-weight:600}
@@ -8276,7 +8362,7 @@ let csrf="",me=null;
 const api=async(u,o={})=>{o.credentials="same-origin";o.headers={...(o.headers||{}),"X-CSRF-Token":csrf};const r=await fetch(u,o);if(r.status===401){location.href="/login";throw new Error("signed out")}return r};
 const colsStocks=[["symbol","Symbol"],["signal","Signal"],["status","Status"],["signal_time","Signal candle"],["_t",""],["close","Close"],["chg","Day %"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"]];
 const colsFut=[["symbol","Symbol"],["signal","Signal"],["status","Status"],["signal_time","Signal candle"],["_t",""],["close","Spot"],["chg","Day %"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["lot","Lot"],["fexp","Expiry"]];
-let data=null,sector="ALL",filter="ALL",sortKey="signal",sortDir=1,q="",timer=null,tf=null,futInfo={},futLoaded=false;
+let secDir={},secDirKey="",data=null,sector="ALL",filter="ALL",sortKey="signal",sortDir=1,q="",timer=null,tf=null,futInfo={},futLoaded=false;
 try{tf=localStorage.getItem("tf")}catch(e){}
 const tfName={"5m":"5 min","15m":"15 min","1d":"Daily"};
 const rank={BUY:0,SELL:1,"Open BUY":2,"Open SELL":2,"–":3};
@@ -8332,7 +8418,7 @@ function render(){
  const avg=a=>{const v=a.filter(r=>r.chg!=null).map(r=>r.chg);return v.length?v.reduce((x,y)=>x+y,0)/v.length:null};
  const pc=n=>n==null?"–":(n>0?"+":"")+n.toFixed(2)+"%";
  const tile=(key,name,a)=>{const m=avg(a),up=a.filter(r=>r.chg>0).length,dn=a.filter(r=>r.chg<0).length,b=a.filter(r=>r.signal==="BUY").length,se=a.filter(r=>r.signal==="SELL").length;
-  return `<button class="${m==null?"":m>=0?"pos":"neg"}" data-sec="${esc(key)}" aria-pressed="${sector===key}"><span class="sn" title="${esc(name)}">${esc(name)}</span><span class="sc ${m==null?"":m>=0?"up":"dn"}">${pc(m)}</span><span class="ss">${a.length} · ${up} up, ${dn} down</span>${b||se?`<span class="ss">${b} buy, ${se} sell</span>`:""}</button>`};
+  return `<button class="${m==null?"":m>=0?"pos":"neg"}" data-sec="${esc(key)}" aria-pressed="${sector===key}"><span class="sn" title="${esc(name)}">${esc(name)}${secDir[name]?` <i class="dir ${secDir[name].direction}" title="Sector direction: ${secDir[name].direction}, ${secDir[name].above_pct}% of stocks above their trend line">${secDir[name].direction==="Up"?"▲":secDir[name].direction==="Down"?"▼":"◆"}</i>`:""}</span><span class="sc ${m==null?"":m>=0?"up":"dn"}">${pc(m)}</span><span class="ss">${a.length} · ${up} up, ${dn} down</span>${b||se?`<span class="ss">${b} buy, ${se} sell</span>`:""}</button>`};
  const order=Object.keys(grp).sort((a,b)=>(avg(grp[b])??-1e9)-(avg(grp[a])??-1e9));
  const sc=document.getElementById("sectors");
  sc.innerHTML=order.map(k=>tile(k,k,grp[k])).join("");
@@ -8340,7 +8426,9 @@ function render(){
  const ix=["NIFTY","BANKNIFTY","SENSEX"].map(n=>data.rows.find(r=>r.symbol===n)).filter(Boolean);
  document.getElementById("idxTiles").innerHTML=ix.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,px=r.ltp!=null?r.ltp:r.close;
   return `<div><span class="sn">${esc(r.symbol)}</span><span class="sc ${c==null?"":c>=0?"up":"dn"}">${fmt(px)}</span><span class="ss ${c==null?"":c>=0?"up":"dn"}">${c==null?"–":(c>0?"+":"")+c.toFixed(2)+"%"}${r.signal&&r.signal!=="–"?` · ${esc(r.signal)}`:""}</span></div>`}).join("");
- document.getElementById("secnote").textContent="Average change since the previous session's close, best sector first. Click a sector to filter, click again to clear.";
+ document.getElementById("secnote").innerHTML="Average change since the previous session's close, best sector first. Click a sector to filter, click again to clear. ▲▼ shows the sector's direction."+(sector!=="ALL"&&grp[sector]?` <button class="btn ghost" id="secChart">Chart ${esc(sector)}</button>`:"");
+ const scb=document.getElementById("secChart");if(scb)scb.onclick=()=>openChart(sector,tf,0,true);
+ const dk=tf+"|"+(data.updated||"");if(dk!==secDirKey){secDirKey=dk;api("/api/sectors?tf="+encodeURIComponent(tf)).then(r=>r.json()).then(j=>{secDir=j.sectors||{};if(secDirKey===dk)paintSecDir()}).catch(()=>{})}
  const srows=sector==="ALL"?rows:grp[sector];
  const cnt=s=>srows.filter(r=>r.signal===s).length;
  const tabs=[["ALL","All symbols",srows.length,""],["BUY","Buy",cnt("BUY"),"buy"],["SELL","Sell",cnt("SELL"),"sell"],["OPEN","Open trades",srows.filter(isOpen).length,""]];
@@ -8665,7 +8753,9 @@ function initScanner(){
 let lwPromise=null,chSym="",chTf="",chAt=0,chObj=null;
 function loadLW(){if(window.LightweightCharts)return Promise.resolve();
  return lwPromise||(lwPromise=new Promise((ok,no)=>{const s=document.createElement("script");s.src="/lw.js";s.onload=ok;s.onerror=()=>{lwPromise=null;no()};document.head.appendChild(s)}))}
-function openChart(sym,t,at){chSym=sym;chTf=t||tf||"15m";chAt=at||0;$("chTitle").textContent=sym;$("chTfs").innerHTML=(data?data.intervals:["5m","15m","1d"]).map(x=>`<button data-ct="${x}" aria-pressed="${x===chTf}">${tfName[x]||x}</button>`).join("");
+function paintSecDir(){document.querySelectorAll("#sectors button[data-sec]").forEach(b=>{const d=secDir[b.dataset.sec],sn=b.querySelector(".sn");if(!d||!sn||sn.querySelector(".dir"))return;const i=document.createElement("i");i.className="dir "+d.direction;i.textContent=d.direction==="Up"?"▲":d.direction==="Down"?"▼":"◆";i.title="Sector direction: "+d.direction+", "+d.above_pct+"% of stocks above their trend line";sn.append(" ",i)})}
+let chSec=false;
+function openChart(sym,t,at,isSec){chSec=!!isSec;chSym=sym;chTf=t||tf||"15m";chAt=at||0;$("chTitle").textContent=chSec?sym+" sector (equal-weight index of its stocks)":sym;$("chTfs").innerHTML=(data?data.intervals:["5m","15m","1d"]).map(x=>`<button data-ct="${x}" aria-pressed="${x===chTf}">${tfName[x]||x}</button>`).join("");
  if(!$("chartDlg").open)$("chartDlg").showModal();drawChart()}
 function chTradeBar(d){if(d.commodity){$("chTrade").innerHTML='<span class="sub">Commodities are view-only here. Orders are not available yet.</span>';$("chTrade").onclick=null;return}
  const last=d.candles[d.candles.length-1].close,idx=d.index,sy=d.symbol,bt=(c,a,t)=>`<button class="${c}" data-ct2="${a}">${t}</button>`;
@@ -8682,7 +8772,7 @@ async function drawChart(){
  const my=chSym+chTf+chAt;$("chMsg").textContent="Loading chart…";$("chLeg").innerHTML="";
  if(chObj){chObj.remove();chObj=null}
  try{await loadLW()}catch(e){$("chMsg").textContent="The chart library did not load. Reload the page and try again.";return}
- let d;try{const r=await api(`/api/chart?symbol=${encodeURIComponent(chSym)}&tf=${chTf}${chAt?'&at='+chAt:''}`);d=await r.json()}catch(e){$("chMsg").textContent="The server did not return chart data. Try again in a moment.";return}
+ let d;try{const r=await api(chSec?`/api/sector_chart?sector=${encodeURIComponent(chSym)}&tf=${chTf}`:`/api/chart?symbol=${encodeURIComponent(chSym)}&tf=${chTf}${chAt?'&at='+chAt:''}`);d=await r.json();if(chSec&&d.candles){d.markers=[];d.signal=null;d.lines=d.trend?{stop:[],ema:d.trend}:null}}catch(e){$("chMsg").textContent="The server did not return chart data. Try again in a moment.";return}
  if(my!==chSym+chTf+chAt)return;
  if(d.error){$("chMsg").textContent=d.error;return}
  $("chMsg").textContent="";
@@ -8699,7 +8789,7 @@ async function drawChart(){
   lv(sg.entry,ink,"Entry",0);lv(sg.sl,dn,"SL"+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(sg.hits>i?" ✓":""),2));
   leg.unshift(`<b class="${sg.side==="BUY"?"up":"dn"}">${esc(sg.state)}</b> <span>signal candle ${esc(sg.time)}, ${esc(sg.status)}</span>`)}
  else leg.unshift("<span>No signal to show levels for on this timeframe.</span>");
- $("chLeg").innerHTML=leg.join("");chTradeBar(d);
+ if(chSec){const mv=a=>a.map(m=>`${esc(m[0])} ${m[1]>0?"+":""}${m[1]}%`).join(", ");leg.unshift(`<b class="${d.direction==="Up"?"up":d.direction==="Down"?"dn":""}">Direction: ${esc(d.direction)}</b> <span>${d.above_pct}% of ${d.n} stocks are above their trend line</span>`,`<span>Leaders: ${mv(d.leaders)} · Laggards: ${mv(d.laggards)}</span>`);$("chLeg").innerHTML=leg.filter(x=>!x.includes("No signal")).join("");$("chTrade").innerHTML="";$("chTrade").onclick=null}else{$("chLeg").innerHTML=leg.join("");chTradeBar(d)}
  ch.timeScale().fitContent();if(d.candles.length>120)ch.timeScale().setVisibleLogicalRange({from:d.candles.length-120,to:d.candles.length+4})}
 const OC_M={oi:["Open interest","oi","n"],doi:["Change in OI","doi","n"],vol:["Volume","vol","n"],ltp:["Premium","ltp","p"]};
 let ocm="oi";try{ocm=localStorage.getItem("ocm")||"oi"}catch(e){}
