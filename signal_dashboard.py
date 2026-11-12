@@ -1693,7 +1693,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-12v"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-12w"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8723,14 +8723,22 @@ function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
    <td>${esc(r.sector||"–")}</td>${sc}<td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
 let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: F&O stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY"}};
+window.sigSort={};
+const SIG_RANK={taken:1,open:2,passed:4,earlier:5};
+function sigStat(x){return x.status==="taken"?(x.pos?"Open trade":"Closed"):x.status==="open"?"Open now":x.status==="passed"?"Passed":"Earlier"}
+function sigRemark(x){return x.status==="taken"?(x.pos?(x.note||"Bought by the autopilot"):"Bought by the autopilot"+(x.closed?"; closed: "+x.closed:"; closed")):(x.status==="open"?x.note:x.reason)||""}
+const SIG_COLS=[["symbol","Stock",x=>x.symbol],["sector","Sector",x=>x.sector||""],["chg","% moved",x=>x.chg],["grade","Grade",x=>x.grade||"Z"],[null,""],
+ ["status","Status",x=>(x.pos?0:SIG_RANK[x.status]||9)],["signal","Signal",x=>(x.type||"")+(x.time||"")],["px","Price",x=>+x.px],["sl","Stop",x=>+x.sl],["t1","T1",x=>+x.t1],["t2","T2",x=>+x.t2],["t3","T3",x=>+x.t3],["t4","T4",x=>+x.t4],["remarks","Remarks",x=>sigRemark(x)]];
 function sigPaint(p){const d=window.botD[p]||{},all=d.signals||[],sel=$(p+"SecF");
  const secs=[...new Set(all.map(x=>x.sector||"Others"))].sort(),cur=sel.value||"ALL";
  if(document.activeElement!==sel)sel.innerHTML='<option value="ALL">All sectors</option>'+secs.map(k=>`<option value="${esc(k)}">${esc(k)} (${all.filter(x=>(x.sector||"Others")===k).length})</option>`).join("");
  if(document.activeElement!==sel)sel.value=secs.includes(cur)?cur:"ALL";
- const sg=sel.value==="ALL"?all:all.filter(x=>(x.sector||"Others")===sel.value);
+ let sg=sel.value==="ALL"?all:all.filter(x=>(x.sector||"Others")===sel.value);
+ const so=window.sigSort[p],col=so&&SIG_COLS.find(c=>c[0]===so.k);
+ if(col){const f=col[2];sg=[...sg].sort((a,b)=>{const x=f(a),y=f(b);if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;return (typeof x==="string"?x.localeCompare(y):x-y)*so.d})}
  const pc=v=>v==null?"–":`<span class="${v>0?"up":v<0?"dn":""}">${v>0?"+":""}${(+v).toFixed(2)}%</span>`;
- const stat=x=>x.status==="taken"?(x.pos?"<b>Open trade</b> (bought by the autopilot)":"Bought by the autopilot"+(x.closed?", closed: "+esc(x.closed):", closed")):x.status==="open"?"<b>Open now</b>":x.status==="passed"?"Passed: "+esc(x.reason||""):"Earlier today: "+esc(x.reason||"");
- $(p+"Sig").innerHTML=sg.length?`<thead><tr><th>Stock</th><th>Sector</th><th>% moved</th><th>Grade</th><th></th><th>Status</th><th>Why</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.status==="passed"||x.status==="earlier"||(x.status==="taken"&&!x.pos)?"past":""}"><td><b>${esc(x.symbol)}</b></td><td class="sub">${esc(x.sector||"")}</td><td>${pc(x.chg)}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td><td class="act"><button class="mini" data-ap="chart" data-s="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button> <button class="mini" data-ap="ochart" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Option chart</button> <button class="mini go" data-ap="trade" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Trade ${x.right}</button></td><td>${stat(x)}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):x.type==="momentum"?"Early mover "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">${all.length?"No signal in this sector.":"Nothing that fits the rules yet today."}</td></tr></tbody>`}
+ const th=SIG_COLS.map(([k,n])=>k?`<th data-sk="${k}" class="sortable" aria-sort="${so&&so.k===k?(so.d>0?"ascending":"descending"):"none"}" style="cursor:pointer" title="Click to sort">${n}${so&&so.k===k?(so.d>0?" ▲":" ▼"):""}</th>`:"<th></th>").join("");
+ $(p+"Sig").innerHTML=sg.length?`<thead><tr>${th}</tr></thead><tbody>`+sg.map(x=>`<tr class="${x.status==="passed"||x.status==="earlier"||(x.status==="taken"&&!x.pos)?"past":""}"><td><b>${esc(x.symbol)}</b></td><td class="sub">${esc(x.sector||"")}</td><td>${pc(x.chg)}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td><td class="act"><button class="mini" data-ap="chart" data-s="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button> <button class="mini" data-ap="ochart" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Option chart</button> <button class="mini go" data-ap="trade" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Trade ${x.right}</button></td><td>${x.status==="open"||x.pos?"<b>"+sigStat(x)+"</b>":sigStat(x)}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):x.type==="momentum"?"Early mover "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td class="sub" style="min-width:220px">${esc(sigRemark(x))}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">${all.length?"No signal in this sector.":"Nothing that fits the rules yet today."}</td></tr></tbody>`}
 window.botD={};
 function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="ixrow"><b>${t}</b><span class="sub" id="${p}State"></span></div>
@@ -8835,7 +8843,7 @@ async function atmOption(sy,right,tf,m,what){m.textContent=`Loading the ${sy} op
  }catch(e){m.textContent="Could not load the option chain."}}
 async function apOption(b,p,what){b.disabled=true;try{await atmOption(b.dataset.s,b.dataset.r,b.dataset.tf,$(p+"Msg"),what)}finally{b.disabled=false}}
 function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
- for(const p in BOTS){rpDays(p);for(const k of ["RCap","RFee"])$(p+k).onchange=()=>{const l=window.rpLast&&window.rpLast[p];if(l)rpShow(p,l)};$(p+"RRun").onclick=()=>rpRun(p);$(p+"Past").onchange=()=>botLoad();$(p+"SecF").onchange=()=>sigPaint(p);$(p+"Sig").onclick=e=>{const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
+ for(const p in BOTS){rpDays(p);for(const k of ["RCap","RFee"])$(p+k).onchange=()=>{const l=window.rpLast&&window.rpLast[p];if(l)rpShow(p,l)};$(p+"RRun").onclick=()=>rpRun(p);$(p+"Past").onchange=()=>botLoad();$(p+"SecF").onchange=()=>sigPaint(p);$(p+"Sig").onclick=e=>{const h=e.target.closest("th[data-sk]");if(h){const k=h.dataset.sk,o=window.sigSort[p];window.sigSort[p]=o&&o.k===k?(o.d===1?{k,d:-1}:null):{k,d:1};sigPaint(p);return}const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
 function confBadge(r){const c=r&&r.conf;if(!c)return "";const tip=`Grade ${c.g}, score ${c.s} of 100\n`+c.w.map(x=>(x[0]?"✓ ":"✗ ")+x[1]).join("\n")+(c.n<8?"\n(Some checks could not be made)":"");return `<span class="cg cg${c.g}" title="${esc(tip)}">${c.g}<small> ${c.s}</small></span>`}
 let btTimer=null;
 const inr=x=>(x<0?"-":"")+"₹"+Math.abs(Math.round(x)).toLocaleString("en-IN");
