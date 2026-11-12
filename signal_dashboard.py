@@ -1693,7 +1693,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-12t"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-12u"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3306,7 +3306,7 @@ def bot_rules(kind):
         return AUTO_RULES + " Trades NIFTY only." + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
     tail = f" Everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
     sent = " It follows NIFTY's sentiment: only CE trades while NIFTY is up on the day, only PE trades while it is down." if AUTO_SENT else ""
-    mom = (f"Before {AUTO_MOM_END}, buys an at-the-money option on any F&O stock in one of the {AUTO_MOM_TOP} best or worst sectors of the day, or that moved more than {AUTO_MOM_PCT:g}% either way, "
+    mom = (f"Before {AUTO_MOM_END}, buys an at-the-money option on any F&O stock that is in one of the {AUTO_MOM_TOP} best or worst sectors of the day and has itself moved more than {AUTO_MOM_PCT:g}% either way, "
            "without waiting for a signal.") if AUTO_MOM else ""
     if AUTO_MOM and not AUTO_OLD_RULES:
         return mom + sent + " Stop and targets T1 to T4 come from the stock's own range." + tail
@@ -3335,8 +3335,8 @@ def nifty_sentiment():
 
 
 def mom_candidates(u, kind, rows, today, no, manual=False, day=False):
-    """The extra OR entry: before AUTO_MOM_END a stock that sits in one of the AUTO_MOM_TOP best or worst sectors of the day, or has moved more than
-    AUTO_MOM_PCT percent either way, is traded without waiting for a signal. The direction follows NIFTY: a CE while NIFTY is up, a PE while it is down.
+    """Before AUTO_MOM_END a stock that sits in one of the AUTO_MOM_TOP best or worst sectors of the day and has itself moved more than
+    AUTO_MOM_PCT percent either way is traded without waiting for a signal. The direction follows NIFTY: a CE while NIFTY is up, a PE while it is down.
     Stop and targets are from the stock's own range."""
     out = []
     if kind != "scanner" or not rows or not mom_window_open():
@@ -3362,12 +3362,9 @@ def mom_candidates(u, kind, rows, today, no, manual=False, day=False):
     for r, m in mv:
         sym = r["symbol"]
         sec = r.get("sector") or sector_of(sym)
-        if sec in hot:
-            why = f"{sec} is one of the top {hot[sec]} sectors ({avg[sec]:+.2f}%)"
-        elif abs(m) > AUTO_MOM_PCT:
-            why = f"moved {m:+.2f}%"
-        else:
+        if sec not in hot or abs(m) <= AUTO_MOM_PCT:   # both must hold: its sector is one of the best or worst, and the stock itself moved more than AUTO_MOM_PCT
             continue
+        why = f"{sec} is one of the top {hot[sec]} sectors ({avg[sec]:+.2f}%) and the stock moved {m:+.2f}%"
         it = INTERNAL.get((sym, "5m")) or {}
         atr = it.get("atr")
         px = float(r.get("ltp") or r["close"])
