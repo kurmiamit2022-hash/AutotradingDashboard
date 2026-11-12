@@ -1693,7 +1693,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-12s"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-12t"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3278,6 +3278,7 @@ AUTO_MOM_TOP = int(os.getenv("AUTO_MOM_TOP", "3"))   # or one of this many bigge
 AUTO_MOM_ATR = float(os.getenv("AUTO_MOM_ATR", "1.5"))   # its stop is this many of the stock's average candle ranges away (the same range the other entries use, kept between 1 and 3)
 AUTO_SENT = os.getenv("AUTO_SENT", "1") != "0"   # stock autopilot: trade the way NIFTY is leaning today (CE when it is up, PE when it is down)
 AUTO_SENT_MIN = float(os.getenv("AUTO_SENT_MIN", "0.1"))   # NIFTY must be at least this far from yesterday's close, up or down, to count as a lean
+AUTO_OLD_RULES = os.getenv("AUTO_OLD_RULES", "0") == "1"   # 1 brings back the indicator-signal entries (fresh and continuation) for the stock autopilot
 AUTO_SEEN = {}   # (user id, bot, symbol, timeframe, signal time, side) -> True: each signal is acted on once
 AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 minute chart (entries are taken on the 5 minute chart only; the 15 minute chart must be in the same direction: a BUY only while the other chart is also in a BUY zone, a SELL only while it is in a SELL zone, for fresh and continuation trades alike), "
               f"or, only from {AUTO_CONT_START} to {AUTO_CONT_END}, when a signal from an earlier day is still open and the price is back near its trend line. Stop-loss and targets T1 to T4 are the indicator's own: "
@@ -3297,6 +3298,20 @@ def auto_rows(kind, tf):
         by = {r["symbol"]: r for r in STATES[tf]["rows"]}
     rows = [by[s] for s in names if s in by]
     return add_conf(apply_live(rows), tf)
+
+
+def bot_rules(kind):
+    """The rules text shown on the Autopilot page."""
+    if kind == "nifty":
+        return AUTO_RULES + " Trades NIFTY only." + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
+    tail = f" Everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
+    sent = " It follows NIFTY's sentiment: only CE trades while NIFTY is up on the day, only PE trades while it is down." if AUTO_SENT else ""
+    mom = (f"Before {AUTO_MOM_END}, buys an at-the-money option on any F&O stock in one of the {AUTO_MOM_TOP} best or worst sectors of the day, or that moved more than {AUTO_MOM_PCT:g}% either way, "
+           "without waiting for a signal.") if AUTO_MOM else ""
+    if AUTO_MOM and not AUTO_OLD_RULES:
+        return mom + sent + " Stop and targets T1 to T4 come from the stock's own range." + tail
+    old = AUTO_RULES + f" Looks at every F&O stock whose move today is between {AUTO_MOVE_MIN:g}% and {AUTO_MOVE_MAX:g}%, up or down."
+    return old + (" " + mom if mom else "") + sent + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, a continuation needs the price near its trend line." + tail
 
 
 def mom_window_open():
@@ -3391,7 +3406,7 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False):
     tfrows = {tf: auto_rows(kind, tf) for tf in AUTO_TFS}
     zones = {tf: {r["symbol"]: r.get("side") for r in (tfrows[tf] or []) if (r.get("signal") or "–") != "–" and not r.get("sl_hit")} for tf in AUTO_TFS}   # who is in a BUY or SELL zone on each chart
     for tf in AUTO_TFS:
-        if tf not in AUTO_ENTRY_TFS:
+        if tf not in AUTO_ENTRY_TFS or (kind == "scanner" and AUTO_MOM and not AUTO_OLD_RULES):   # the stock autopilot trades early movers only
             continue
         rows = tfrows[tf]
         other = "15m" if tf == "5m" else "5m"
@@ -6733,7 +6748,7 @@ def bot_view(u, kind="scanner"):
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
     return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
-            "rules": AUTO_RULES + (" Trades NIFTY only." if kind == "nifty" else f" Looks at every F&O stock (not only the intraday scanner's list) whose move today is between {AUTO_MOVE_MIN:g}% and {AUTO_MOVE_MAX:g}%, up or down.") + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, a continuation needs the price near its trend line, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}.",
+            "rules": bot_rules(kind),
             "signals": manual_signals(u, kind),
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
 
