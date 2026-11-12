@@ -1693,7 +1693,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-11q"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-12s"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3271,6 +3271,13 @@ def cont_window_open():
 
 AUTO_MOVE_MIN = float(os.getenv("AUTO_MOVE_MIN", "1"))   # the scanner autopilot only trades stocks whose move today (up or down) is between these percentages
 AUTO_MOVE_MAX = float(os.getenv("AUTO_MOVE_MAX", "3"))
+AUTO_MOM = os.getenv("AUTO_MOM", "1") != "0"   # extra OR entry for the stock autopilot: a big mover early in the day, with no indicator signal needed
+AUTO_MOM_END = os.getenv("AUTO_MOM_END", "10:00")   # such entries are only taken before this time
+AUTO_MOM_PCT = float(os.getenv("AUTO_MOM_PCT", "2"))   # a stock that moved more than this percent either way qualifies
+AUTO_MOM_TOP = int(os.getenv("AUTO_MOM_TOP", "3"))   # or one of this many biggest gainers / losers
+AUTO_MOM_ATR = float(os.getenv("AUTO_MOM_ATR", "1.5"))   # its stop is this many of the stock's average candle ranges away (the same range the other entries use, kept between 1 and 3)
+AUTO_SENT = os.getenv("AUTO_SENT", "1") != "0"   # stock autopilot: trade the way NIFTY is leaning today (CE when it is up, PE when it is down)
+AUTO_SENT_MIN = float(os.getenv("AUTO_SENT_MIN", "0.1"))   # NIFTY must be at least this far from yesterday's close, up or down, to count as a lean
 AUTO_SEEN = {}   # (user id, bot, symbol, timeframe, signal time, side) -> True: each signal is acted on once
 AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 minute chart (entries are taken on the 5 minute chart only; the 15 minute chart must be in the same direction: a BUY only while the other chart is also in a BUY zone, a SELL only while it is in a SELL zone, for fresh and continuation trades alike), "
               f"or, only from {AUTO_CONT_START} to {AUTO_CONT_END}, when a signal from an earlier day is still open and the price is back near its trend line. Stop-loss and targets T1 to T4 are the indicator's own: "
@@ -3292,6 +3299,83 @@ def auto_rows(kind, tf):
     return add_conf(apply_live(rows), tf)
 
 
+def mom_window_open():
+    return AUTO_MOM and "09:15" <= ist_now().strftime("%H:%M") < AUTO_MOM_END
+
+
+def nifty_sentiment():
+    """(side, change %): BUY when NIFTY is up on the day by at least AUTO_SENT_MIN, SELL when it is down by that much, None in between. (None, None) without data."""
+    try:
+        with LOCK:
+            row = next((dict(r) for r in STATES["5m"]["rows"] if r["symbol"] == "NIFTY"), None) or next((dict(r) for r in STATES[DEFAULT_INTERVAL]["rows"] if r["symbol"] == "NIFTY"), None)
+        if not row:
+            return None, None
+        row = apply_live([row])[0]
+        chg = row.get("ltp_chg", row.get("chg"))
+        if chg is None:
+            return None, None
+        return ("BUY" if chg >= AUTO_SENT_MIN else "SELL" if chg <= -AUTO_SENT_MIN else None), float(chg)
+    except Exception:
+        return None, None
+
+
+def mom_candidates(u, kind, rows, today, no, manual=False, day=False):
+    """The extra OR entry: before AUTO_MOM_END a stock that sits in one of the AUTO_MOM_TOP best or worst sectors of the day, or has moved more than
+    AUTO_MOM_PCT percent either way, is traded without waiting for a signal. The direction follows NIFTY: a CE while NIFTY is up, a PE while it is down.
+    Stop and targets are from the stock's own range."""
+    out = []
+    if kind != "scanner" or not rows or not mom_window_open():
+        return out
+    side, nchg = nifty_sentiment()
+    if side is None:
+        no("early movers", "NIFTY is " + ("flat today" if nchg is not None else "not available yet") + f", so there is no direction to trade ({'%+.2f%%' % nchg if nchg is not None else 'no data'})")
+        return out
+    mv = [(r, r.get("ltp_chg", r.get("chg"))) for r in rows if r.get("ltp") or r.get("close")]
+    mv = [(r, m) for r, m in mv if m is not None]
+    if not mv:
+        return out
+    grp = {}
+    for r, m in mv:
+        sec = r.get("sector") or sector_of(r["symbol"])
+        if sec not in ("Others", "Indices"):
+            grp.setdefault(sec, []).append(m)
+    avg = {k: sum(v) / len(v) for k, v in grp.items() if len(v) >= 2}
+    order = sorted(avg, key=lambda k: -avg[k])
+    hot = {k: "gainers" for k in order[:AUTO_MOM_TOP] if avg[k] > 0}
+    hot.update({k: "losers" for k in order[::-1][:AUTO_MOM_TOP] if avg[k] < 0})
+    sg = 1 if side == "BUY" else -1
+    for r, m in mv:
+        sym = r["symbol"]
+        sec = r.get("sector") or sector_of(sym)
+        if sec in hot:
+            why = f"{sec} is one of the top {hot[sec]} sectors ({avg[sec]:+.2f}%)"
+        elif abs(m) > AUTO_MOM_PCT:
+            why = f"moved {m:+.2f}%"
+        else:
+            continue
+        it = INTERNAL.get((sym, "5m")) or {}
+        atr = it.get("atr")
+        px = float(r.get("ltp") or r["close"])
+        if not atr or atr <= 0:
+            no(f"{sym} early mover", "no average range yet, skipped")
+            continue
+        risk = max(1.0, min(3.0, AUTO_MOM_ATR)) * float(atr)
+        lv = {"sl": round(px - sg * risk, 2), **{f"tp{i}": round(px + sg * risk * i, 2) for i in range(1, 5)}}
+        skey = f"mom {today} {side}"
+        key = (u["id"], kind, sym, "mom", today, side)
+        with ORDER_LOCK:
+            done = any(o.get("user") == u["id"] and o.get("bot") and o["symbol"] == sym and o.get("date") == today and (o.get("bot_sigkey") or "").startswith("mom ") for o in ORDERS)
+        if done:
+            AUTO_SEEN[key] = True
+        if (AUTO_SEEN.get(key) or done) and not manual:
+            continue
+        out.append({"symbol": sym, "side": side, "px": px, "levels": lv, "tf": "5m", "etype": "momentum", "grade": None, "score": None, "dist": 0.0, "key": key, "sigkey": skey,
+                    "taken": bool(done), "time": ist_now().strftime("%H:%M"), "status": "taken" if done else "open", "reason": None,
+                    "mom": (1 if m * sg > 0 else 0, abs(m)),
+                    "note": f"early mover: {why}; NIFTY is {nchg:+.2f}% so a {'CE' if side == 'BUY' else 'PE'}, no signal needed"})
+    return out
+
+
 def auto_candidates(u, cfg, kind, why=None, manual=False, day=False):
     """Signals that qualify right now, fresh ones first and then by grade and closeness to the trend line. `why` collects the reason a live signal was left out.
     With day=True (the list for manual trading) every signal from today that fits the rules is returned, with a status: taken, open or passed."""
@@ -3303,6 +3387,7 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False):
         if why is not None:
             why.append(f"{label}: {text}")
     cont_window, cont_noted = cont_window_open(), False
+    sent_side, sent_chg = nifty_sentiment() if (kind == "scanner" and AUTO_SENT) else (None, None)
     tfrows = {tf: auto_rows(kind, tf) for tf in AUTO_TFS}
     zones = {tf: {r["symbol"]: r.get("side") for r in (tfrows[tf] or []) if (r.get("signal") or "–") != "–" and not r.get("sl_hit")} for tf in AUTO_TFS}   # who is in a BUY or SELL zone on each chart
     for tf in AUTO_TFS:
@@ -3324,6 +3409,12 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False):
                 if mv is None or not (AUTO_MOVE_MIN <= abs(mv) <= AUTO_MOVE_MAX):
                     no(label, f"{side} skipped: moved {'%+.2f%%' % mv if mv is not None else 'unknown'} today, needs {AUTO_MOVE_MIN:g}% to {AUTO_MOVE_MAX:g}% either way")
                     continue
+            if kind == "scanner" and AUTO_SENT and sent_side is not None and side != sent_side:
+                no(label, f"{side} skipped: NIFTY is {sent_chg:+.2f}% today, so only {'CE (BUY)' if sent_side == 'BUY' else 'PE (SELL)'} trades are taken")
+                continue
+            if kind == "scanner" and AUTO_SENT and sent_side is None and sent_chg is not None:
+                no(label, f"{side} skipped: NIFTY is flat today ({sent_chg:+.2f}%), no direction to follow")
+                continue
             if zone.get(sym) != side:   # the 5 and the 15 minute charts must point the same way, for fresh and continuation entries alike
                 z = zone.get(sym)
                 no(label, f"{side} on {tf[:-1]} min skipped: the {other[:-1]} minute chart is " + (f"in a {z} zone" if z else "not in any zone"))
@@ -3383,6 +3474,12 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False):
                         "note": (f"fresh {tf} {side} signal at {r.get('signal_time')}" if fresh else f"{side} signal from {sdate} still open, back near its trend line on {tf}")
                                 + (f", grade {g} ({cf.get('s')})" if g else "")})
     out.sort(key=lambda c: (c["etype"] != "fresh", -(c["score"] or 0), c["dist"]))
+    try:
+        have = {(c["symbol"], c["side"]) for c in out}
+        extra = [c for c in mom_candidates(u, kind, tfrows.get("5m"), today, no, manual, day) if (c["symbol"], c["side"]) not in have]
+        out += sorted(extra, key=lambda c: c["mom"], reverse=True)   # a signal entry always comes first; then the movers whose own move agrees with NIFTY, biggest first
+    except Exception as e:
+        no("momentum", f"could not be checked ({type(e).__name__})")
     return out
 
 
@@ -8624,8 +8721,8 @@ async function botLoad(){clearTimeout(botTimer);if(mode!=="autopilot")return;
   const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";const mm=$(p+"Msg");if(mm.textContent==="Running."&&d.state!=="running")mm.textContent="The autopilot is stopped (the server restarted or it was stopped elsewhere). Press Play to start it.";
   $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
   const showPast=$(p+"Past").checked,tr=d.trades.filter(t=>showPast||!t.past),np=d.trades.length-tr.length;$(p+"Past").nextSibling.textContent=" Show trades from earlier days"+(np?` (${np})`:"");
-  $(p+"Trades").innerHTML=tr.length?`<thead><tr><th>Date</th><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+tr.map(t=>`<tr class="${t.past?"past":""}"><td>${t.past?esc(t.date||""):"Today"}</td><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"||t.etype==="continuation"?"Continuation":t.etype==="fresh"?"Fresh":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No trades today.</td></tr></tbody>`;
-  const sg=d.signals||[];$(p+"Sig").innerHTML=sg.length?`<thead><tr><th>Stock</th><th></th><th>Status</th><th>Why</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Grade</th><th></th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.status==="passed"||x.status==="earlier"?"past":""}"><td><b>${esc(x.symbol)}</b></td><td class="act"><button class="mini" data-ap="chart" data-s="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button> <button class="mini" data-ap="ochart" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Option chart</button> <button class="mini go" data-ap="trade" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Trade ${x.right}</button></td><td>${x.status==="taken"?"<b>Bought by the autopilot</b>":x.status==="open"?"<b>Open now</b>":x.status==="passed"?"Passed: "+esc(x.reason||""):"Earlier today: "+esc(x.reason||"")}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No signal that fits the rules yet today.</td></tr></tbody>`;
+  $(p+"Trades").innerHTML=tr.length?`<thead><tr><th>Date</th><th>Time</th><th>Option</th><th>Entry</th><th>Mode</th><th>Bought</th><th>Sold</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>`+tr.map(t=>`<tr class="${t.past?"past":""}"><td>${t.past?esc(t.date||""):"Today"}</td><td>${t.time}</td><td>${esc(t.label)}</td><td>${t.etype==="gap"||t.etype==="continuation"?"Continuation":t.etype==="fresh"?"Fresh":t.etype==="momentum"?"Early mover":"Signal"}</td><td>${t.mode}</td><td>${t.entry?f2(t.entry):"–"}</td><td>${t.exit?f2(t.exit):"–"}</td><td class="${pnlCls(t.pnl||0)}">${t.pnl==null?"–":money(t.pnl)}</td><td>${t.state==="open"?"Open · stop "+f2(t.p_sl)+" · T1 "+f2(t.p_t1)+" · T2 "+f2(t.p_t2):esc(t.reason||t.state)}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No trades today.</td></tr></tbody>`;
+  const sg=d.signals||[];$(p+"Sig").innerHTML=sg.length?`<thead><tr><th>Stock</th><th></th><th>Status</th><th>Why</th><th>Price</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Grade</th><th></th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.status==="passed"||x.status==="earlier"?"past":""}"><td><b>${esc(x.symbol)}</b></td><td class="act"><button class="mini" data-ap="chart" data-s="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button> <button class="mini" data-ap="ochart" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Option chart</button> <button class="mini go" data-ap="trade" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Trade ${x.right}</button></td><td>${x.status==="taken"?"<b>Bought by the autopilot</b>":x.status==="open"?"<b>Open now</b>":x.status==="passed"?"Passed: "+esc(x.reason||""):"Earlier today: "+esc(x.reason||"")}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):x.type==="momentum"?"Early mover":"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">No signal that fits the rules yet today.</td></tr></tbody>`;
   $(p+"Sig").parentElement.hidden=false;
   $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
  botTimer=setTimeout(botLoad,8000)}
@@ -8667,7 +8764,7 @@ function rpByTf(r){const o={};for(const t of r.trades){const k=o[t.tf]=o[t.tf]||
 function rpShow(p,r){window.rpLast=window.rpLast||{};window.rpLast[p]=r;const cap=Math.max(1000,+$(p+"RCap").value||100000),fee=+$(p+"RFee").value||0,sim=rpSim(r,cap,fee),sc=sim.c,sf=sim.f,pc=(sc.end/cap-1)*100,when=r.mode==="range"?"by the end of the month":"by the end of the day";
  const money=`<div class="rpcap"><div class="rpbig"><span class="sub">Starting with ${rpInr(cap)}, buying the at-the-money call (CE) or put (PE) with the whole account on each trade, exiting at the stop-loss or target the system sets${fee?`, less ${fee}% charges and slippage per trade`:""}</span><div>${rpInr(cap)} → <b class="${sc.end>=cap?"up":"dn"}">${rpInr(sc.end)}</b> <span class="${pc>=0?"up":"dn"}">${pc>=0?"+":""}${pc.toFixed(1)}%</span> <span class="sub">${when}</span></div></div>
   <div class="sub">Profit ${rpInr(sc.end-cap)} · biggest fall from a peak ${rpInr(-sc.dd)} (${sc.ddp.toFixed(1)}%) · without compounding (${rpInr(cap)} in every trade): ${rpInr(sf.end)} (${((sf.end/cap-1)*100).toFixed(1)}%)</div></div>`;
- const s=r.summary,rg=r.mode==="range",R=x=>`<span class="${x>0?"up":x<0?"dn":""}">${x>0?"+":""}${x}R</span>`,why=t=>t==="fresh"?"Fresh":"Continuation",pill=(sd,rt)=>`<span class="pill ${sd}">${rt==="CE"?"CALL (CE)":"PUT (PE)"}</span>`,cb=(x)=>`<button class="mini" data-rc="${esc(x.symbol)}|${x.tf}|${x.ts}">Chart</button>`;
+ const s=r.summary,rg=r.mode==="range",R=x=>`<span class="${x>0?"up":x<0?"dn":""}">${x>0?"+":""}${x}R</span>`,why=t=>t==="fresh"?"Fresh":t==="momentum"?"Early mover":"Continuation",pill=(sd,rt)=>`<span class="pill ${sd}">${rt==="CE"?"CALL (CE)":"PUT (PE)"}</span>`,cb=(x)=>`<button class="mini" data-rc="${esc(x.symbol)}|${x.tf}|${x.ts}">Chart</button>`;
  const dy=x=>rg?`<td>${x.day.slice(5)}</td>`:"",dh=rg?"<th>Day</th>":"";
  const tr=r.trades.length?`<div class="wrap rpscroll"><table><thead><tr>${dh}<th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>In</th><th>Price</th><th>Stop</th><th>T1</th><th>T4</th><th>Out</th><th>Price</th><th>Result</th><th>Targets</th><th>Stock moved</th><th>Option bought</th><th>Option sold</th><th>Option P&amp;L</th><th>R</th><th></th></tr></thead><tbody>`+r.trades.map(t=>`<tr>${dy(t)}<td><b>${esc(t.symbol)}</b></td><td>${pill(t.side,t.right)}</td><td>${t.tf==="5m"?"5 min":"15 min"}</td><td>${why(t.type)}</td><td>${t.entered}</td><td>${t.entry}</td><td>${t.sl}</td><td>${t.t1}</td><td>${t.t4}</td><td>${t.exit_at}</td><td>${t.exit}</td><td>${esc(t.reason)}</td><td>${t.targets}</td><td class="${t.pct>=0?"up":"dn"}">${t.pct>0?"+":""}${t.pct}%</td>${t.opt_pct==null?"<td>–</td><td>–</td><td>–</td>":`<td>${t.opt_in}</td><td>${t.opt_out}</td><td class="${t.opt_pct>=0?"up":"dn"}">${t.opt_pct>0?"+":""}${t.opt_pct}%</td>`}<td>${R(t.r)}</td><td>${cb(t)}</td></tr>`).join("")+"</tbody></table></div>":`<div class="sub">The rules would not have taken any trade on ${esc(r.day)}.</div>`;
  const shown=r.signals.slice(0,300),tot=r.signals_total||r.signals.length;
