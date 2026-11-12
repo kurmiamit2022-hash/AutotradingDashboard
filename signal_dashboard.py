@@ -1027,11 +1027,19 @@ def add_today_candle(sym, sid, seg, kind, df, now):
         return df
 
 
-def dhan_candles(sym, interval, days):
-    """Candles of one symbol from Dhan: intraday in pieces of up to 80 days, daily in one request."""
-    inst = dhan_inst(sym)
+def dhan_future_inst(sym):
+    """(security id, segment, instrument) of the nearest futures contract, or None."""
+    f = near_future(sym, "dhan")
+    if not f:
+        return None
+    return str(f[1]), f[4] or "NSE_FNO", "FUTIDX" if (sym in INDICES or sym in BSE_INDICES) else "FUTSTK"
+
+
+def dhan_candles(sym, interval, days, fut=False):
+    """Candles of one symbol from Dhan: intraday in pieces of up to 80 days, daily in one request. fut=True reads the nearest futures contract."""
+    inst = dhan_future_inst(sym) if fut else dhan_inst(sym)
     if not inst:
-        raise DhanDataError(f"{sym} is not in Dhan's instrument list")
+        raise DhanDataError(f"{sym} has no futures contract in Dhan's instrument list" if fut else f"{sym} is not in Dhan's instrument list")
     sid, seg, kind = inst
     now = ist_now()
     end = now.date() + timedelta(days=1)
@@ -1693,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-12w"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-12y"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -1799,6 +1807,7 @@ ALERT_DDL = [
     "CREATE TABLE IF NOT EXISTS alerts(user_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, telegram_chat TEXT, ntfy_topic TEXT, "
     "tfs TEXT NOT NULL DEFAULT '15m', sides TEXT NOT NULL DEFAULT 'BUY,SELL', sectors TEXT NOT NULL DEFAULT '', updated TEXT)",
     "CREATE TABLE IF NOT EXISTS alert_seen(k TEXT PRIMARY KEY, ts TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS manual_sig(k TEXT PRIMARY KEY, day TEXT NOT NULL, data TEXT NOT NULL)",
 ]
 
 
@@ -3404,7 +3413,7 @@ def mom_candidates(u, cfg, kind, rows, today, no, manual=False, day=False):
     return out
 
 
-def auto_candidates(u, cfg, kind, why=None, manual=False, day=False):
+def auto_candidates(u, cfg, kind, why=None, manual=False, day=False, old_view=False):
     """Signals that qualify right now, fresh ones first and then by grade and closeness to the trend line. `why` collects the reason a live signal was left out.
     With day=True (the list for manual trading) every signal from today that fits the rules is returned, with a status: taken, open or passed."""
     ent = cfg.get("entries", "both")
@@ -3421,7 +3430,7 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False):
     AUTO_MOVES[kind] = {r["symbol"]: (r.get("ltp_chg", r.get("chg")), r.get("sector")) for r in (tfrows.get("5m") or [])}
     zones = {tf: {r["symbol"]: r.get("side") for r in (tfrows[tf] or []) if (r.get("signal") or "–") != "–" and not r.get("sl_hit")} for tf in AUTO_TFS}   # who is in a BUY or SELL zone on each chart
     for tf in AUTO_TFS:
-        if tf not in AUTO_ENTRY_TFS or (kind == "scanner" and AUTO_MOM and not AUTO_OLD_RULES):   # the stock autopilot trades early movers only
+        if tf not in AUTO_ENTRY_TFS or (kind == "scanner" and AUTO_MOM and not AUTO_OLD_RULES and not old_view):   # the stock autopilot trades early movers only
             continue
         rows = tfrows[tf]
         other = "15m" if tf == "5m" else "5m"
@@ -3439,10 +3448,10 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False):
                 if mv is None or not (AUTO_MOVE_MIN <= abs(mv) <= AUTO_MOVE_MAX):
                     no(label, f"{side} skipped: moved {'%+.2f%%' % mv if mv is not None else 'unknown'} today, needs {AUTO_MOVE_MIN:g}% to {AUTO_MOVE_MAX:g}% either way")
                     continue
-            if kind == "scanner" and AUTO_SENT and sent_side is not None and side != sent_side:
+            if kind == "scanner" and AUTO_SENT and not old_view and sent_side is not None and side != sent_side:
                 no(label, f"{side} skipped: NIFTY is {sent_chg:+.2f}% today, so only {'CE (BUY)' if sent_side == 'BUY' else 'PE (SELL)'} trades are taken")
                 continue
-            if kind == "scanner" and AUTO_SENT and sent_side is None and sent_chg is not None:
+            if kind == "scanner" and AUTO_SENT and not old_view and sent_side is None and sent_chg is not None:
                 no(label, f"{side} skipped: NIFTY is flat today ({sent_chg:+.2f}%), no direction to follow")
                 continue
             if zone.get(sym) != side:   # the 5 and the 15 minute charts must point the same way, for fresh and continuation entries alike
@@ -5877,8 +5886,14 @@ def indicator_pack(symbol, df, tf, stamp, lo_t=None, minbars=60):
     return out
 
 
-def chart_data(symbol, tf, at=0):
-    if use_dhan():
+def chart_data(symbol, tf, at=0, fut=False):
+    if fut:
+        if not use_dhan():
+            raise DhanDataError("Futures charts need Dhan as the data source")
+        if not load_master("dhan"):
+            raise DhanDataError("Dhan's instrument list could not be loaded")
+        df = dhan_candles(symbol, tf, _days(PERIODS[tf]), fut=True)
+    elif use_dhan():
         df = dhan_frames([symbol], tf, _days(PERIODS[tf]))[0].get(symbol)
     else:
         import yfinance as yf
@@ -5956,18 +5971,21 @@ def api_sector_chart(sector: str, tf: str = DEFAULT_INTERVAL):
 
 
 @app.get("/api/chart")
-def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0):
+def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0, inst: str = "stock"):
     symbol = symbol.upper().strip()
     if tf not in INTERVALS:
         tf = DEFAULT_INTERVAL
     if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol) or (symbol not in UNIVERSE and symbol not in INDEX_YF and symbol not in COMMODITIES):
         return JSONResponse({"error": "Unknown symbol."}, status_code=400)
-    key = (symbol, tf, at)
+    fut = inst == "fut" and symbol not in COMMODITIES
+    key = (symbol, tf, at, fut)
     hit = CHART_CACHE.get(key)
     if hit and time.time() - hit[0] < 30:
         return JSONResponse(hit[1])
     try:
-        d = chart_data(symbol, tf, at)
+        d = chart_data(symbol, tf, at, fut)
+    except DhanDataError as e:
+        return JSONResponse({"error": str(e)})
     except Exception as e:
         return JSONResponse({"error": f"Could not load candles ({type(e).__name__})."})
     if not d:
@@ -6749,7 +6767,7 @@ def bot_past_trades(uid, kind):
     return out
 
 
-def bot_view(u, kind="scanner"):
+def bot_view(u, kind="scanner", old=False):
     kind = bot_kind(kind)
     cfg = bot_cfg(u["id"], kind)
     today = ist_now().strftime("%Y-%m-%d")
@@ -6764,7 +6782,7 @@ def bot_view(u, kind="scanner"):
     return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
             "rules": bot_rules(kind), "old_rules": kind == "nifty" or AUTO_OLD_RULES or not AUTO_MOM,
-            "signals": manual_signals(u, kind),
+            "signals": manual_signals(u, kind, old),
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
 
 
@@ -7211,23 +7229,44 @@ MANUAL_DAY = {}   # (user id, bot) -> {"day": date, "rows": {key: row}}. Every s
 MANUAL_ORDER = {"open": 0, "taken": 1, "passed": 2, "earlier": 3}
 
 
-def manual_signals(u, kind):
+def manual_load(uid, kind, today):
+    """Rows saved earlier today (the list survives a restart or a new deploy)."""
+    rows = {}
+    try:
+        for r in q("SELECT k, data FROM manual_sig WHERE k LIKE ?", (f"{uid}|{kind}|{today}|%",)):
+            rows[r["k"].split("|", 3)[3]] = json.loads(r["data"])
+        x("DELETE FROM manual_sig WHERE day < ?", (today,))
+    except Exception as e:
+        print("manual list load:", e, flush=True)
+    return rows
+
+
+def manual_save(uid, kind, today, key, row):
+    try:
+        x("INSERT INTO manual_sig(k, day, data) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET data=excluded.data",
+          (f"{uid}|{kind}|{today}|{key}", today, json.dumps({a: b for a, b in row.items() if a != "chg"})))
+    except Exception as e:
+        print("manual list save:", e, flush=True)
+
+
+def manual_signals(u, kind, old=False):
     """Every signal from today that fits this autopilot's rules, for someone trading by hand, with what happened to it.
     Shown whether or not the autopilot is running. Signals stay on the list for the rest of the day."""
-    k = (u["id"], kind)
+    k = (u["id"], kind, bool(old))
     hit = MANUAL_SIG.get(k)
     if hit and time.time() - hit[0] < 10:
         return hit[1]
     cfg = bot_cfg(u["id"], kind)
     today = ist_now().strftime("%Y-%m-%d")
+    dk = (u["id"], kind)
     try:
-        cands = auto_candidates(u, cfg, kind, manual=True, day=True)
+        cands = auto_candidates(u, cfg, kind, manual=True, day=True, old_view=bool(old))
     except Exception as e:
         print("manual signals:", e)
         return hit[1] if hit else []
-    store = MANUAL_DAY.get(k)
+    store = MANUAL_DAY.get(dk)
     if not store or store["day"] != today:
-        store = MANUAL_DAY[k] = {"day": today, "rows": {}}
+        store = MANUAL_DAY[dk] = {"day": today, "rows": manual_load(u["id"], kind, today), "saved": {}}
     rows, now = store["rows"], time.time()
     seen = set()
     for c in cands:
@@ -7256,20 +7295,26 @@ def manual_signals(u, kind):
                      "px": round(float(o.get("bot_entry_under") or 0), 2), "time": o.get("time"), "sl": o.get("bot_sl"), "t1": o.get("bot_t1"), "t2": o.get("bot_t2"),
                      "t3": o.get("bot_t3"), "t4": o.get("bot_t4"), "grade": o.get("bot_grade"), "score": None, "taken": True, "status": "taken", "reason": None, "note": "",
                      "chg": o.get("bot_chg"), "sector": o.get("bot_sector"), "pos": o.get("bot_state") == "open", "closed": o.get("bot_reason"), "ts": now}
+    for key_, row_ in rows.items():   # save what changed, so the list is still there after a restart
+        snap = json.dumps({a: b for a, b in row_.items() if a not in ("chg", "ts")}, sort_keys=True)
+        if store["saved"].get(key_) != snap:
+            store["saved"][key_] = snap
+            manual_save(u["id"], kind, today, key_, row_)
     moves = AUTO_MOVES.get(kind) or {}
     for row in rows.values():   # the live move and sector on every row, including ones that stopped qualifying
         mvs = moves.get(row["symbol"])
         if mvs and mvs[0] is not None:
             row["chg"] = round(float(mvs[0]), 2)
         row["sector"] = (mvs[1] if mvs and mvs[1] else None) or row.get("sector") or sector_of(row["symbol"])
-    out = sorted(rows.values(), key=lambda r: (0 if r.get("pos") else 1 + MANUAL_ORDER.get(r["status"], 9), -r["ts"]))   # trades that are still open come first
+    show = [r for r in rows.values() if old or r.get("type") == "momentum" or r.get("taken") or kind == "nifty" or AUTO_OLD_RULES or not AUTO_MOM]
+    out = sorted(show, key=lambda r: (0 if r.get("pos") else 1 + MANUAL_ORDER.get(r["status"], 9), -r["ts"]))   # trades that are still open come first
     MANUAL_SIG[k] = (time.time(), out)
     return out
 
 
 @app.get("/api/optbot")
-def api_optbot(request: Request, bot: str = "scanner"):
-    return bot_view(request.state.user, bot)
+def api_optbot(request: Request, bot: str = "scanner", old: int = 0):
+    return bot_view(request.state.user, bot, bool(old))
 
 
 def bot_apply(u, payload, mode, kind="scanner"):
@@ -8118,6 +8163,18 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .chtfs button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
 .chleg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--mute);margin-bottom:6px}.chleg i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
 #chart{height:min(62vh,560px);width:100%}
+.cwrap{display:grid;grid-template-columns:270px minmax(0,1fr);gap:12px;align-items:start}
+.cwl{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px}
+.cwl input,.cwl select{width:100%;box-sizing:border-box}
+#cwList{height:min(66vh,640px);overflow-y:auto;display:flex;flex-direction:column;gap:2px}
+#cwList button{display:flex;align-items:center;gap:6px;justify-content:space-between;text-align:left;border:0;background:transparent;color:var(--ink);padding:7px 8px;border-radius:8px;cursor:pointer;font:inherit}
+#cwList button:hover{background:rgba(120,120,160,.12)}#cwList button[aria-selected=true]{background:var(--ink);color:var(--panel)}
+#cwList .nm{font-weight:600}#cwList .pc{font-size:12px}#cwList .sg{font-size:10px;border-radius:6px;padding:1px 5px;border:1px solid currentColor;opacity:.85}
+.cwm{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0}
+.cwbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}.cwbar b{font-size:18px}.cwbar .seg{margin:0}
+#cwOpt{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+#cwChart{height:min(64vh,620px);min-height:340px;width:100%}
+@media(max-width:820px){.cwrap{grid-template-columns:1fr}#cwList{height:200px}}
 td.act{white-space:nowrap}
 .tk{padding:20px}.tk h2{margin:0 0 4px;font-size:20px}
 .tkgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
@@ -8256,7 +8313,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="charts">Charts</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -8293,6 +8350,26 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label> <label class="chk"><input type="checkbox" id="scConf"> Grade A only</label><span class="sub" id="scMeta"></span></div>
 <div class="wrap"><table id="scTable"></table></div>
 
+</section>
+<section id="view-charts" hidden>
+<div class="cwrap">
+ <aside class="cwl" aria-label="Watchlist">
+  <input id="cwQ" placeholder="Search symbol" aria-label="Search symbol" autocomplete="off">
+  <select id="cwSec" aria-label="Sector"><option value="ALL">All sectors</option></select>
+  <select id="cwSort" aria-label="Sort"><option value="az">A to Z</option><option value="chg">% change, highest first</option><option value="chgd">% change, lowest first</option><option value="sig">Signals first</option></select>
+  <div id="cwList" role="listbox" aria-label="Symbols" tabindex="0"></div>
+ </aside>
+ <div class="cwm">
+  <div class="cwbar"><b id="cwTitle">Charts</b><div class="seg" id="cwInst" role="group" aria-label="Instrument"><button data-i="stock">Stock</button><button data-i="fut">Futures</button><button data-i="opt">Option</button></div>
+   <div class="seg" id="cwTf" role="group" aria-label="Timeframe" style="margin-left:auto"></div></div>
+  <div id="cwOpt" hidden><label class="sub">Expiry <select id="cwExp"></select></label><label class="sub">Strike <select id="cwStrike"></select></label>
+   <div class="seg" id="cwSide" role="group" aria-label="Call or put"><button data-r="CE">Call (CE)</button><button data-r="PE">Put (PE)</button></div>
+   <div class="seg" id="cwDays" role="group" aria-label="Days"><button data-d="1">1 day</button><button data-d="3">3 days</button></div></div>
+  <div class="chleg" id="cwLeg"></div><div id="cwMsg" class="tkmsg" role="status"></div>
+  <div id="cwChart"></div>
+  <p class="sub">Press ↑ or ↓ to move to the previous or next symbol, ← or → to change the timeframe.</p>
+ </div>
+</div>
 </section>
 <section id="view-commodities" hidden>
 <div class="ixrow"><div class="seg" id="cmTfs" role="group" aria-label="Timeframe"></div>
@@ -8587,9 +8664,87 @@ const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"
 const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(a>=1e7?(a/1e7).toFixed(2)+" Cr":a>=1e5?(a/1e5).toFixed(2)+" L":a>=1e3?(a/1e3).toFixed(1)+" K":String(Math.round(a)))};
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
+// ── Charts workspace: a watchlist and one big chart; the arrow keys move through the list ──
+const cw={sym:null,inst:"stock",tf:"15m",side:"CE",days:1,exp:"",strike:null,chain:{},obj:null,my:0,t:null,ready:false,view:[]};
+try{const j=JSON.parse(localStorage.getItem("cw")||"{}");for(const k of ["sym","inst","tf","side","days"])if(j[k]!=null)cw[k]=j[k]}catch(e){}
+function cwSave(){try{localStorage.setItem("cw",JSON.stringify({sym:cw.sym,inst:cw.inst,tf:cw.tf,side:cw.side,days:cw.days}))}catch(e){}}
+function cwRows(){return data?data.rows:[]}
+function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec=$("cwSec").value,so=$("cwSort").value;
+ const secs=[...new Set(rows.map(r=>r.type==="index"?"Indices":(r.sector||"Others")))].sort();
+ if($("cwSec").options.length!==secs.length+1){$("cwSec").innerHTML='<option value="ALL">All sectors</option>'+secs.map(x=>`<option>${esc(x)}</option>`).join("");$("cwSec").value=secs.includes(sec)?sec:"ALL"}
+ let v=rows.filter(r=>(!q||r.symbol.includes(q))&&($("cwSec").value==="ALL"||(r.type==="index"?"Indices":(r.sector||"Others"))===$("cwSec").value));
+ const ch=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?-999:c},sg=r=>(r.signal&&r.signal!=="–")?0:1;
+ v.sort((a,b)=>(a.type==="index"?0:1)-(b.type==="index"?0:1)||(so==="chg"?ch(b)-ch(a):so==="chgd"?ch(a)-ch(b):so==="sig"?sg(a)-sg(b)||a.symbol.localeCompare(b.symbol):a.symbol.localeCompare(b.symbol)));
+ cw.view=v.map(r=>r.symbol);
+ $("cwList").innerHTML=v.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,sg=r.signal&&r.signal!=="–"?(r.side==="BUY"?"BUY":"SELL"):"";
+  return `<button role="option" data-s="${esc(r.symbol)}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${esc(r.symbol)}</span><span>${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>'}
+function cwMark(){document.querySelectorAll("#cwList button").forEach(b=>{const on=b.dataset.s===cw.sym;b.setAttribute("aria-selected",on);if(on)b.scrollIntoView({block:"nearest"})})}
+function cwShow(){if(!cw.ready){cw.ready=true;
+  $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSort").onchange=()=>cwBuild();
+  $("cwList").onclick=e=>{const b=e.target.closest("button[data-s]");if(b)cwPick(b.dataset.s)};
+  $("cwInst").onclick=e=>{const b=e.target.closest("button");if(!b)return;cw.inst=b.dataset.i;cw.exp="";cw.strike=null;cwSave();cwPaintCtl();cwLoad()};
+  $("cwTf").onclick=e=>{const b=e.target.closest("button");if(b)cwTf(b.dataset.t)};
+  $("cwSide").onclick=e=>{const b=e.target.closest("button");if(b){cw.side=b.dataset.r;cwSave();cwPaintCtl();cwLoad()}};
+  $("cwDays").onclick=e=>{const b=e.target.closest("button");if(b){cw.days=+b.dataset.d;cwSave();cwPaintCtl();cwLoad()}};
+  $("cwExp").onchange=()=>{cw.exp=$("cwExp").value;cw.strike=null;cwLoad()};
+  $("cwStrike").onchange=()=>{cw.strike=+$("cwStrike").value;cwLoad()};
+  document.addEventListener("keydown",cwKey)}
+ if(!data){$("cwMsg").textContent="Loading symbols…";setTimeout(()=>{if(mode==="charts")cwShow()},1200);return}
+ cwBuild();if(!cw.sym||!cw.view.includes(cw.sym))cw.sym=cw.view.includes("NIFTY")?"NIFTY":cw.view[0];cwPaintCtl();cwMark();cwLoad()}
+function cwPaintCtl(){$("cwInst").querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.i===cw.inst));
+ $("cwTf").innerHTML=["5m","15m","1d"].map(x=>`<button data-t="${x}" aria-pressed="${x===cw.tf}">${tfName[x]||x}</button>`).join("");
+ $("cwOpt").hidden=cw.inst!=="opt";$("cwSide").querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.r===cw.side));$("cwDays").querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",+b.dataset.d===cw.days))}
+function cwTf(t){if(!t||t===cw.tf)return;cw.tf=t;cwSave();cwPaintCtl();cwLoad()}
+function cwPick(sym){if(!sym)return;cw.sym=sym;cw.exp="";cw.strike=null;cwSave();cwMark();clearTimeout(cw.t);cw.t=setTimeout(cwLoad,140)}
+function cwKey(e){if(mode!=="charts"||e.ctrlKey||e.metaKey||e.altKey)return;const el=document.activeElement,tg=el&&el.tagName;if(tg==="INPUT"||tg==="TEXTAREA"||tg==="SELECT"||$("chartDlg").open||$("optDlg").open)return;
+ if(e.key==="ArrowDown"||e.key==="ArrowUp"){e.preventDefault();const i=cw.view.indexOf(cw.sym),n=cw.view.length;if(!n)return;cwPick(cw.view[Math.max(0,Math.min(n-1,(i<0?0:i+(e.key==="ArrowDown"?1:-1))))])}
+ else if(e.key==="ArrowLeft"||e.key==="ArrowRight"){e.preventDefault();const T=["5m","15m","1d"],i=T.indexOf(cw.tf);cwTf(T[Math.max(0,Math.min(2,i+(e.key==="ArrowRight"?1:-1)))])}}
+async function cwChain(sym){if(cw.chain[sym]&&Date.now()-cw.chain[sym].at<120000)return cw.chain[sym].d;
+ const d=await (await api(`/api/options/chain?symbol=${encodeURIComponent(sym)}&tf=${tf||"15m"}`)).json();cw.chain[sym]={at:Date.now(),d};return d}
+async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
+ $("cwTitle").textContent=sym+(cw.inst==="fut"?" futures (nearest month)":"");$("cwMsg").textContent="Loading chart…";$("cwLeg").innerHTML="";
+ try{await loadLW()}catch(e){$("cwMsg").textContent="The chart library did not load. Reload the page and try again.";return}
+ let candles,lines=null,legend=[],markers=[],levels=null,intraday=true;
+ try{
+  if(cw.inst==="opt"){
+   const ch=await cwChain(sym);if(my!==cw.my)return;
+   if(ch.error||!ch.rows||!ch.rows.length){$("cwMsg").textContent=ch.error||"No option chain for this symbol (it may not be in F&O).";cwClear();return}
+   const exps=ch.expiries||[ch.expiry];if(!cw.exp||!exps.includes(cw.exp))cw.exp=ch.expiry||exps[0];
+   const strikes=ch.rows.map(r=>r.strike);if(cw.strike==null||!strikes.includes(cw.strike))cw.strike=ch.atm!=null?ch.atm:strikes[Math.floor(strikes.length/2)];
+   $("cwExp").innerHTML=exps.map(x=>`<option${x===cw.exp?" selected":""}>${esc(x)}</option>`).join("");$("cwStrike").innerHTML=strikes.map(x=>`<option value="${x}"${x===cw.strike?" selected":""}>${x}${x===ch.atm?" (ATM)":""}</option>`).join("");
+   const m=cw.tf==="5m"?"5m":"15m",days=cw.tf==="1d"?3:cw.days;
+   const h=await (await api(`/api/options/history?symbol=${encodeURIComponent(sym)}&expiry=${encodeURIComponent(cw.exp)}&strike=${cw.strike}&tf=${m}&days=${days}`)).json();if(my!==cw.my)return;
+   if(h.error){$("cwMsg").textContent=h.error;cwClear();return}
+   const rows=h[cw.side.toLowerCase()]||[];if(!rows.length){$("cwMsg").textContent="No price history for this contract yet.";cwClear();return}
+   candles=rows.map(r=>({time:r.t+19800,open:r.o,high:r.h,low:r.l,close:r.c}));
+   const ind=(h.ind||{})[cw.side.toLowerCase()];if(ind&&ind.stop)lines={stop:ind.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(ind.ema||[]).map(([t,v])=>[t+19800,v])};
+   const f=rows[0].c,l=rows[rows.length-1].c;legend.push(`<b>${esc(sym)} ${cw.strike} ${cw.side}</b> <span>expiry ${esc(cw.exp)} · last ${l.toFixed(2)} (${(l/f-1>=0?"+":"")+((l/f-1)*100).toFixed(1)}% over the period)</span>`);
+   if(cw.tf==="1d")legend.push("<span>Option history is intraday only, so 15 minute candles of the last 3 days are shown.</span>")
+  }else{
+   const r=await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${cw.tf}&inst=${cw.inst}`);const d=await r.json();if(my!==cw.my)return;
+   if(d.error){$("cwMsg").textContent=d.error;cwClear();return}
+   candles=d.candles;lines=d.lines;intraday=d.intraday;
+   markers=(d.markers||[]).map(m=>m.side==="BUY"?{time:m.time,position:"belowBar",color:"#0a7d5a",shape:"arrowUp",text:"BUY"}:{time:m.time,position:"aboveBar",color:"#c0392b",shape:"arrowDown",text:"SELL"});
+   const row=cwRows().find(x=>x.symbol===sym)||{},c=row.ltp_chg!=null?row.ltp_chg:row.chg,last=candles[candles.length-1].close;
+   legend.push(`<b>${esc(sym)}</b> <span>${last.toFixed(2)}${c!=null?` (${c>0?"+":""}${c.toFixed(2)}% today)`:""}${row.sector?" · "+esc(row.sector):""}</span>`);
+   if(d.signal){levels=d.signal;legend.push(`<b class="${d.signal.side==="BUY"?"up":"dn"}">${esc(d.signal.state)}</b> <span>signal candle ${esc(d.signal.time)}, ${esc(d.signal.status)}</span>`)}else legend.push("<span>No signal on this timeframe.</span>")}
+ }catch(e){if(my===cw.my)$("cwMsg").textContent="The server did not return chart data. Try again in a moment.";return}
+ $("cwMsg").textContent="";cwClear();
+ const css=getComputedStyle(document.documentElement),col=(n,f)=>css.getPropertyValue(n).trim()||f;
+ const ink=col("--ink","#222"),line=col("--line","#ddd"),up=col("--buy","#0a7d5a"),dn=col("--sell","#c0392b");
+ const ch=LightweightCharts.createChart($("cwChart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:intraday,secondsVisible:false},crosshair:{mode:0}});
+ cw.obj=ch;
+ if(lines){const sp=ch.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp.setData(lines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
+  if(lines.ema&&lines.ema.length){const ep=ch.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ep.setData(lines.ema.map(([t,v])=>({time:t,value:v})))}}
+ const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(candles);if(markers.length)cs.setMarkers(markers);
+ if(levels){const lastT=candles[candles.length-1].time,lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title});s.setData([{time:levels.from,value:price},{time:lastT,value:price}])};
+  lv(levels.entry,ink,"Entry",0);lv(levels.sl,dn,"SL"+(levels.sl_hit?" ✖":""),0);levels.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(levels.hits>i?" ✓":""),2))}
+ $("cwLeg").innerHTML=legend.join("");ch.timeScale().fitContent();if(candles.length>120)ch.timeScale().setVisibleLogicalRange({from:candles.length-120,to:candles.length+4})}
+function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}}
 function setMode(m){if(m==="index")m="options";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",options:"options",scanner:"scanner",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
- ["stocks","options","scanner","commodities","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ const vm={stocks:"stocks",futures:"stocks",charts:"charts",options:"options",scanner:"scanner",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","charts","options","scanner","commodities","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ if(m==="charts")cwShow();
  if(m==="commodities"){cmPaint();cmLoad()}else clearTimeout(cmTimer);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
  if(m==="scanner"){scPaint();scLoad()}else clearTimeout(scTimer);
@@ -8762,16 +8917,16 @@ function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="wrap"><table id="${p}Trades"></table></div>
  <label class="sub" style="display:flex;gap:6px;align-items:center;margin:6px 0"><input type="checkbox" id="${p}Past"> Show trades from earlier days</label>
  <div class="ixrow"><b>Signals for manual trades</b><span class="sub" id="${p}SigNote">Every signal from today that fits this autopilot's rules, and what happened to it. Shown even while it is off.</span></div>
- <div class="botrow"><label>Sector<select id="${p}SecF" aria-label="Filter by sector"><option value="ALL">All sectors</option></select></label></div>
+ <div class="botrow"><label>Sector<select id="${p}SecF" aria-label="Filter by sector"><option value="ALL">All sectors</option></select></label><label class="sub" id="${p}OldW" style="display:none;gap:6px;align-items:center"><input type="checkbox" id="${p}Old"> Also show today's indicator signals (the autopilot does not trade these)</label></div>
  <div class="wrap"><table id="${p}Sig"></table></div>
  <div class="ixrow"><b>Replay past days</b><select id="${p}RDay" aria-label="Day to replay"></select><button class="btn" id="${p}RRun">Replay</button><label class="sub">Capital ₹ <input id="${p}RCap" type="number" min="1000" step="1000" value="100000" style="width:90px"></label><label class="sub">Charges per trade (%) <input id="${p}RFee" type="number" min="0" max="2" step="0.01" value="0.05" style="width:60px"></label><span class="sub" id="${p}RMsg">Runs the rules above over the last month of 5 and 15 minute candles, or one day. Nothing is traded.</span></div>
  <div id="${p}RRes"></div>
  <div class="sub" id="${p}Log"></div>
 </div>`}
 async function botLoad(){clearTimeout(botTimer);if(mode!=="autopilot")return;
- for(const p in BOTS){try{const d=await (await api("/api/optbot?bot="+BOTS[p].kind)).json();window.botD[p]=d;
+ for(const p in BOTS){try{const d=await (await api("/api/optbot?bot="+BOTS[p].kind+($(p+"Old")&&$(p+"Old").checked?"&old=1":""))).json();window.botD[p]=d;
   if(document.activeElement&&[p+"Mode",p+"Ent",p+"Grade",p+"Max",p+"Lots",p+"Loss"].includes(document.activeElement.id)){}else{$(p+"Mode").value=d.mode==="off"?d.choice:d.mode;$(p+"Ent").value=d.entries;$(p+"Grade").value=d.min_grade;$(p+"Max").value=d.max_trades;$(p+"Lots").value=d.lots;$(p+"Loss").value=d.loss_limit}
-  $(p+"Rules").textContent=d.rules;$(p+"Ent").parentElement.hidden=!d.old_rules;
+  $(p+"Rules").textContent=d.rules;$(p+"Ent").parentElement.hidden=!d.old_rules;$(p+"OldW").style.display=d.old_rules?"none":"flex";
   $(p+"State").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${d.pnl>=0?"+":"-"}₹${Math.abs(d.pnl).toLocaleString("en-IN")}`;
   const pill=$(p+"Pill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";const mm=$(p+"Msg");if(mm.textContent==="Running."&&d.state!=="running")mm.textContent="The autopilot is stopped (the server restarted or it was stopped elsewhere). Press Play to start it.";
   $(p+"Play").disabled=d.state==="running";$(p+"Pause").disabled=d.state!=="running";$(p+"Stop").disabled=d.state==="stopped"&&!d.open;$(p+"Mode").disabled=d.state!=="stopped";
@@ -8843,7 +8998,7 @@ async function atmOption(sy,right,tf,m,what){m.textContent=`Loading the ${sy} op
  }catch(e){m.textContent="Could not load the option chain."}}
 async function apOption(b,p,what){b.disabled=true;try{await atmOption(b.dataset.s,b.dataset.r,b.dataset.tf,$(p+"Msg"),what)}finally{b.disabled=false}}
 function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
- for(const p in BOTS){rpDays(p);for(const k of ["RCap","RFee"])$(p+k).onchange=()=>{const l=window.rpLast&&window.rpLast[p];if(l)rpShow(p,l)};$(p+"RRun").onclick=()=>rpRun(p);$(p+"Past").onchange=()=>botLoad();$(p+"SecF").onchange=()=>sigPaint(p);$(p+"Sig").onclick=e=>{const h=e.target.closest("th[data-sk]");if(h){const k=h.dataset.sk,o=window.sigSort[p];window.sigSort[p]=o&&o.k===k?(o.d===1?{k,d:-1}:null):{k,d:1};sigPaint(p);return}const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
+ for(const p in BOTS){rpDays(p);for(const k of ["RCap","RFee"])$(p+k).onchange=()=>{const l=window.rpLast&&window.rpLast[p];if(l)rpShow(p,l)};$(p+"RRun").onclick=()=>rpRun(p);$(p+"Past").onchange=()=>botLoad();$(p+"SecF").onchange=()=>sigPaint(p);$(p+"Old").onchange=()=>botLoad();$(p+"Sig").onclick=e=>{const h=e.target.closest("th[data-sk]");if(h){const k=h.dataset.sk,o=window.sigSort[p];window.sigSort[p]=o&&o.k===k?(o.d===1?{k,d:-1}:null):{k,d:1};sigPaint(p);return}const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}}
 function confBadge(r){const c=r&&r.conf;if(!c)return "";const tip=`Grade ${c.g}, score ${c.s} of 100\n`+c.w.map(x=>(x[0]?"✓ ":"✗ ")+x[1]).join("\n")+(c.n<8?"\n(Some checks could not be made)":"");return `<span class="cg cg${c.g}" title="${esc(tip)}">${c.g}<small> ${c.s}</small></span>`}
 let btTimer=null;
 const inr=x=>(x<0?"-":"")+"₹"+Math.abs(Math.round(x)).toLocaleString("en-IN");
