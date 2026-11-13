@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-13e"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-13g"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3283,13 +3283,13 @@ AUTO_MOVE_MAX = float(os.getenv("AUTO_MOVE_MAX", "3"))
 AUTO_MOM = os.getenv("AUTO_MOM", "1") != "0"   # extra OR entry for the stock autopilot: a big mover early in the day, with no indicator signal needed
 AUTO_MOM_END = os.getenv("AUTO_MOM_END", "10:00")   # such entries are only taken before this time
 AUTO_MOM_PCT = float(os.getenv("AUTO_MOM_PCT", "2"))   # a stock that moved more than this percent either way qualifies
-AUTO_MOM_TOP = int(os.getenv("AUTO_MOM_TOP", "3"))   # or one of this many biggest gainers / losers
+AUTO_MOM_TOP = int(os.getenv("AUTO_MOM_TOP", "2"))   # sectors traded WITH the NIFTY trend: the best ones while NIFTY is up, the worst ones while it is down
+AUTO_MOM_COUNTER = int(os.getenv("AUTO_MOM_COUNTER", "1"))   # sectors traded against the NIFTY trend: the worst while it is up, the best while it is down
 AUTO_MOM_ATR = float(os.getenv("AUTO_MOM_ATR", "1.5"))   # its stop is this many of the stock's average candle ranges away (the same range the other entries use, kept between 1 and 3)
 AUTO_SENT = os.getenv("AUTO_SENT", "1") != "0"   # stock autopilot: trade the way NIFTY is leaning today (CE when it is up, PE when it is down)
 AUTO_SENT_MIN = float(os.getenv("AUTO_SENT_MIN", "0.1"))   # NIFTY must be at least this far from yesterday's close, up or down, to count as a lean
 AUTO_OLD_RULES = os.getenv("AUTO_OLD_RULES", "0") == "1"   # 1 brings back the indicator-signal entries (fresh and continuation) for the stock autopilot
 AUTO_MOVES = {}   # bot -> {symbol: (change today %, sector)}, kept for the manual list
-AUTO_MOM_ALIGN = os.getenv("AUTO_MOM_ALIGN", "1") != "0"   # an early mover is traded only when the stock moves the same way as NIFTY (a gainer on an up NIFTY, a loser on a down NIFTY)
 AUTO_SEEN = {}   # (user id, bot, symbol, timeframe, signal time, side) -> True: each signal is acted on once
 AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the indicator gives a fresh signal on the 5 minute chart (entries are taken on the 5 minute chart only; the 15 minute chart must be in the same direction: a BUY only while the other chart is also in a BUY zone, a SELL only while it is in a SELL zone, for fresh and continuation trades alike), "
               f"or, only from {AUTO_CONT_START} to {AUTO_CONT_END}, when a signal from an earlier day is still open and the price is back near its trend line. Stop-loss and targets T1 to T4 are the indicator's own: "
@@ -3316,9 +3316,10 @@ def bot_rules(kind):
     if kind == "nifty":
         return AUTO_RULES + " Trades NIFTY only." + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
     tail = f" Everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
-    sent = " It follows NIFTY's sentiment: only CE trades (on gainers) while NIFTY is up on the day, only PE trades (on losers) while it is down." if AUTO_SENT else ""
-    mom = (f"Before {AUTO_MOM_END}, buys an at-the-money option on any F&O stock that is in one of the {AUTO_MOM_TOP} best or worst sectors of the day and has itself moved more than {AUTO_MOM_PCT:g}% either way, "
-           "without waiting for a signal.") if AUTO_MOM else ""
+    sent = " The trades that go with NIFTY are taken first. If NIFTY is flat, nothing is bought." if AUTO_SENT else ""
+    mom = (f"Before {AUTO_MOM_END}, by the NIFTY trend. While NIFTY is down: a PE on stocks in the {AUTO_MOM_TOP} worst sectors of the day and a CE on stocks in the {AUTO_MOM_COUNTER} best sector. "
+           f"While NIFTY is up: a CE on stocks in the {AUTO_MOM_TOP} best sectors and a PE on stocks in the {AUTO_MOM_COUNTER} worst sector. The stock itself must have moved more than {AUTO_MOM_PCT:g}% the same way as its sector. "
+           "No signal is needed.") if AUTO_MOM else ""
     if AUTO_MOM and not AUTO_OLD_RULES:
         return mom + sent + " Stop and targets T1 to T4 come from the stock's own range." + tail + " The Replay below still tests the old indicator-signal rules only; early-mover entries cannot be replayed."
     old = AUTO_RULES + f" Looks at every F&O stock whose move today is between {AUTO_MOVE_MIN:g}% and {AUTO_MOVE_MAX:g}%, up or down."
@@ -3346,15 +3347,16 @@ def nifty_sentiment():
 
 
 def mom_candidates(u, cfg, kind, rows, today, no, manual=False, day=False):
-    """Before AUTO_MOM_END a stock that sits in one of the AUTO_MOM_TOP best or worst sectors of the day and has itself moved more than
-    AUTO_MOM_PCT percent either way is traded without waiting for a signal. The direction follows NIFTY: a CE while NIFTY is up, a PE while it is down.
-    Stop and targets are from the stock's own range."""
+    """Before AUTO_MOM_END, by the NIFTY trend. NIFTY down: a PE on stocks in the AUTO_MOM_TOP worst sectors and a CE on stocks in the AUTO_MOM_COUNTER best sector.
+    NIFTY up: a CE on stocks in the AUTO_MOM_TOP best sectors and a PE on stocks in the AUTO_MOM_COUNTER worst sector. The stock itself must have moved more than
+    AUTO_MOM_PCT percent the same way as its sector. The trades that go with NIFTY come first. Stop and targets are from the stock's own range."""
     out = []
     if kind != "scanner" or not rows or not mom_window_open():
         return out
-    side, nchg = nifty_sentiment()
-    if side is None:
-        no("early movers", "NIFTY is " + ("flat today" if nchg is not None else "not available yet") + f", so there is no direction to trade ({'%+.2f%%' % nchg if nchg is not None else 'no data'})")
+    nside, nchg = nifty_sentiment()
+    ntxt = "NIFTY is not available" if nchg is None else f"NIFTY is {nchg:+.2f}%"
+    if nside is None:   # there is no trend to follow
+        no("early movers", ("NIFTY is flat today (%+.2f%%)" % nchg if nchg is not None else "NIFTY is not available yet") + ", so there is no trend to follow and nothing is bought")
         return out
     mv = [(r, r.get("ltp_chg", r.get("chg"))) for r in rows if r.get("ltp") or r.get("close")]
     mv = [(r, m) for r, m in mv if m is not None]
@@ -3367,9 +3369,10 @@ def mom_candidates(u, cfg, kind, rows, today, no, manual=False, day=False):
             grp.setdefault(sec, []).append(m)
     avg = {k: sum(v) / len(v) for k, v in grp.items() if len(v) >= 2}
     order = sorted(avg, key=lambda k: -avg[k])
-    hot = {k: "gainers" for k in order[:AUTO_MOM_TOP] if avg[k] > 0}
-    hot.update({k: "losers" for k in order[::-1][:AUTO_MOM_TOP] if avg[k] < 0})
-    sg = 1 if side == "BUY" else -1
+    # NIFTY down: sell the AUTO_MOM_TOP worst sectors and buy the AUTO_MOM_COUNTER best one. NIFTY up: buy the AUTO_MOM_TOP best sectors and sell the AUTO_MOM_COUNTER worst one.
+    n_up, n_dn = (AUTO_MOM_TOP, AUTO_MOM_COUNTER) if nside == "BUY" else (AUTO_MOM_COUNTER, AUTO_MOM_TOP)
+    hot = {k: "gainers" for k in order[:n_up] if avg[k] > 0}
+    hot.update({k: "losers" for k in order[::-1][:n_dn] if avg[k] < 0})
     against = 0
     try:
         cctx = conf_context("5m")
@@ -3380,9 +3383,12 @@ def mom_candidates(u, cfg, kind, rows, today, no, manual=False, day=False):
         sec = r.get("sector") or sector_of(sym)
         if sec not in hot or abs(m) <= AUTO_MOM_PCT:   # both must hold: its sector is one of the best or worst, and the stock itself moved more than AUTO_MOM_PCT
             continue
-        if AUTO_MOM_ALIGN and (m > 0) != (side == "BUY"):   # a stock moving against NIFTY is left out instead of being bought the opposite way
+        side = "BUY" if hot[sec] == "gainers" else "SELL"
+        if (m > 0) != (side == "BUY"):   # a stock moving against its own sector is left out
             against += 1
             continue
+        sg = 1 if side == "BUY" else -1
+        aligned = nside == side   # goes the same way as NIFTY
         why = f"{sec} is one of the top {hot[sec]} sectors ({avg[sec]:+.2f}%) and the stock moved {m:+.2f}%"
         it = INTERNAL.get((sym, "5m")) or {}
         atr = it.get("atr")
@@ -3413,10 +3419,10 @@ def mom_candidates(u, cfg, kind, rows, today, no, manual=False, day=False):
         out.append({"symbol": sym, "side": side, "px": px, "levels": lv, "tf": "5m", "etype": "momentum", "grade": g, "score": None, "dist": 0.0, "key": key, "sigkey": skey,
                     "taken": bool(done), "time": ist_now().strftime("%H:%M"), "status": "taken" if done else "passed" if passed else "open", "reason": passed,
                     "chg": round(m, 2), "sector": sec,
-                    "mom": (1 if m * sg > 0 else 0, abs(m)),
-                    "note": f"early mover: {why}; NIFTY is {nchg:+.2f}% so a {'CE' if side == 'BUY' else 'PE'}, no signal needed"})
+                    "mom": (1 if aligned else 0, abs(m)),
+                    "note": f"early mover: {why}, so a {'CE' if side == 'BUY' else 'PE'}; {ntxt}, {'with' if aligned else 'against'} this trade; no signal needed"})
     if against and not day:
-        no("early movers", f"{against} qualifying stock{'s are' if against != 1 else ' is'} moving against NIFTY ({nchg:+.2f}%), so only {'gainers' if side == 'BUY' else 'losers'} are traded")
+        no("early movers", f"{against} stock{'s' if against != 1 else ''} in the top sectors moved against their sector and {'were' if against != 1 else 'was'} skipped")
     return out
 
 
