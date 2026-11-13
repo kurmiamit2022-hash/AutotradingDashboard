@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-12z"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-13b"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5962,6 +5962,71 @@ def chart_data(symbol, tf, at=0, fut=False):
     return out
 
 
+@app.get("/api/recommend")
+def api_recommend(symbol: str):
+    """For one stock or index, on every timeframe: the signal, its grade, whether NIFTY and the sector agree, and what that means for the stock, its nearest futures and an option."""
+    symbol = symbol.upper().strip()
+    if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol) or (symbol not in UNIVERSE and symbol not in INDEX_YF):
+        return JSONResponse({"error": "Unknown symbol."}, status_code=400)
+    nside, nchg = nifty_sentiment()
+    out = {"symbol": symbol, "nifty": {"side": nside, "chg": None if nchg is None else round(nchg, 2)}, "fut": None, "tfs": {}}
+    try:
+        f = next((x for x in (near_future(symbol, n) for n in ("dhan", "angel")) if x), None)
+        if f:
+            out["fut"] = {"expiry": f[0].strftime("%d %b %Y"), "lot": f[3] or bt_lot_for(symbol)}
+        elif bt_lot_for(symbol):
+            out["fut"] = {"expiry": None, "lot": bt_lot_for(symbol)}
+    except Exception:
+        pass
+    for t in INTERVALS:
+        with LOCK:
+            row = next((dict(r) for r in STATES[t]["rows"] if r["symbol"] == symbol), None)
+        if not row:
+            out["tfs"][t] = {"scanned": False}
+            continue
+        try:
+            row = apply_live([row])[0]
+        except Exception:
+            pass
+        side = row.get("side") if row.get("signal") not in (None, "–") else None
+        item = {"scanned": True, "signal": row.get("signal") or "–", "side": side, "status": row.get("status"), "signal_time": row.get("signal_time"),
+                "bars_ago": row.get("bars_ago"), "chg": row.get("ltp_chg", row.get("chg")), "sector": row.get("sector"), "grade": None, "score": None,
+                "pts": 0, "reasons": [], "verdict": "No trade"}
+        sec_dir = (SECTOR_CHARTS.get(t, {}).get(row.get("sector")) or {}).get("direction")
+        item["sector_dir"] = sec_dir
+        if side:
+            for k in ("entry", "sl", "tp1", "tp2", "tp3", "tp4"):
+                item[k] = row.get(k)
+            try:
+                c = conf_row(row, t, conf_context(t))
+            except Exception:
+                c = None
+            if c:
+                item["grade"], item["score"] = c["g"], c["s"]
+            pts, why = 0, item["reasons"]
+            want = "BUY" if side == "BUY" else "SELL"
+            if nside:
+                ok = nside == want
+                pts += 1 if ok else -1
+                why.append(f"NIFTY is {'up' if nside == 'BUY' else 'down'} today, {'the same way as' if ok else 'against'} this {side.lower()}")
+            if sec_dir in ("Up", "Down"):
+                ok = (sec_dir == "Up") == (side == "BUY")
+                pts += 1 if ok else -1
+                why.append(f"its sector is trending {sec_dir.lower()}, {'with' if ok else 'against'} this trade")
+            if item["grade"] in ("A", "B"):
+                pts += 1
+                why.append(f"signal grade {item['grade']}")
+            elif item["grade"] == "C":
+                why.append("signal grade C (weak)")
+            if row.get("status") and not str(row["status"]).startswith("Open"):
+                pts -= 1
+                why.append(f"the signal is already over ({row['status']})")
+            item["pts"] = pts
+            item["verdict"] = "Favourable" if pts >= 2 else "Against" if pts <= -1 else "Mixed"
+        out["tfs"][t] = item
+    return JSONResponse(out)
+
+
 @app.get("/api/sectors")
 def api_sectors(tf: str = DEFAULT_INTERVAL):
     tf = tf if tf in INTERVALS else DEFAULT_INTERVAL
@@ -8164,7 +8229,7 @@ td.pick-pe{box-shadow:inset 0 0 0 2px var(--sell);font-weight:700}
 .px{display:inline-block;min-width:52px}
 dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0;width:min(460px,92vw)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
-#chartDlg,#optDlg{width:min(1100px,96vw);max-width:96vw}.kb{background:none;border:0;color:inherit;font:inherit;font-weight:700;cursor:pointer;padding:2px 4px;border-radius:6px}.kb:hover{background:var(--line)}.kb span{font-size:11px;opacity:.7}.ogtip{font-size:13px;min-height:20px;margin:6px 0;color:var(--ink)}.ogsum{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-top:10px;font-size:13px}.ogsum div{padding:8px 10px;border:1px solid var(--line);border-radius:10px}#ogSvg{overflow-x:auto;max-width:100%}#ogSvg svg{display:block;touch-action:pan-x pan-y}#ogSvg text{fill:var(--mute);font-size:10px}#ogSvg .ax{stroke:var(--line);stroke-width:1}#ogSvg .xh{stroke:var(--acc);stroke-width:1;stroke-dasharray:3 3}
+#chartDlg,#optDlg{width:min(1100px,96vw);max-width:96vw}.kb{background:none;border:0;color:inherit;font:inherit;font-weight:700;cursor:pointer;padding:2px 4px;border-radius:6px}.kb:hover{background:var(--line)}.kb span{font-size:11px;opacity:.7}.ogtip{font-size:13px;min-height:20px;margin:6px 0;color:var(--ink)}.ogsum{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin-top:10px;font-size:13px}.ogsum div{padding:8px 10px;border:1px solid var(--line);border-radius:10px}#ogSvg{overflow-x:auto;max-width:100%}#ogSvg svg{display:block;touch-action:pan-x pan-y}#ogSvg text{fill:var(--mute);font-size:10px}#ogSvg .ax{stroke:var(--line);stroke-width:1}#ogSvg .xh{stroke:var(--acc);stroke-width:1;stroke-dasharray:3 3}
 .chbox{padding:14px 16px}.chhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}.chhead b{font-size:18px}
 .chtfs{display:flex;gap:4px;margin-left:auto}.chtfs button{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:4px 12px;cursor:pointer;font:inherit}
 .chtfs button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
@@ -8173,6 +8238,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .cwrap{display:grid;grid-template-columns:270px minmax(0,1fr);gap:12px;align-items:start}
 .cwl{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px}
 .cwl input,.cwl select{width:100%;box-sizing:border-box}
+.rcgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin:8px 0}.rcc{border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:13px}.rcc h4{margin:0 0 6px;font-size:15px}.rcl{display:grid;grid-template-columns:62px 1fr;gap:8px;padding:5px 0;border-top:1px solid var(--line)}.rcl>span{color:var(--mute);font-size:12px}.rcw{margin:4px 0 0;padding-left:16px;font-size:12px;color:var(--mute)}
 #cwList{height:min(66vh,640px);overflow-y:auto;display:flex;flex-direction:column;gap:2px}
 #cwList button{display:flex;align-items:center;gap:6px;justify-content:space-between;text-align:left;border:0;background:transparent;color:var(--ink);padding:7px 8px;border-radius:8px;cursor:pointer;font:inherit}
 #cwList button:hover{background:rgba(120,120,160,.12)}#cwList button[aria-selected=true]{background:var(--ink);color:var(--panel)}
@@ -8239,6 +8305,10 @@ h1::before{content:"";width:12px;height:26px;border-radius:4px;background:linear
 .mode button{border-radius:10px;border-bottom:0;margin:0;padding:8px 16px;white-space:nowrap}
 .mode button[aria-pressed=true]{background:var(--g);color:#fff}
 .mode button:hover{background:var(--flat)}.mode button[aria-pressed=true]:hover{background:var(--g)}
+.mode button[data-m=charts]{font-weight:800;color:#c2410c;letter-spacing:.2px}
+.mode button[data-m=charts][aria-pressed=true],.mode button[data-m=charts][aria-pressed=true]:hover{background:linear-gradient(135deg,#f97316,#dc2626);color:#fff}
+:root[data-theme=dark] .mode button[data-m=charts]:not([aria-pressed=true]){color:#fdba74}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]) .mode button[data-m=charts]:not([aria-pressed=true]){color:#fdba74}}
 .idx div{border:0;box-shadow:var(--shadow);position:relative;overflow:hidden;background:linear-gradient(160deg,var(--panel),var(--flat))}
 .idx div::after{content:"";position:absolute;right:-18px;top:-18px;width:70px;height:70px;border-radius:50%;background:var(--g);opacity:.18}
 .sectors button{border:0;box-shadow:var(--shadow);transition:transform .12s,box-shadow .12s}
@@ -8320,7 +8390,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="options">Options</button><button data-m="scanner">Intraday Scanner</button><button data-m="charts">Charts</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -8330,40 +8400,13 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
 <div class="note" id="note"></div>
 </section>
-<section id="view-options" hidden>
-<div class="ogrid" id="ogrid">
- <aside class="olist" aria-label="Scripts">
-  <input id="osym" placeholder="Search a stock or index" aria-label="Search scripts" autocomplete="off">
-  <select id="osec" aria-label="Sector"><option value="ALL">All sectors</option></select>
-  <select id="ofilt" aria-label="Show"><option value="all">All scripts</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option></select>
-  <select id="osort" aria-label="Sort"><option value="sig">Sort: signal</option><option value="name">Sort: name A to Z</option><option value="up">Sort: gainers first</option><option value="down">Sort: losers first</option><option value="move">Sort: biggest move, up or down</option></select>
-  <div class="orows" id="chips"></div>
- </aside>
- <div class="omain">
-  <div class="osum" id="osum" hidden></div>
-  <div class="card ochart" id="ochartc" hidden>
-   <div class="ixrow"><div class="seg" id="ocSeg" role="group" aria-label="Graph type"></div><label class="chk"><input type="checkbox" id="ocOn" checked> Show graph</label>
-    <span class="oleg"><i style="background:#ff9f43"></i>Calls <i style="background:#35c9ff"></i>Puts</span><span class="sub" id="ocNote"></span></div>
-   <div class="wrap" id="ocSvg"></div></div>
-  <label class="more"><input type="checkbox" id="omore"> Show volume and IV</label>
-  <div class="wrap"><table class="otab" id="otable"></table></div>
-  <div class="note" id="onote">Pick a script on the left. Every F&amp;O stock and index has a chain. Sensex and Bankex chains are priced by your broker and show no open interest.</div>
- </div>
-</div>
-</section>
-<section id="view-scanner" hidden>
-<div class="ixrow"><div class="seg" id="scTfs" role="group" aria-label="Timeframe"></div>
- <b class="scttl" id="scTtl">Top 15 by traded value today</b>
- <label class="chk"><input type="checkbox" id="scOnly"> Only with a signal</label> <label class="chk"><input type="checkbox" id="scConf"> Grade A only</label><span class="sub" id="scMeta"></span></div>
-<div class="wrap"><table id="scTable"></table></div>
-
-</section>
 <section id="view-charts" hidden>
 <div class="cwrap">
  <aside class="cwl" aria-label="Watchlist">
   <input id="cwQ" placeholder="Search symbol" aria-label="Search symbol" autocomplete="off">
   <select id="cwSec" aria-label="Sector"><option value="ALL">All sectors</option></select>
-  <select id="cwSort" aria-label="Sort"><option value="az">A to Z</option><option value="chg">% change, highest first</option><option value="chgd">% change, lowest first</option><option value="sig">Signals first</option></select>
+  <select id="cwShow" aria-label="Show"><option value="all">All symbols</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option></select>
+  <select id="cwSort" aria-label="Sort"><option value="az">A to Z</option><option value="chg">% change, highest first</option><option value="chgd">% change, lowest first</option><option value="sig">Signals first</option><option value="move">Biggest move, up or down</option></select>
   <div id="cwList" role="listbox" aria-label="Symbols" tabindex="0"></div>
  </aside>
  <div class="cwm">
@@ -8375,6 +8418,17 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="chleg" id="cwLeg"></div><div id="cwMsg" class="tkmsg" role="status"></div>
   <div id="cwChart"></div>
   <p class="sub">Press ↑ or ↓ to move to the previous or next symbol, ← or → to change the timeframe.</p>
+  <div class="card" id="cwReco" aria-live="polite"></div>
+  <h3 class="scttl" style="margin:14px 0 6px">Options data</h3>
+  <div class="osum" id="osum" hidden></div>
+    <div class="card ochart" id="ochartc" hidden>
+     <div class="ixrow"><div class="seg" id="ocSeg" role="group" aria-label="Graph type"></div><label class="chk"><input type="checkbox" id="ocOn" checked> Show graph</label>
+      <span class="oleg"><i style="background:#ff9f43"></i>Calls <i style="background:#35c9ff"></i>Puts</span><span class="sub" id="ocNote"></span></div>
+     <div class="wrap" id="ocSvg"></div></div>
+    <label class="more"><input type="checkbox" id="omore"> Show volume and IV</label>
+    <div class="wrap"><table class="otab" id="otable"></table></div>
+    <div class="note" id="onote">Pick a script on the left. Every F&amp;O stock and index has a chain. Sensex and Bankex chains are priced by your broker and show no open interest.</div>
+  
  </div>
 </div>
 </section>
@@ -8594,7 +8648,7 @@ document.getElementById("refresh").onclick=async()=>{const b=document.getElement
 document.getElementById("tfs").onclick=e=>{const b=e.target.closest("button");if(!b||b.dataset.tf===tf)return;
  tf=b.dataset.tf;try{localStorage.setItem("tf",tf)}catch(x){}
  data=null;document.getElementById("body").innerHTML=`<tr><td colspan="14" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;
- optOverride="";document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(osym)loadChain();if(mode==="history")loadHistory()};
+ optOverride="";document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(mode==="charts")cwShow();if(mode==="history")loadHistory()};
 let tickT=null,tickBusy=false;
 async function tick(){clearTimeout(tickT);
  try{if(mode==="stocks"&&data&&data.feed&&data.feed.source&&!document.hidden&&!tickBusy){tickBusy=true;const asked=tf;const d=await (await api("/api/ticks?tf="+asked)).json();tickBusy=false;
@@ -8627,7 +8681,7 @@ function cellFor(r,k){
 function render(){
  if(!data)return;
  document.getElementById("tfs").innerHTML=data.intervals.map(x=>`<button data-tf="${x}" aria-pressed="${x===tf}">${tfName[x]||x}</button>`).join("");
- renderChips();
+ if(mode==="charts"&&cw.ready)cwBuild();
  const fut=mode==="futures";
  const rows=fut?data.rows:data.rows.filter(r=>r.type!=="index");
  rows.forEach(r=>{const f=futInfo[r.symbol];r.lot=f?f.lot:null;r.fexp=f?f.expiry:null});
@@ -8665,7 +8719,10 @@ function render(){
 // ── Options tab ──
 let mode="stocks",osym="",oexp="",oreq=0;
 let optOverride="";
-const optTf=()=>optOverride||tf||"";
+const optTf=()=>mode==="charts"?cw.tf:(optOverride||tf||"");
+const chainMem={};
+function chainFetch(sym,exp,tfv){const u=`/api/options/chain?symbol=${encodeURIComponent(sym)}&tf=${tfv}`+(exp?`&expiry=${encodeURIComponent(exp)}`:"");const h=chainMem[u];
+ if(h&&Date.now()-h.at<15000)return h.p;const p=api(u).then(r=>r.json());chainMem[u]={at:Date.now(),p};p.catch(()=>{delete chainMem[u]});return p}
 try{mode=localStorage.getItem("mode")||"stocks"}catch(e){}
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(a>=1e7?(a/1e7).toFixed(2)+" Cr":a>=1e5?(a/1e5).toFixed(2)+" L":a>=1e3?(a/1e3).toFixed(1)+" K":String(Math.round(a)))};
@@ -8679,21 +8736,21 @@ function cwRows(){return data?data.rows:[]}
 function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec=$("cwSec").value,so=$("cwSort").value;
  const secs=[...new Set(rows.map(r=>r.type==="index"?"Indices":(r.sector||"Others")))].sort();
  if($("cwSec").options.length!==secs.length+1){$("cwSec").innerHTML='<option value="ALL">All sectors</option>'+secs.map(x=>`<option>${esc(x)}</option>`).join("");$("cwSec").value=secs.includes(sec)?sec:"ALL"}
- let v=rows.filter(r=>(!q||r.symbol.includes(q))&&($("cwSec").value==="ALL"||(r.type==="index"?"Indices":(r.sector||"Others"))===$("cwSec").value));
+ let v=rows.filter(r=>{const g=r.signal||"–",f=$("cwShow").value;return f==="all"||(f==="sig"?g!=="–":g.includes(f))}).filter(r=>(!q||r.symbol.includes(q))&&($("cwSec").value==="ALL"||(r.type==="index"?"Indices":(r.sector||"Others"))===$("cwSec").value));
  const ch=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?-999:c},sg=r=>(r.signal&&r.signal!=="–")?0:1;
- v.sort((a,b)=>(a.type==="index"?0:1)-(b.type==="index"?0:1)||(so==="chg"?ch(b)-ch(a):so==="chgd"?ch(a)-ch(b):so==="sig"?sg(a)-sg(b)||a.symbol.localeCompare(b.symbol):a.symbol.localeCompare(b.symbol)));
- cw.view=v.map(r=>r.symbol);
+ v.sort((a,b)=>(a.type==="index"?0:1)-(b.type==="index"?0:1)||(so==="chg"?ch(b)-ch(a):so==="chgd"?ch(a)-ch(b):so==="move"?Math.abs(ch(b)===-999?0:ch(b))-Math.abs(ch(a)===-999?0:ch(a)):so==="sig"?sg(a)-sg(b)||a.symbol.localeCompare(b.symbol):a.symbol.localeCompare(b.symbol)));
+ cw.view=v.map(r=>r.symbol);const keepTop=$("cwList").scrollTop;
  $("cwList").innerHTML=v.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,sg=r.signal&&r.signal!=="–"?(r.side==="BUY"?"BUY":"SELL"):"";
-  return `<button role="option" data-s="${esc(r.symbol)}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${esc(r.symbol)}</span><span>${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>'}
+  return `<button role="option" data-s="${esc(r.symbol)}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${esc(r.symbol)}</span><span>${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
 function cwMark(){document.querySelectorAll("#cwList button").forEach(b=>{const on=b.dataset.s===cw.sym;b.setAttribute("aria-selected",on);if(on)b.scrollIntoView({block:"nearest"})})}
 function cwShow(){if(!cw.ready){cw.ready=true;
-  $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSort").onchange=()=>cwBuild();
+  $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSort").onchange=()=>cwBuild();$("cwShow").onchange=()=>cwBuild();
   $("cwList").onclick=e=>{const b=e.target.closest("button[data-s]");if(b)cwPick(b.dataset.s)};
   $("cwInst").onclick=e=>{const b=e.target.closest("button");if(!b)return;cw.inst=b.dataset.i;cw.exp="";cw.strike=null;cwSave();cwPaintCtl();cwLoad()};
   $("cwTf").onclick=e=>{const b=e.target.closest("button");if(b)cwTf(b.dataset.t)};
   $("cwSide").onclick=e=>{const b=e.target.closest("button");if(b){cw.side=b.dataset.r;cwSave();cwPaintCtl();cwLoad()}};
   $("cwDays").onclick=e=>{const b=e.target.closest("button");if(b){cw.days=+b.dataset.d;cwSave();cwPaintCtl();cwLoad()}};
-  $("cwExp").onchange=()=>{cw.exp=$("cwExp").value;cw.strike=null;cwLoad()};
+  $("cwExp").onchange=()=>{cw.exp=$("cwExp").value;oexp=cw.exp;cw.strike=null;loadChain();cwLoad()};
   $("cwStrike").onchange=()=>{cw.strike=+$("cwStrike").value;cwLoad()};
   document.addEventListener("keydown",cwKey)}
  if(!data){$("cwMsg").textContent="Loading symbols…";setTimeout(()=>{if(mode==="charts")cwShow()},1200);return}
@@ -8706,9 +8763,39 @@ function cwPick(sym){if(!sym)return;cw.sym=sym;cw.exp="";cw.strike=null;cwSave()
 function cwKey(e){if(mode!=="charts"||e.ctrlKey||e.metaKey||e.altKey)return;const el=document.activeElement,tg=el&&el.tagName;if(tg==="INPUT"||tg==="TEXTAREA"||tg==="SELECT"||$("chartDlg").open||$("optDlg").open)return;
  if(e.key==="ArrowDown"||e.key==="ArrowUp"){e.preventDefault();const i=cw.view.indexOf(cw.sym),n=cw.view.length;if(!n)return;cwPick(cw.view[Math.max(0,Math.min(n-1,(i<0?0:i+(e.key==="ArrowDown"?1:-1))))])}
  else if(e.key==="ArrowLeft"||e.key==="ArrowRight"){e.preventDefault();const T=["5m","15m","1d"],i=T.indexOf(cw.tf);cwTf(T[Math.max(0,Math.min(2,i+(e.key==="ArrowRight"?1:-1)))])}}
-async function cwChain(sym){if(cw.chain[sym]&&Date.now()-cw.chain[sym].at<120000)return cw.chain[sym].d;
- const d=await (await api(`/api/options/chain?symbol=${encodeURIComponent(sym)}&tf=${tf||"15m"}`)).json();cw.chain[sym]={at:Date.now(),d};return d}
+function cwChain(sym){return chainFetch(sym,cw.exp,cw.tf)}
+let cwRecSym="";
+async function cwRecLoad(sym,quiet){if(!sym)return;if(!quiet){cw.rec=null;cwRecoPaint()}
+ try{const d=await (await api("/api/recommend?symbol="+encodeURIComponent(sym))).json();if(sym===cw.sym){cw.rec=d.error?null:d;cwRecoPaint()}}catch(e){}}
+function cwRecoPaint(){const box=$("cwReco");if(!box)return;const R=cw.rec;
+ if(!R||R.symbol!==cw.sym){box.innerHTML='<div class="sub">Loading the recommendation…</div>';return}
+ const ch=lastChain&&lastChain.symbol===cw.sym?lastChain:null,atm=ch?ch.rows.find(r=>r.strike===ch.atm):null;
+ const nf=R.nifty&&R.nifty.chg!=null?`NIFTY <b class="${R.nifty.chg>=0?"up":"dn"}">${R.nifty.chg>0?"+":""}${R.nifty.chg.toFixed(2)}%</b> (${R.nifty.side==="BUY"?"calls favoured":R.nifty.side==="SELL"?"puts favoured":"flat"})`:"NIFTY n/a";
+ const pcr=ch&&ch.pcr!=null?`PCR <b>${ch.pcr}</b> (${ch.pcr>=1.2?"leans bullish":ch.pcr<=0.8?"leans bearish":"neutral"})`:"";
+ const oi=ch&&ch.max_pe!=null?`Put OI wall <b>${ch.max_pe}</b> (support) · Call OI wall <b>${ch.max_ce}</b> (resistance)`:"";
+ const fu=R.fut?`Futures: ${R.fut.expiry?esc(R.fut.expiry)+", ":""}lot ${R.fut.lot||"?"}`:"No futures contract found";
+ const cards=["5m","15m","1d"].map(t=>{const x=R.tfs[t]||{};const nm=tfName[t]||t;
+  if(!x.scanned)return `<div class="rcc"><h4>${nm}</h4><p class="sub">Not scanned yet. Switch the main timeframe to ${nm} once, or wait for the next scan.</p></div>`;
+  if(!x.side)return `<div class="rcc"><h4>${nm} <span class="pill">–</span></h4><p class="sub">No active signal on ${nm} candles, so no stock, futures or option trade is suggested. Wait for one.</p></div>`;
+  const buy=x.side==="BUY",cls=buy?"up":"dn";
+  const opt=atm?(()=>{const l=atm[buy?"ce":"pe"].ltp;return l==null?"Option price not available":`Buy ATM <b>${ch.atm} ${buy?"CE":"PE"}</b> at ₹${f2(l)}<span class="sub"> · exit if the stock closes ${buy?"below":"above"} ${f2(x.sl)}</span> <button class="mini go" data-rc="opt" data-t="${t}">Buy ${buy?"CE":"PE"}</button>`})():'<span class="sub">Loading the chain…</span>';
+  const fut=R.fut&&R.fut.lot?`${x.side} 1 lot (${R.fut.lot} qty), about ₹${Math.round(R.fut.lot*x.entry).toLocaleString("en-IN")}<span class="sub"> · same stop and targets as the stock</span> <button class="mini go" data-rc="fut" data-t="${t}">${buy?"Buy":"Sell"} futures</button>`:'<span class="sub">No futures lot found</span>';
+  return `<div class="rcc"><h4>${nm} <span class="pill ${esc(x.signal.replace(" ","_"))}">${esc(x.signal)}</span> <span class="sub">${esc(x.signal_time||"")}${x.grade?` · grade ${x.grade}`:""}</span></h4>
+   <div class="rcl"><span>Stock</span><div><b class="${cls}">${x.side}</b> near ${f2(x.entry)}<br><span class="sub">stop ${f2(x.sl)} · T1 ${f2(x.tp1)} · T2 ${f2(x.tp2)} · T3 ${f2(x.tp3)} · T4 ${f2(x.tp4)}</span> <button class="mini go" data-rc="eq" data-t="${t}">${buy?"Buy":"Sell"} stock</button></div></div>
+   <div class="rcl"><span>Futures</span><div>${fut}</div></div>
+   <div class="rcl"><span>Option</span><div>${opt}</div></div>
+   <div class="rcl"><span>Verdict</span><div><span class="pill ${x.verdict==="Favourable"?"BUY":x.verdict==="Against"?"SELL":""}">${x.verdict}</span><ul class="rcw">${(x.reasons||[]).map(r=>`<li>${esc(r)}</li>`).join("")}</ul></div></div></div>`}).join("");
+ box.innerHTML=`<div class="ixrow"><b class="scttl">Recommendation: ${esc(R.symbol)}</b><span class="sub">${nf}${pcr?" · "+pcr:""}${oi?" · "+oi:""} · ${fu}</span></div>
+  <div class="rcgrid">${cards}</div>
+  <p class="sub">A rule-based reading of the signal, NIFTY, the sector and the option chain. It is not advice and does not guarantee a result. Check the price and the risk before you trade.</p>`}
+document.addEventListener("click",e=>{const b=e.target.closest("[data-rc]");if(!b||!cw.rec)return;const R=cw.rec,x=R.tfs[b.dataset.t]||{},sym=R.symbol;if(!x.side)return;
+ if(b.dataset.rc==="eq")openTicket({kind:"equity",symbol:sym,label:sym,side:x.side,price:x.entry,tf:b.dataset.t});
+ else if(b.dataset.rc==="fut")openTicket({kind:"future",symbol:sym,label:sym+" futures, nearest month",side:x.side,price:x.entry,tf:b.dataset.t});
+ else if(b.dataset.rc==="opt"&&lastChain&&lastChain.symbol===sym){const r=lastChain.rows.find(z=>z.strike===lastChain.atm),right=x.side==="BUY"?"CE":"PE",l=r&&r[right.toLowerCase()].ltp;
+  openTicket({kind:"option",symbol:sym,expiry:lastChain.expiry,strike:lastChain.atm,right,side:"BUY",price:l,label:`${sym} ${lastChain.atm} ${right} ${lastChain.expiry}`,tf:b.dataset.t})}});
 async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
+ {const k=sym+"|"+cw.tf,same=(cw.optKey||"").split("|")[0]===sym;if(cw.optKey!==k){cw.optKey=k;osym=sym;if(!same)oexp="";loadChain(same)}
+  if(cwRecSym!==sym){cwRecSym=sym;cwRecLoad(sym)}}
  $("cwTitle").textContent=sym+(cw.inst==="fut"?" futures (nearest month)":"");$("cwMsg").textContent="Loading chart…";$("cwLeg").innerHTML="";
  try{await loadLW()}catch(e){$("cwMsg").textContent="The chart library did not load. Reload the page and try again.";return}
  let candles,lines=null,legend=[],markers=[],levels=null,intraday=true;
@@ -8748,58 +8835,22 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
   lv(levels.entry,ink,"Entry",0);lv(levels.sl,dn,"SL"+(levels.sl_hit?" ✖":""),0);levels.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(levels.hits>i?" ✓":""),2))}
  $("cwLeg").innerHTML=legend.join("");ch.timeScale().fitContent();if(candles.length>120)ch.timeScale().setVisibleLogicalRange({from:candles.length-120,to:candles.length+4})}
 function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}}
-function setMode(m){if(m==="index")m="options";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
- const vm={stocks:"stocks",futures:"stocks",charts:"charts",options:"options",scanner:"scanner",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
- ["stocks","charts","options","scanner","commodities","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
+ const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","charts","commodities","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  if(m==="charts")cwShow();
  if(m==="commodities"){cmPaint();cmLoad()}else clearTimeout(cmTimer);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
- if(m==="scanner"){scPaint();scLoad()}else clearTimeout(scTimer);
  if(m==="autopilot")botLoad();else clearTimeout(botTimer);
- if(m==="orders")loadOrders();if(m==="options")renderChips();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
+ if(m==="orders")loadOrders();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
 function initConf(){$("confOnly").onchange=()=>render()}
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
-function renderChips(){
- if(!data)return;
- const box=document.getElementById("chips"),keep=box.scrollTop;
- const by={};data.rows.forEach(r=>by[r.symbol]=r);
- const all=(data.indices||[]).concat(data.symbols||[]);
- const text=document.getElementById("osym").value.trim().toUpperCase(),fl=document.getElementById("ofilt").value;
- const ss=document.getElementById("osec"),sec=ss.value;
- const secs=[...new Set(data.rows.map(r=>r.sector||"Others"))].sort();
- if(ss.options.length!==secs.length+1){ss.innerHTML='<option value="ALL">All sectors</option>'+secs.map(x=>`<option>${esc(x)}</option>`).join("");ss.value=secs.includes(sec)?sec:"ALL"}
- const list=all.filter(n=>{const sg=(by[n]||{}).signal||"–";
-  if(text&&!n.includes(text))return false;
-  if(sec!=="ALL"&&((by[n]||{}).sector||(data.indices||[]).includes(n)&&"Indices"||"Others")!==sec)return false;
-  return fl==="all"||(fl==="sig"?sg!=="–":sg.includes(fl))});
- const so=document.getElementById("osort").value,ch=n=>{const r=by[n];if(!r)return null;const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?null:c};
- list.sort((a,b)=>{
-  if(so!=="sig"&&so!=="name"){const ca=ch(a),cb=ch(b);if(ca==null||cb==null){if(ca!==cb)return ca==null?1:-1}else{const d=so==="up"?cb-ca:so==="down"?ca-cb:Math.abs(cb)-Math.abs(ca);if(d)return d}return a.localeCompare(b)}
-  if(so==="name")return a.localeCompare(b);
-  const ra=by[a]?rank[by[a].signal]:99,rb=by[b]?rank[by[b].signal]:99;return (ra??99)-(rb??99)||a.localeCompare(b)});
- box.innerHTML=list.length?list.map(n=>{const sg=(by[n]||{}).signal||"–";
-  const c=by[n]?(by[n].ltp_chg!=null?by[n].ltp_chg:by[n].chg):null;
-  return `<button class="orow" data-s="${esc(n)}" aria-pressed="${n===osym}"><span>${esc(n)}</span><span class="ochg ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span>${sg==="–"?'<span class="none">–</span>':`<span class="pill ${sg.replace(" ","_")}">${sg}</span>`}</button>`}).join(""):`<div class="sub" style="padding:12px">No scripts match.</div>`;
- box.scrollTop=keep;
-}
-document.getElementById("chips").onclick=e=>{const b=e.target.closest(".orow");if(b){optOverride="";osym=b.dataset.s;oexp="";loadChain()}};
-document.getElementById("osym").oninput=renderChips;
-document.getElementById("ofilt").onchange=renderChips;
-document.getElementById("osec").onchange=renderChips;
-try{const sv=localStorage.getItem("osort");if(sv&&[...document.getElementById("osort").options].some(o=>o.value===sv))document.getElementById("osort").value=sv}catch(e){}
-document.getElementById("osort").onchange=()=>{try{localStorage.setItem("osort",document.getElementById("osort").value)}catch(e){}renderChips()};
-document.getElementById("osym").onkeydown=e=>{if(e.key!=="Enter")return;
- const t=e.target.value.trim().toUpperCase();if(!t)return;
- const all=((data&&data.indices)||[]).concat((data&&data.symbols)||[]);
- osym=all.includes(t)?t:(all.find(n=>n.startsWith(t))||t);oexp="";loadChain()};
 document.getElementById("omore").onchange=()=>{if(lastChain)renderChain(lastChain)};
 async function loadChain(quiet){
  if(!osym)return;const my=++oreq,box=document.getElementById("onote");
  if(!quiet){document.getElementById("otable").innerHTML="";document.getElementById("osum").hidden=true;box.textContent=`Loading the ${osym} option chain…`}
- renderChips();
- try{const u=`/api/options/chain?symbol=${encodeURIComponent(osym)}&tf=${optTf()}`+(oexp?`&expiry=${encodeURIComponent(oexp)}`:"");
-  const d=await (await api(u)).json();if(my!==oreq)return;renderChain(d)}
+ try{const d=await chainFetch(osym,oexp,optTf());if(my!==oreq)return;renderChain(d)}
  catch(e){if(my===oreq)box.textContent="Cannot reach the server."}
 }
 // ── new-signal flashing, toast, page title and optional sound ──
@@ -9062,7 +9113,7 @@ function initScanner(){
   const b=e.target.closest("[data-sc]");if(!b)return;const sy=b.dataset.s;
   if(b.dataset.sc==="chart")openChart(sy,scTf);
   else if(b.dataset.sc==="fut")openTicket({kind:"future",symbol:sy,label:sy+" futures, nearest month",side:b.dataset.side,price:+b.dataset.p,tf:scTf});
-  else{optOverride=scTf;osym=sy;oexp="";setMode("options");loadChain()}}}
+  else{cw.sym=sy;cw.tf=scTf;cw.inst="opt";cw.exp="";cw.strike=null;cwSave();setMode("charts")}}}
 // ── chart popup (TradingView's open-source Lightweight Charts) ──
 let lwPromise=null,chSym="",chTf="",chAt=0,chObj=null;
 function loadLW(){if(window.LightweightCharts)return Promise.resolve();
@@ -9227,7 +9278,7 @@ function renderChain(d){
  if(others)h+=`<div class="osl"><span>Other timeframes:</span>${others}<span class="sub">(only those already scanned)</span></div>`;
  ol.innerHTML=h;
  const sb=document.getElementById("osug");if(sb)sb.onclick=()=>openTicket({kind:"option",symbol:d.symbol,expiry:d.expiry,strike:+sb.dataset.strike,right:sb.dataset.right,side:"BUY",price:+sb.dataset.ltp,label:`${d.symbol} ${+sb.dataset.strike} ${sb.dataset.right} ${d.expiry}`});
- document.getElementById("oexp").onchange=e=>{oexp=e.target.value;loadChain()};
+ document.getElementById("oexp").onchange=e=>{oexp=e.target.value;cw.exp=oexp;loadChain();if(cw.inst==="opt")cwLoad()};
  const more=document.getElementById("omore").checked,cls=(...a)=>a.filter(Boolean).join(" ");
  const iv=l=>l.iv==null?"–":l.iv.toFixed(1);
  const rows=d.rows.map(r=>{const atm=r.strike===d.atm;
@@ -9242,7 +9293,8 @@ function renderChain(d){
  tb.innerHTML=`<thead><tr><th class="g" colspan="${cH.length}">Calls</th><th class="k" rowspan="2">Strike</th><th class="g" colspan="${pH.length}">Puts</th></tr><tr>${cH.map(h=>`<th>${h}</th>`).join("")}${pH.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${rows}</tbody>`;
  box.textContent=(d.note?d.note+" ":"")+(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The signal is calculated on the underlying's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click B or S beside a price to buy or sell that option.";
 }
-setInterval(()=>{if(mode==="options"&&osym)loadChain(true)},60000);
+{const _rc=renderChain;renderChain=function(d){_rc(d);try{cwRecoPaint()}catch(e){}}}
+setInterval(()=>{if(mode==="charts"&&osym){loadChain(true);cwRecLoad(cw.sym,true)}},60000);
 // ── Orders and order ticket ──
 let tk=null,tkToken=null,tradeInfo={mode:"paper",caps:{}},lastChain=null;
 const $=id=>document.getElementById(id);
@@ -9285,7 +9337,7 @@ $("tkQty").addEventListener("input",fundsPaint);
 $("tkFunds").onclick=e=>{if(e.target.id==="tkMax"&&fundsInfo&&fundsInfo.max_qty!=null){$("tkQty").value=Math.max(1,fundsInfo.max_qty);resetReview();fundsPaint()}};
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-initChart();initFlash();initModes();initScanner();initBot();initBacktest();initConf();initInstall();initChainGraph();
+initChart();initFlash();initModes();initBot();initBacktest();initConf();initInstall();initChainGraph();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
  $("tkMsg").textContent="Checking the order…";
@@ -9305,7 +9357,7 @@ $("body").onclick=e=>{const cb=e.target.closest("[data-chart]");if(cb){openChart
  const b=e.target.closest("[data-trade]");if(!b||!data)return;const r=data.rows.find(x=>x.symbol===b.dataset.trade);if(!r)return;
  const side=r.signal.endsWith("SELL")?"SELL":"BUY";
  openTicket(mode==="futures"?{kind:"future",symbol:r.symbol,label:r.symbol+" futures, nearest month",side,price:r.close}:{kind:"equity",symbol:r.symbol,label:r.symbol,side,price:r.close})};
-$("otable").onclick=e=>{const kb=e.target.closest(".kb");if(kb&&lastChain){openOptChart(+kb.dataset.k);return}
+$("otable").onclick=e=>{const kb=e.target.closest(".kb");if(kb&&lastChain){if(mode==="charts"){cw.inst="opt";cw.exp=lastChain.expiry;cw.strike=+kb.dataset.k;cwSave();cwPaintCtl();cwLoad();$("cwChart").scrollIntoView({block:"center",behavior:"smooth"});return}openOptChart(+kb.dataset.k);return}
  const b=e.target.closest(".ob");if(!b||!lastChain)return;
  openTicket({kind:"option",symbol:lastChain.symbol,expiry:lastChain.expiry,strike:+b.dataset.strike,right:b.dataset.right,side:b.dataset.side,price:+b.dataset.ltp,label:`${lastChain.symbol} ${+b.dataset.strike} ${b.dataset.right} ${lastChain.expiry}`})};
 $("chk").onclick=async()=>{$("chkMsg").textContent="Checking…";const bs=(tradeInfo.brokers||[]).length?tradeInfo.brokers:[""];const out=[];
