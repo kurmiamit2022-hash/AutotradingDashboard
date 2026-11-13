@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-13b"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-13d"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8238,6 +8238,14 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .cwrap{display:grid;grid-template-columns:270px minmax(0,1fr);gap:12px;align-items:start}
 .cwl{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px}
 .cwl input,.cwl select{width:100%;box-sizing:border-box}
+#cwReco{border:2px solid transparent;border-radius:14px;background:linear-gradient(var(--panel),var(--panel)) padding-box,linear-gradient(135deg,#f97316,#dc2626,#7c3aed) border-box}
+.rcc{--rc:#b45309;--rcbg:rgba(245,158,11,.13);border-left:6px solid var(--rc)!important;background:var(--rcbg)}
+.rcc.fav{--rc:#047857;--rcbg:rgba(16,185,129,.15)}.rcc.ag{--rc:#b91c1c;--rcbg:rgba(239,68,68,.14)}.rcc.no{--rc:#6b7280;--rcbg:transparent}
+.rcc .rcact{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:-2px 0 8px;padding:7px 10px;border-radius:9px;background:var(--rc);color:#fff;font-weight:800;font-size:14px;letter-spacing:.3px}
+.rcc .rcact small{font-weight:700;opacity:.95;font-size:12px}
+.rcc .rcl{border-top-color:rgba(120,120,140,.28)}
+.rcc .go{background:var(--rc);border-color:var(--rc);color:#fff;font-weight:700}
+.rcc ul.rcw{color:var(--ink)}
 .rcgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin:8px 0}.rcc{border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:13px}.rcc h4{margin:0 0 6px;font-size:15px}.rcl{display:grid;grid-template-columns:62px 1fr;gap:8px;padding:5px 0;border-top:1px solid var(--line)}.rcl>span{color:var(--mute);font-size:12px}.rcw{margin:4px 0 0;padding-left:16px;font-size:12px;color:var(--mute)}
 #cwList{height:min(66vh,640px);overflow-y:auto;display:flex;flex-direction:column;gap:2px}
 #cwList button{display:flex;align-items:center;gap:6px;justify-content:space-between;text-align:left;border:0;background:transparent;color:var(--ink);padding:7px 8px;border-radius:8px;cursor:pointer;font:inherit}
@@ -8247,6 +8255,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .cwbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}.cwbar b{font-size:18px}.cwbar .seg{margin:0}
 #cwOpt{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 #cwChart{height:min(64vh,620px);min-height:340px;width:100%}
+#cwChart2{height:260px;width:100%}.cwopt #cwChart{height:min(46vh,420px);min-height:300px}
 @media(max-width:820px){.cwrap{grid-template-columns:1fr}#cwList{height:200px}}
 td.act{white-space:nowrap}
 .tk{padding:20px}.tk h2{margin:0 0 4px;font-size:20px}
@@ -8417,6 +8426,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
    <div class="seg" id="cwDays" role="group" aria-label="Days"><button data-d="1">1 day</button><button data-d="3">3 days</button></div></div>
   <div class="chleg" id="cwLeg"></div><div id="cwMsg" class="tkmsg" role="status"></div>
   <div id="cwChart"></div>
+  <div id="cwBaseW" hidden><div class="sub" id="cwBaseT" style="margin:8px 0 2px"></div><div id="cwChart2"></div></div>
   <p class="sub">Press ↑ or ↓ to move to the previous or next symbol, ← or → to change the timeframe.</p>
   <div class="card" id="cwReco" aria-live="polite"></div>
   <h3 class="scttl" style="margin:14px 0 6px">Options data</h3>
@@ -8775,16 +8785,17 @@ function cwRecoPaint(){const box=$("cwReco");if(!box)return;const R=cw.rec;
  const oi=ch&&ch.max_pe!=null?`Put OI wall <b>${ch.max_pe}</b> (support) · Call OI wall <b>${ch.max_ce}</b> (resistance)`:"";
  const fu=R.fut?`Futures: ${R.fut.expiry?esc(R.fut.expiry)+", ":""}lot ${R.fut.lot||"?"}`:"No futures contract found";
  const cards=["5m","15m","1d"].map(t=>{const x=R.tfs[t]||{};const nm=tfName[t]||t;
-  if(!x.scanned)return `<div class="rcc"><h4>${nm}</h4><p class="sub">Not scanned yet. Switch the main timeframe to ${nm} once, or wait for the next scan.</p></div>`;
-  if(!x.side)return `<div class="rcc"><h4>${nm} <span class="pill">–</span></h4><p class="sub">No active signal on ${nm} candles, so no stock, futures or option trade is suggested. Wait for one.</p></div>`;
+  if(!x.scanned)return `<div class="rcc no"><h4>${nm}</h4><p class="sub">Not scanned yet. Switch the main timeframe to ${nm} once, or wait for the next scan.</p></div>`;
+  if(!x.side)return `<div class="rcc no"><h4>${nm} <span class="pill">–</span></h4><p class="sub">No active signal on ${nm} candles, so no stock, futures or option trade is suggested. Wait for one.</p></div>`;
   const buy=x.side==="BUY",cls=buy?"up":"dn";
   const opt=atm?(()=>{const l=atm[buy?"ce":"pe"].ltp;return l==null?"Option price not available":`Buy ATM <b>${ch.atm} ${buy?"CE":"PE"}</b> at ₹${f2(l)}<span class="sub"> · exit if the stock closes ${buy?"below":"above"} ${f2(x.sl)}</span> <button class="mini go" data-rc="opt" data-t="${t}">Buy ${buy?"CE":"PE"}</button>`})():'<span class="sub">Loading the chain…</span>';
   const fut=R.fut&&R.fut.lot?`${x.side} 1 lot (${R.fut.lot} qty), about ₹${Math.round(R.fut.lot*x.entry).toLocaleString("en-IN")}<span class="sub"> · same stop and targets as the stock</span> <button class="mini go" data-rc="fut" data-t="${t}">${buy?"Buy":"Sell"} futures</button>`:'<span class="sub">No futures lot found</span>';
-  return `<div class="rcc"><h4>${nm} <span class="pill ${esc(x.signal.replace(" ","_"))}">${esc(x.signal)}</span> <span class="sub">${esc(x.signal_time||"")}${x.grade?` · grade ${x.grade}`:""}</span></h4>
+  const vc=x.verdict==="Favourable"?"fav":x.verdict==="Against"?"ag":"mix";
+  return `<div class="rcc ${vc}"><div class="rcact"><span>${nm} · ${buy?"▲ BUY":"▼ SELL"}</span><small>${x.verdict==="Favourable"?"✔ ":x.verdict==="Against"?"✖ ":"● "}${x.verdict.toUpperCase()}</small></div><div class="sub" style="margin:-2px 0 4px">${esc(x.signal_time||"")}${x.grade?` · grade ${x.grade}`:""}</div>
    <div class="rcl"><span>Stock</span><div><b class="${cls}">${x.side}</b> near ${f2(x.entry)}<br><span class="sub">stop ${f2(x.sl)} · T1 ${f2(x.tp1)} · T2 ${f2(x.tp2)} · T3 ${f2(x.tp3)} · T4 ${f2(x.tp4)}</span> <button class="mini go" data-rc="eq" data-t="${t}">${buy?"Buy":"Sell"} stock</button></div></div>
    <div class="rcl"><span>Futures</span><div>${fut}</div></div>
    <div class="rcl"><span>Option</span><div>${opt}</div></div>
-   <div class="rcl"><span>Verdict</span><div><span class="pill ${x.verdict==="Favourable"?"BUY":x.verdict==="Against"?"SELL":""}">${x.verdict}</span><ul class="rcw">${(x.reasons||[]).map(r=>`<li>${esc(r)}</li>`).join("")}</ul></div></div></div>`}).join("");
+   <div class="rcl"><span>Why</span><div><ul class="rcw">${(x.reasons||[]).map(r=>`<li>${esc(r)}</li>`).join("")}</ul></div></div></div>`}).join("");
  box.innerHTML=`<div class="ixrow"><b class="scttl">Recommendation: ${esc(R.symbol)}</b><span class="sub">${nf}${pcr?" · "+pcr:""}${oi?" · "+oi:""} · ${fu}</span></div>
   <div class="rcgrid">${cards}</div>
   <p class="sub">A rule-based reading of the signal, NIFTY, the sector and the option chain. It is not advice and does not guarantee a result. Check the price and the risk before you trade.</p>`}
@@ -8798,7 +8809,7 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
   if(cwRecSym!==sym){cwRecSym=sym;cwRecLoad(sym)}}
  $("cwTitle").textContent=sym+(cw.inst==="fut"?" futures (nearest month)":"");$("cwMsg").textContent="Loading chart…";$("cwLeg").innerHTML="";
  try{await loadLW()}catch(e){$("cwMsg").textContent="The chart library did not load. Reload the page and try again.";return}
- let candles,lines=null,legend=[],markers=[],levels=null,intraday=true;
+ let candles,lines=null,legend=[],markers=[],levels=null,intraday=true,und=null,undLines=null,undErr="";
  try{
   if(cw.inst==="opt"){
    const ch=await cwChain(sym);if(my!==cw.my)return;
@@ -8811,6 +8822,8 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
    if(h.error){$("cwMsg").textContent=h.error;cwClear();return}
    const rows=h[cw.side.toLowerCase()]||[];if(!rows.length){$("cwMsg").textContent="No price history for this contract yet.";cwClear();return}
    candles=rows.map(r=>({time:r.t+19800,open:r.o,high:r.h,low:r.l,close:r.c}));
+   und=(h.und||[]).map(r=>({time:r.t+19800,open:r.o,high:r.h,low:r.l,close:r.c}));undErr=h.und_error||"";
+   const iu=(h.ind||{}).und;if(iu&&iu.stop)undLines={stop:iu.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(iu.ema||[]).map(([t,v])=>[t+19800,v])};
    const ind=(h.ind||{})[cw.side.toLowerCase()];if(ind&&ind.stop)lines={stop:ind.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(ind.ema||[]).map(([t,v])=>[t+19800,v])};
    const f=rows[0].c,l=rows[rows.length-1].c;legend.push(`<b>${esc(sym)} ${cw.strike} ${cw.side}</b> <span>expiry ${esc(cw.exp)} · last ${l.toFixed(2)} (${(l/f-1>=0?"+":"")+((l/f-1)*100).toFixed(1)}% over the period)</span>`);
    if(cw.tf==="1d")legend.push("<span>Option history is intraday only, so 15 minute candles of the last 3 days are shown.</span>")
@@ -8833,8 +8846,16 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
  const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(candles);if(markers.length)cs.setMarkers(markers);
  if(levels){const lastT=candles[candles.length-1].time,lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title});s.setData([{time:levels.from,value:price},{time:lastT,value:price}])};
   lv(levels.entry,ink,"Entry",0);lv(levels.sl,dn,"SL"+(levels.sl_hit?" ✖":""),0);levels.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(levels.hits>i?" ✓":""),2))}
- $("cwLeg").innerHTML=legend.join("");ch.timeScale().fitContent();if(candles.length>120)ch.timeScale().setVisibleLogicalRange({from:candles.length-120,to:candles.length+4})}
-function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}}
+ $("cwLeg").innerHTML=legend.join("");ch.timeScale().fitContent();if(candles.length>120)ch.timeScale().setVisibleLogicalRange({from:candles.length-120,to:candles.length+4})
+ $("cwBaseW").hidden=cw.inst!=="opt";document.querySelector(".cwm").classList.toggle("cwopt",cw.inst==="opt");
+ if(cw.inst==="opt"){$("cwBaseT").innerHTML=und&&und.length?`<b>${esc(sym)}</b> stock chart, same candles and days as the option above`:esc(undErr||"The stock chart is not available for this symbol right now.");
+  if(und&&und.length){const c2=LightweightCharts.createChart($("cwChart2"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:true,secondsVisible:false},crosshair:{mode:0}});cw.obj2=c2;
+   if(undLines){const sp2=c2.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp2.setData(undLines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
+    if(undLines.ema&&undLines.ema.length){const e2=c2.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});e2.setData(undLines.ema.map(([t,v])=>({time:t,value:v})))}}
+   const k2=c2.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});k2.setData(und);
+   let lock=false;const link=(a,b)=>a.timeScale().subscribeVisibleTimeRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleRange(r)}catch(e){}lock=false});link(ch,c2);link(c2,ch);
+   try{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}catch(e){}}}}
+function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
 function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
  const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
  ["stocks","charts","commodities","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
