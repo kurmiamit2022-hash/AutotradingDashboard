@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-13k"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-13l"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -9205,10 +9205,16 @@ async function rpRun(p){const b=$(p+"RRun"),m=$(p+"RMsg");b.disabled=true;$(p+"R
    b.disabled=false;if(g.status==="done"){m.textContent=`Replayed ${g.result.day}.`;rpDays(p,g.result.days,$(p+"RDay").value);rpShow(p,g.result)}else m.textContent=g.msg||"The replay could not run."};
   poll()}catch(e){m.textContent="The replay could not run.";b.disabled=false}}
 const rpInr=v=>(v<0?"-":"")+"₹"+Math.abs(Math.round(v)).toLocaleString("en-IN");
-function rpSim(r,cap,feePct){const tr=r.trades.slice().sort((a,b)=>(a.day||r.day)<(b.day||r.day)?-1:(a.day||r.day)>(b.day||r.day)?1:a.entered<b.entered?-1:1),out={};
- for(const comp of [true,false]){let eq=cap,peak=cap,dd=0,ddp=0;const curve=[cap],days={};
-  for(const t of tr){const pnl=(comp?eq:cap)*(((t.opt_pct!=null?t.opt_pct:(t.pct||0)))-feePct)/100;eq+=pnl;const d=t.day||r.day;days[d]=(days[d]||0)+pnl;curve.push(eq);peak=Math.max(peak,eq);dd=Math.max(dd,peak-eq);ddp=Math.max(ddp,(peak-eq)/peak*100)}
-  out[comp?"c":"f"]={end:eq,curve,dd,ddp,days:Object.entries(days).map(([day,v])=>({day,v}))}}
+function rpSim(r,cap,feePct){
+ // Trades that are open at the same time share the account: each gets 1/(the most trades open together during its life), so five trades at 09:45 are not five all-in bets in a row.
+ const tr=r.trades.map(t=>({t,d:t.day||r.day,s:t.entered,e:t.exit_hhmm||t.exit_at||"15:30"})).sort((a,b)=>a.d<b.d?-1:a.d>b.d?1:a.s<b.s?-1:a.s>b.s?1:0),out={},byDay={};
+ for(const x of tr)(byDay[x.d]=byDay[x.d]||[]).push(x);
+ for(const d in byDay){const L=byDay[d];for(const x of L){let n=1;for(const y of L){if(y.s<x.e&&y.s>=x.s||y===x){let c=0;for(const z of L)if(z.s<=y.s&&z.e>y.s)c++;n=Math.max(n,c)}}x.n=Math.max(1,n)}}
+ for(const comp of [true,false]){let eq=cap,peak=cap,dd=0,ddp=0;const curve=[cap],days={},pend=[];
+  const settle=upto=>{pend.sort((a,b)=>a.k<b.k?-1:a.k>b.k?1:0);while(pend.length&&pend[0].k<=upto){const p=pend.shift();eq+=p.v;days[p.d]=(days[p.d]||0)+p.v;curve.push(eq);peak=Math.max(peak,eq);dd=Math.max(dd,peak-eq);ddp=Math.max(ddp,(peak-eq)/peak*100)}};
+  for(const x of tr){settle(x.d+" "+x.s);const base=(comp?eq:cap)/x.n,t=x.t;pend.push({k:x.d+" "+x.e,v:base*(((t.opt_pct!=null?t.opt_pct:(t.pct||0)))-feePct)/100,d:x.d})}
+  settle("9999");
+  out[comp?"c":"f"]={end:eq,curve,dd,ddp,days:Object.entries(days).map(([day,v])=>({day,v})).sort((a,b)=>a.day<b.day?-1:1)}}
  return out}
 function rpCharts(eq,pd,fmt,base,title){if(eq.length<2)return "";const W=640,H=150,pl=52,pr=8,pt=8,pb=18,n=eq.length,lo=Math.min(base,...eq),hi=Math.max(base,...eq),sp=(hi-lo)||1,x=i=>pl+i/(n-1)*(W-pl-pr),y=v=>pt+(hi-v)/sp*(H-pt-pb);
  let g=`<line class="ax" x1="${pl}" x2="${W-pr}" y1="${y(base)}" y2="${y(base)}"/>`;for(const v of [lo,(lo+hi)/2,hi])g+=`<text x="${pl-4}" y="${y(v)+3}" text-anchor="end">${fmt(v)}</text>`;
@@ -9222,8 +9228,8 @@ function rpByTf(r){const o={};for(const t of r.trades){const k=o[t.tf]=o[t.tf]||
  const ks=Object.keys(o).sort();if(!ks.length)return "";const f=(v,d=2)=>(v>0?"+":"")+v.toFixed(d);
  return `<div class="wrap"><table><thead><tr><th>Chart</th><th>Trades</th><th>Win rate</th><th>Total R</th><th>Avg R / trade</th><th>Profit factor</th><th>Avg stock move</th><th>Avg option P&amp;L</th></tr></thead><tbody>`+ks.map(k=>{const a=o[k];return `<tr><td><b>${k==="5m"?"5 min":"15 min"}</b></td><td>${a.n}</td><td>${(a.w/a.n*100).toFixed(0)}%</td><td class="${a.tr>=0?"up":"dn"}">${f(a.tr,1)}R</td><td>${f(a.tr/a.n)}R</td><td>${a.gl?(a.gw/a.gl).toFixed(2):"–"}</td><td>${f(a.pct/a.n)}%</td><td class="${a.op>=0?"up":"dn"}">${f(a.op/a.n,1)}%</td></tr>`}).join("")+`</tbody></table></div>`}
 function rpShow(p,r){window.rpLast=window.rpLast||{};window.rpLast[p]=r;const cap=Math.max(1000,+$(p+"RCap").value||100000),fee=+$(p+"RFee").value||0,sim=rpSim(r,cap,fee),sc=sim.c,sf=sim.f,pc=(sc.end/cap-1)*100,when=r.mode==="range"?"by the end of the month":"by the end of the day";
- const money=`<div class="rpcap"><div class="rpbig"><span class="sub">Starting with ${rpInr(cap)}, buying the at-the-money call (CE) or put (PE) with the whole account on each trade, exiting at the stop-loss or target the system sets${fee?`, less ${fee}% charges and slippage per trade`:""}</span><div>${rpInr(cap)} → <b class="${sc.end>=cap?"up":"dn"}">${rpInr(sc.end)}</b> <span class="${pc>=0?"up":"dn"}">${pc>=0?"+":""}${pc.toFixed(1)}%</span> <span class="sub">${when}</span></div></div>
-  <div class="sub">Profit ${rpInr(sc.end-cap)} · biggest fall from a peak ${rpInr(-sc.dd)} (${sc.ddp.toFixed(1)}%) · without compounding (${rpInr(cap)} in every trade): ${rpInr(sf.end)} (${((sf.end/cap-1)*100).toFixed(1)}%)</div></div>`;
+ const money=`<div class="rpcap"><div class="rpbig"><span class="sub">Starting with ${rpInr(cap)}, buying the at-the-money call (CE) or put (PE), sharing the account between trades that are open at the same time (the whole account when only one is open), exiting at the stop-loss or target the system sets${fee?`, less ${fee}% charges and slippage per trade`:""}</span><div>${rpInr(cap)} → <b class="${sc.end>=cap?"up":"dn"}">${rpInr(sc.end)}</b> <span class="${pc>=0?"up":"dn"}">${pc>=0?"+":""}${pc.toFixed(1)}%</span> <span class="sub">${when}</span></div></div>
+  <div class="sub">Profit ${rpInr(sc.end-cap)} · biggest fall from a peak ${rpInr(-sc.dd)} (${sc.ddp.toFixed(1)}%) · without compounding (${rpInr(cap)} shared out each time): ${rpInr(sf.end)} (${((sf.end/cap-1)*100).toFixed(1)}%)</div></div>`;
  const s=r.summary,rg=r.mode==="range",R=x=>`<span class="${x>0?"up":x<0?"dn":""}">${x>0?"+":""}${x}R</span>`,why=t=>t==="fresh"?"Fresh":t==="momentum"?"Early mover":"Continuation",pill=(sd,rt)=>`<span class="pill ${sd}">${rt==="CE"?"CALL (CE)":"PUT (PE)"}</span>`,cb=(x)=>`<button class="mini" data-rc="${esc(x.symbol)}|${x.tf}|${x.ts}">Chart</button>`;
  const dy=x=>rg?`<td>${x.day.slice(5)}</td>`:"",dh=rg?"<th>Day</th>":"";
  const tr=r.trades.length?`<div class="wrap rpscroll"><table><thead><tr>${dh}<th>Stock</th><th>Buy</th><th>Chart</th><th>Why</th><th>In</th><th>Price</th><th>Stop</th><th>T1</th><th>T4</th><th>Out</th><th>Price</th><th>Result</th><th>Targets</th><th>Stock moved</th><th>Option bought</th><th>Option sold</th><th>Option P&amp;L</th><th>R</th><th></th></tr></thead><tbody>`+r.trades.map(t=>`<tr>${dy(t)}<td><b>${esc(t.symbol)}</b></td><td>${pill(t.side,t.right)}</td><td>${t.tf==="5m"?"5 min":"15 min"}</td><td>${why(t.type)}</td><td>${t.entered}</td><td>${t.entry}</td><td>${t.sl}</td><td>${t.t1}</td><td>${t.t4}</td><td>${t.exit_at}</td><td>${t.exit}</td><td>${esc(t.reason)}</td><td>${t.targets}</td><td class="${t.pct>=0?"up":"dn"}">${t.pct>0?"+":""}${t.pct}%</td>${t.opt_pct==null?"<td>–</td><td>–</td><td>–</td>":`<td>${t.opt_in}</td><td>${t.opt_out}</td><td class="${t.opt_pct>=0?"up":"dn"}">${t.opt_pct>0?"+":""}${t.opt_pct}%</td>`}<td>${R(t.r)}</td><td>${cb(t)}</td></tr>`).join("")+"</tbody></table></div>":`<div class="sub">The rules would not have taken any trade on ${esc(r.day)}.</div>`;
