@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-13i"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-13k"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3321,7 +3321,7 @@ def bot_rules(kind):
            f"While NIFTY is up: a CE on stocks in the {AUTO_MOM_TOP} best sectors and a PE on stocks in the {AUTO_MOM_COUNTER} worst sector. The stock itself must have moved more than {AUTO_MOM_PCT:g}% the same way as its sector. "
            "No signal is needed.") if AUTO_MOM else ""
     if AUTO_MOM and not AUTO_OLD_RULES:
-        return mom + sent + " Stop and targets T1 to T4 come from the stock's own range." + tail + " The Replay below still tests the old indicator-signal rules only; early-mover entries cannot be replayed."
+        return mom + sent + " Stop and targets T1 to T4 come from the stock's own range." + tail + " The Replay below runs these same early-mover rules on past days (using the 5 minute candles; the grade filter cannot be rebuilt for the past, so it is not applied)."
     old = AUTO_RULES + f" Looks at every F&O stock whose move today is between {AUTO_MOVE_MIN:g}% and {AUTO_MOVE_MAX:g}%, up or down."
     return old + (" " + mom if mom else "") + sent + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, a continuation needs the price near its trend line." + tail
 
@@ -3346,6 +3346,16 @@ def nifty_sentiment():
         return None, None
 
 
+def mom_hot(avg, nside):
+    """The sectors the early-mover rule trades, from {sector: average move} and the NIFTY side. NIFTY down: the AUTO_MOM_TOP worst sectors (PE) and the AUTO_MOM_COUNTER best (CE).
+    NIFTY up: the AUTO_MOM_TOP best sectors (CE) and the AUTO_MOM_COUNTER worst (PE). Returns {sector: "gainers" or "losers"}."""
+    order = sorted(avg, key=lambda k: -avg[k])
+    n_up, n_dn = (AUTO_MOM_TOP, AUTO_MOM_COUNTER) if nside == "BUY" else (AUTO_MOM_COUNTER, AUTO_MOM_TOP)
+    hot = {k: "gainers" for k in order[:n_up] if avg[k] > 0}
+    hot.update({k: "losers" for k in order[::-1][:n_dn] if avg[k] < 0})
+    return hot
+
+
 def mom_candidates(u, cfg, kind, rows, today, no, manual=False, day=False):
     """Before AUTO_MOM_END, by the NIFTY trend. NIFTY down: a PE on stocks in the AUTO_MOM_TOP worst sectors and a CE on stocks in the AUTO_MOM_COUNTER best sector.
     NIFTY up: a CE on stocks in the AUTO_MOM_TOP best sectors and a PE on stocks in the AUTO_MOM_COUNTER worst sector. The stock itself must have moved more than
@@ -3368,11 +3378,7 @@ def mom_candidates(u, cfg, kind, rows, today, no, manual=False, day=False):
         if sec not in ("Others", "Indices"):
             grp.setdefault(sec, []).append(m)
     avg = {k: sum(v) / len(v) for k, v in grp.items() if len(v) >= 2}
-    order = sorted(avg, key=lambda k: -avg[k])
-    # NIFTY down: sell the AUTO_MOM_TOP worst sectors and buy the AUTO_MOM_COUNTER best one. NIFTY up: buy the AUTO_MOM_TOP best sectors and sell the AUTO_MOM_COUNTER worst one.
-    n_up, n_dn = (AUTO_MOM_TOP, AUTO_MOM_COUNTER) if nside == "BUY" else (AUTO_MOM_COUNTER, AUTO_MOM_TOP)
-    hot = {k: "gainers" for k in order[:n_up] if avg[k] > 0}
-    hot.update({k: "losers" for k in order[::-1][:n_dn] if avg[k] < 0})
+    hot = mom_hot(avg, nside)
     against = 0
     try:
         cctx = conf_context("5m")
@@ -4405,10 +4411,23 @@ def bt_stats(done, p):
             "by_symbol": [{"sym": k, "trades": v["trades"], "win_rate": round(v["wins"] / v["trades"] * 100, 1), "pnl": round(v["pnl"], 2)} for k, v in sorted(by_sym.items(), key=lambda kv: -kv[1]["pnl"])]}
 
 
-def bt_run(params, candles):
-    """candles: {symbol: DataFrame}. Returns the full result."""
+def bt_movers_trades(span, data, cfg):
+    """The Autopilot's early-mover rule over past days (the same engine as the Replay), as trades the backtest can size with the user's capital."""
+    rr = replay_run_range(data, "scanner", span, cfg)
+    if rr.get("error"):
+        return None, rr["error"]
+    out = []
+    for t in rr["trades"]:
+        a, b = pd.Timestamp(f"{t['day']} {t['entered']}", tz=IST), pd.Timestamp(f"{t['day']} {t['exit_hhmm']}", tz=IST)
+        out.append({"sym": t["symbol"], "side": 1 if t["side"] == "BUY" else -1, "t_in": a, "t_out": max(a, b), "entry": t["entry"], "exit": t["exit"], "risk": abs(t["entry"] - t["sl"]),
+                    "sl": t["sl"], "tp": t["t4"], "why": t["reason"], "kind": "early mover", "grade": None, "score": None})
+    return out, None
+
+
+def bt_run(params, candles, trades_in=None):
+    """candles: {symbol: DataFrame}. Returns the full result. trades_in: ready-made trades (the early-mover strategy), when there are no candles to scan."""
     p = params
-    trades, problems = [], []
+    trades, problems = list(trades_in or []), []
     for sym, df in candles.items():
         try:
             tr, why = (bt_gap_trades if p["strategy"] == "gap" else bt_signal_trades)(sym, df, p["interval"], p)
@@ -4456,16 +4475,18 @@ def bt_params(payload):
         if kind not in ("stock", "futures", "options"):
             raise ValueError("Choose stock, futures or options")
         strategy = str(payload.get("strategy", "signal"))
-        if strategy not in ("signal", "gap"):
-            raise ValueError("Choose the signal or the gap continuation strategy")
+        if strategy not in ("signal", "gap", "movers"):
+            raise ValueError("Choose the signal, the gap continuation or the early movers strategy")
         raw = payload.get("symbols", "")
         syms = [s.strip().upper() for s in (raw.split(",") if isinstance(raw, str) else raw) if str(s).strip()]
         syms = list(dict.fromkeys(syms))
+        if strategy == "movers":
+            syms, interval = ["F&O stocks"], "5m"   # the whole F&O list, on 5 minute candles, decided by the NIFTY trend
         if not syms:
             raise ValueError("Enter at least one symbol, for example NIFTY or RELIANCE")
         if len(syms) > BT_MAX_SYMBOLS:
             raise ValueError(f"Test at most {BT_MAX_SYMBOLS} symbols at a time")
-        unknown = [s for s in syms if s not in UNIVERSE]
+        unknown = [s for s in syms if s not in UNIVERSE and strategy != "movers"]
         if unknown:
             raise ValueError("Not in the list of tracked symbols: " + ", ".join(unknown[:5]))
         mx = BT_MAX_DAYS[interval]
@@ -4483,7 +4504,7 @@ def bt_params(payload):
             raise ValueError("Gap continuation needs a 5 or 15 minute timeframe")
         if interval == "1d" and p["intraday"]:
             p["intraday"] = False
-        if strategy == "gap":
+        if strategy in ("gap", "movers"):
             p["intraday"] = True
         return p, None
     except ValueError as e:
@@ -4493,6 +4514,28 @@ def bt_params(payload):
 def bt_job(jid, user_id, p):
     job = BT_JOBS[jid]
     try:
+        if p["strategy"] == "movers":
+            job["note"] = "Downloading the 5 and 15 minute candles of the F&O stocks and NIFTY"
+            _, data, errors, rdays = replay_load("scanner", lambda a, b: job.update(note=f"Downloaded {a} of {b}"))
+            if not data:
+                job.update(state="error", error="No candles could be loaded. " + ("; ".join(errors[:3]) if errors else "Check the data feed."))
+                return
+            now = ist_now()
+            first = (now - timedelta(days=p["days"])).strftime("%Y-%m-%d")
+            span = [d for d in rdays[1:] if d >= first and (d < now.strftime("%Y-%m-%d") or now.strftime("%H:%M") > "15:35")]   # the first loaded day is warm-up for the indicator
+            job["note"] = f"Replaying the early-mover rule over {len(span)} trading days"
+            tr, err = bt_movers_trades(span, data, bot_cfg(user_id, "scanner")) if span else (None, "No complete trading days are loaded for that period.")
+            if err:
+                job.update(state="error", error=err)
+                return
+            res = bt_run(p, {}, tr)
+            res["problems"] = errors[:5] + res["problems"]
+            res["notes"] = [f"Early movers: before {AUTO_MOM_END}, by the NIFTY trend. NIFTY down: sell the {AUTO_MOM_TOP} worst sectors, buy the {AUTO_MOM_COUNTER} best. NIFTY up: buy the {AUTO_MOM_TOP} best, sell the {AUTO_MOM_COUNTER} worst. "
+                            f"The stock must also have moved more than {AUTO_MOM_PCT:g}% the same way. At most {int(bot_cfg(user_id, 'scanner').get('max_trades', 3))} trades a day, as in your Autopilot settings. "
+                            "The grade filter and the symbol list are not used; the timeframe is 5 minutes."] + res["notes"]
+            res["params"] = {k: (v.strftime("%H:%M") if isinstance(v, dtime) else v) for k, v in p.items()}
+            job.update(state="done", result=res)
+            return
         job["note"] = "Downloading price history"
         candles, bad = bt_fetch(p["symbols"], p["interval"], p["days"], lambda a, b: job.update(note=f"Downloaded {a} of {b} symbols"))
         if not candles:
@@ -4582,6 +4625,34 @@ def api_history(tf: str = DEFAULT_INTERVAL, symbol: str = "", sector: str = "", 
             "recent": [{**r, "status": hist_status(r)} for r in recs[:300]],
             "since": pd.Timestamp(oldest, unit="s", tz="UTC").tz_convert(IST).strftime("%d %b %Y") if oldest else None,
             "sector_names": sector_names()}
+
+
+@app.get("/api/history/autopilot")
+def api_history_autopilot(request: Request, days: int = 0):
+    """The Autopilot's own trades (today's and earlier days), summed up by how they were entered, by day and one by one."""
+    u = request.state.user
+    rows = []
+    for kind in ("scanner", "nifty"):
+        for t in bot_view(u, kind).get("trades", []):
+            rows.append({**{k: t.get(k) for k in ("date", "time", "label", "mode", "entry", "exit", "pnl", "reason", "state", "etype")}, "bot": kind})
+    if days and days > 0:
+        cut = (ist_now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        rows = [r for r in rows if (r["date"] or "") >= cut]
+    rows.sort(key=lambda r: (r["date"] or "", r["time"] or ""), reverse=True)
+
+    def grp(key):
+        g = {}
+        for r in rows:
+            if r["pnl"] is None or r["state"] == "open":
+                continue   # a trade still running has no result yet
+            b = g.setdefault(key(r), {"n": 0, "wins": 0, "pnl": 0.0})
+            b["n"] += 1
+            b["wins"] += 1 if r["pnl"] > 0 else 0
+            b["pnl"] += r["pnl"]
+        return [{"key": k, "n": v["n"], "win_rate": round(v["wins"] / v["n"] * 100), "pnl": round(v["pnl"], 2)} for k, v in g.items()]
+    names = {"momentum": "Early mover", "fresh": "Fresh signal", "continuation": "Continuation", "signal": "Signal"}
+    return {"by_type": sorted(grp(lambda r: names.get(r["etype"], r["etype"] or "Signal")), key=lambda r: -r["n"]),
+            "by_day": sorted(grp(lambda r: r["date"]), key=lambda r: r["key"], reverse=True), "trades": rows[:400], "total": len(rows)}
 
 
 # ── Signal alerts: Telegram and ntfy push ──
@@ -6981,7 +7052,7 @@ def replay_fetch(names, tf, progress):
 
 
 def replay_names(kind):
-    return ["NIFTY"] if kind == "nifty" else [s for s in UNIVERSE if s not in INDICES and s not in SCANNER_EXCLUDE and s not in INDEX_YF]
+    return ["NIFTY"] if kind == "nifty" else [s for s in UNIVERSE if s not in INDICES and s not in SCANNER_EXCLUDE and s not in INDEX_YF] + ["NIFTY"]   # the stock replay also needs NIFTY, for its trend
 
 
 def replay_load(kind, set_progress):
@@ -7009,11 +7080,65 @@ def replay_load(kind, set_progress):
     return hit
 
 
+def replay_mom_cands(data, syms, day, T, endt):
+    """The early-mover rule as it stood at the close of one 5 minute candle: NIFTY's trend, the best and worst sectors so far today, and the stocks in them that moved enough.
+    Returns (candidates, a reason when there are none). The same rule as the live Autopilot (mom_hot); the grade filter is not applied, as the past grade cannot be rebuilt."""
+    from bisect import bisect_right
+    N = (data.get("NIFTY") or {}).get("5m")
+    if not N:
+        return [], "NIFTY candles were not loaded, so there is no trend to follow"
+    kn = bisect_right(N["close_ts"], T) - 1
+    if kn < 0 or N["dates"][kn] != day:
+        return [], None
+    d0 = N["day0"].get(day, 0)
+    if d0 <= 0:
+        return [], "no NIFTY close from the day before"
+    nchg = (float(N["c"][kn]) / float(N["c"][d0 - 1]) - 1) * 100
+    nside = "BUY" if nchg >= AUTO_SENT_MIN else "SELL" if nchg <= -AUTO_SENT_MIN else None
+    if nside is None:
+        return [], "NIFTY was flat, so there was no trend to follow"
+    items, grp = [], {}
+    for s_ in syms:
+        S5 = data[s_]["5m"]
+        k5 = bisect_right(S5["close_ts"], T) - 1
+        if k5 < 0 or S5["dates"][k5] != day:
+            continue
+        e0 = S5["day0"].get(day, 0)
+        if e0 <= 0:
+            continue
+        ltp = float(S5["c"][k5])
+        m = (ltp / float(S5["c"][e0 - 1]) - 1) * 100
+        sec = sector_of(s_)
+        items.append((s_, S5, k5, ltp, m, sec))
+        if sec not in ("Others", "Indices"):
+            grp.setdefault(sec, []).append(m)
+    avg = {k: sum(v) / len(v) for k, v in grp.items() if len(v) >= 2}
+    hot = mom_hot(avg, nside)
+    out = []
+    for s_, S5, k5, ltp, m, sec in items:
+        if sec not in hot or abs(m) <= AUTO_MOM_PCT:
+            continue
+        side = "BUY" if hot[sec] == "gainers" else "SELL"
+        if (m > 0) != (side == "BUY"):
+            continue
+        at = float(S5["atr"][k5])
+        if not at == at or at <= 0:
+            continue
+        sg = 1 if side == "BUY" else -1
+        risk = max(1.0, min(3.0, AUTO_MOM_ATR)) * at
+        g = {"side": side, "dir": sg, "entry": ltp, "sl": ltp - sg * risk, "tps": [ltp + sg * risk * i for i in range(1, 5)], "risk": risk, "date": day, "time": endt, "j": k5, "hits": 0, "open": True, "bars_ago": 0}
+        out.append({"symbol": s_, "tf": "5m", "g": g, "px": ltp, "key": (s_, "mom", day, side), "etype": "momentum", "dist": 0.0, "at": endt, "chg": m, "S5": S5, "k5": k5, "sts": int(S5["ts"][k5]),
+                    "mom": (1 if nside == side else 0, abs(m))})
+    return out, None
+
+
 def replay_run(data, kind, day, cfg):
     """One day, one 5 minute step at a time. Returns the signals that qualified, the trades the autopilot would have taken, and why the others were left out."""
     ent = cfg.get("entries", "both")
     max_trades = int(cfg.get("max_trades", 3))
-    syms = [s for s, v in data.items() if "5m" in v and "15m" in v]
+    syms = [s for s, v in data.items() if "5m" in v and "15m" in v and not (kind == "scanner" and s == "NIFTY")]
+    mom = kind == "scanner" and AUTO_MOM and not AUTO_OLD_RULES   # the stock Autopilot trades early movers only, unless the old rules are switched back on
+    mom_end = AUTO_MOM_END
     steps = {}
     for s in syms:
         S5 = data[s]["5m"]
@@ -7027,6 +7152,7 @@ def replay_run(data, kind, day, cfg):
     first = OPTBOT_FIRST_ENTRY.strftime("%H:%M")
     last = OPTBOT_LAST_ENTRY.strftime("%H:%M")
     seen, signals, skips, trades, taken_keys = set(), [], {}, [], set()
+    sigmap = {}
     pos = {}
     from bisect import bisect_right
 
@@ -7040,7 +7166,13 @@ def replay_run(data, kind, day, cfg):
         if endt < first or endt > last:
             continue
         cands = []
-        for s in syms:
+        if mom:
+            if endt >= mom_end:
+                continue
+            cands, why_none = replay_mom_cands(data, syms, day, T, endt)
+            if why_none:
+                skip(why_none, ("none", endt[:2]))
+        for s in ([] if mom else syms):
             S5, S15 = data[s]["5m"], data[s]["15m"]
             k5 = bisect_right(S5["close_ts"], T) - 1
             k15 = bisect_right(S15["close_ts"], T) - 1
@@ -7093,18 +7225,25 @@ def replay_run(data, kind, day, cfg):
                         skip("continuation: not back near its trend line", key)
                         continue
                 cands.append({"symbol": s, "tf": tf, "g": g, "px": ltp, "key": key, "etype": "fresh" if fresh else "continuation", "dist": dist if dist is not None else 9.9, "at": endt, "chg": chg, "S5": S5, "k5": k5, "sts": int(S["ts"][g["j"]])})
-        cands.sort(key=lambda c: (c["etype"] != "fresh", c["dist"]))
+        if mom:
+            cands.sort(key=lambda c: c["mom"], reverse=True)   # the trades that go with NIFTY first, then the biggest move
+        else:
+            cands.sort(key=lambda c: (c["etype"] != "fresh", c["dist"]))
         for c in cands:
             g = c["g"]
             if c["key"] not in seen:
                 seen.add(c["key"])
                 signals.append({"symbol": c["symbol"], "side": g["side"], "right": "CE" if g["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "at": c["at"], "signal_time": f"{g['date']} {g['time']}",
                                 "price": round(c["px"], 2), "sl": round(g["sl"], 2), "tps": [round(t, 2) for t in g["tps"]], "move": None if c["chg"] is None else round(c["chg"], 2), "taken": False, "why_not": None, "ts": c["sts"], "day": day})
-            sig = next(x for x in signals if (x["symbol"], x["tf"], x["signal_time"], x["side"]) == (c["symbol"], c["tf"], f"{g['date']} {g['time']}", g["side"]))
+                sigmap[c["key"]] = signals[-1]
+            sig = sigmap[c["key"]]
             if c["key"] in taken_keys or sig["taken"]:
                 continue
             if c["symbol"] in pos and pos[c["symbol"]]["open"]:
                 sig["why_not"] = "already in a trade on this stock"
+                continue
+            if mom and c["symbol"] in pos:
+                sig["why_not"] = "this stock was already traded today"
                 continue
             if len(trades) >= max_trades:
                 sig["why_not"] = f"daily limit of {max_trades} trades reached"
@@ -7365,12 +7504,12 @@ def manual_signals(u, kind, old=False):
     for c in cands:
         key = f"{c['sigkey']} {c['symbol']}"
         seen.add(key)
-        old = rows.get(key)
+        prev = rows.get(key)
         rows[key] = {"symbol": c["symbol"], "side": c["side"], "right": "CE" if c["side"] == "BUY" else "PE", "tf": c["tf"], "type": c["etype"], "px": round(c["px"], 2),
-                     "time": old["time"] if (old and c.get("etype") == "momentum" and old.get("time")) else c.get("time"), "sl": c["levels"]["sl"], "t1": c["levels"]["tp1"], "t2": c["levels"]["tp2"], "t3": c["levels"]["tp3"], "t4": c["levels"]["tp4"],
+                     "time": prev["time"] if (prev and c.get("etype") == "momentum" and prev.get("time")) else c.get("time"), "sl": c["levels"]["sl"], "t1": c["levels"]["tp1"], "t2": c["levels"]["tp2"], "t3": c["levels"]["tp3"], "t4": c["levels"]["tp4"],
                      "grade": c.get("grade"), "score": c.get("score"), "taken": c.get("taken", False), "status": c["status"], "reason": c.get("reason"), "note": c["note"],
-                     "chg": c.get("chg"), "sector": c.get("sector"), "ts": old["ts"] if old else now}
-        if old and old["status"] == "taken":
+                     "chg": c.get("chg"), "sector": c.get("sector"), "ts": prev["ts"] if prev else now}
+        if prev and prev["status"] == "taken":
             rows[key]["status"], rows[key]["taken"] = "taken", True
     for key, row in rows.items():
         if key not in seen and row["status"] == "open":
@@ -8494,13 +8633,16 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div class="card"><h3>Weakest symbols</h3><div class="wrap"><table id="hWorst"></table></div></div>
 </div>
 <div class="card"><h3>Every signal</h3><div class="wrap"><table id="hList"></table></div></div>
+<div class="card"><h3>Autopilot trades <span class="sub">(what your Autopilot actually bought, paper and live)</span></h3>
+ <div class="hgrid even"><div class="wrap"><table id="hApType"></table></div><div class="wrap"><table id="hApDay"></table></div></div>
+ <div class="wrap rpscroll"><table id="hApList"></table></div><div class="sub" id="hApMore"></div></div>
 <div class="note" id="hFoot">How to read this: each signal is followed from its candle's close. It counts as a win for a target if price reached that target before the stop-loss. If the stop and a target are touched in the same candle, the stop is counted first. Signals that have reached neither yet are open and left out of that target's rate. "R per trade" is the average result if you always exited at that target: a win is worth that many R, a loss is minus 1R. Slippage, brokerage and gaps are not included, signals that overlap are each counted on their own, and the history only goes as far back as Yahoo's candles (about 30 days on 5 min, 60 days on 15 min, 2 years on Daily). Past results do not promise future ones.</div>
 </section>
 <section id="view-backtest" hidden>
 <div class="card botbox">
  <div class="ixrow"><b>Backtest</b><span class="sub">See how a strategy would have grown your funds on past candles. Results are estimates, not promises.</span></div>
  <div class="botrow">
-  <label>Strategy<select id="btStrategy"><option value="signal">Signals (fresh and ongoing)</option><option value="gap">Gap continuation at the open</option></select></label>
+  <label>Strategy<select id="btStrategy"><option value="signal">Signals (fresh and ongoing)</option><option value="gap">Gap continuation at the open</option><option value="movers">Early movers (the stock Autopilot rule)</option></select></label>
   <label>Trade<select id="btKind"><option value="stock">Stocks / index (cash)</option><option value="futures">Futures</option><option value="options">Options (buying)</option></select></label>
   <label>Symbols (up to 10, comma separated)<input id="btSyms" value="NIFTY" placeholder="NIFTY, RELIANCE, TCS"></label>
   <label>Timeframe<select id="btTf"><option value="5m">5 minute (last ~2 months)</option><option value="15m" selected>15 minute (last ~2 months)</option><option value="1d">Daily (years)</option></select></label>
@@ -9155,7 +9297,7 @@ async function btRun(){clearTimeout(btTimer);
  poll()}
 function initBacktest(){$("btRun").onclick=btRun;
  $("btTf").onchange=()=>{const dly=$("btTf").value==="1d";$("btDays").value=dly?730:58;$("btIntra").checked=!dly;$("btIntra").disabled=dly;$("btLev").value=dly?1:5};
- $("btStrategy").onchange=()=>{const g=$("btStrategy").value==="gap";if(g&&$("btTf").value==="1d"){$("btTf").value="5m";$("btTf").onchange()}$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true}}
+ $("btStrategy").onchange=()=>{const v=$("btStrategy").value,m=v==="movers",g=v==="gap"||m;if((g&&$("btTf").value==="1d")||(m&&$("btTf").value!=="5m")){$("btTf").value="5m";$("btTf").onchange()}$("btSyms").disabled=m;$("btSyms").title=m?"The early-mover strategy uses the whole F&O list":"";$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true}}
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
  $("scOnly").onchange=()=>{scLoad()};$("scConf").onchange=()=>{scRender()};
@@ -9495,7 +9637,15 @@ $("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{use
 let hReq=0,hTimer=null,hDeb=null;
 const pct=n=>n==null?"–":n.toFixed(1)+"%";
 const rr=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${n.toFixed(2)}R</span>`;
-async function loadHistory(){clearTimeout(hTimer);const my=++hReq;
+async function loadHistAp(){
+ try{const d=await (await api("/api/history/autopilot?days="+encodeURIComponent($("hDays").value||0))).json();if(d.error)return;
+  const m=v=>v==null?"–":`<span class="${v>=0?"up":"dn"}">${v>=0?"+":"-"}₹${Math.abs(Math.round(v)).toLocaleString("en-IN")}</span>`,t=(id,h,rows,f,empty)=>{$(id).className="gt";$(id).innerHTML=rows.length?`<thead><tr>${h.map(x=>`<th>${x}</th>`).join("")}</tr></thead><tbody>${rows.map(f).join("")}</tbody>`:`<tbody><tr><td class="empty" style="text-align:left">${empty}</td></tr></tbody>`};
+  t("hApType",["Entry type","Trades","Win rate","P&amp;L"],d.by_type,r=>`<tr><td><b>${esc(r.key)}</b></td><td>${r.n}</td><td>${r.win_rate}%</td><td>${m(r.pnl)}</td></tr>`,"No closed Autopilot trades yet.");
+  t("hApDay",["Day","Trades","Win rate","P&amp;L"],d.by_day.slice(0,15),r=>`<tr><td>${esc(r.key)}</td><td>${r.n}</td><td>${r.win_rate}%</td><td>${m(r.pnl)}</td></tr>`,"Nothing to show yet.");
+  const nm={momentum:"Early mover",fresh:"Fresh signal",continuation:"Continuation",signal:"Signal"};
+  t("hApList",["Day","Time","Option","Entry type","Mode","Bought","Sold","P&amp;L","How it ended"],d.trades,r=>`<tr><td>${esc(r.date||"")}</td><td>${esc(r.time||"")}</td><td><b>${esc(r.label||"")}</b></td><td>${esc(nm[r.etype]||r.etype||"Signal")}</td><td>${esc(r.mode||"")}</td><td>${r.entry==null?"–":(+r.entry).toFixed(2)}</td><td>${r.exit==null?"–":(+r.exit).toFixed(2)}</td><td>${m(r.pnl)}</td><td class="sub">${esc(r.state==="open"?"still open":(r.reason||r.state||""))}</td></tr>`,"No Autopilot trades yet.");
+  $("hApMore").textContent=d.total>d.trades.length?`Showing the latest ${d.trades.length} of ${d.total}.`:""}catch(e){}}
+async function loadHistory(){clearTimeout(hTimer);const my=++hReq;loadHistAp();
  const p=new URLSearchParams({tf:tf||"",symbol:$("hSym").value.trim(),sector:$("hSec").value,side:$("hSide").value,days:$("hDays").value});
  try{const d=await (await api("/api/history?"+p)).json();if(my!==hReq)return;renderHistory(d);
   if(mode==="history"&&(!d.scanned||d.progress))hTimer=setTimeout(loadHistory,3000)}
