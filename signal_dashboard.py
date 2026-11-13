@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-13g"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-13h"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5167,6 +5167,21 @@ def api_ticks(tf: str = DEFAULT_INTERVAL):
     return {"p": out, "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "source": FEED["source"]}
 
 
+@app.get("/api/dirs")
+def api_dirs():
+    """For the Trade Desk list: which way each script's live 5 minute and 15 minute signals point (a stopped-out signal does not count)."""
+    out = {}
+    with LOCK:
+        snaps = {t: list(STATES[t]["rows"]) for t in ("5m", "15m")}
+    for t, rows in snaps.items():
+        for r in rows:
+            sd_ = r.get("side")
+            if r.get("signal") not in (None, "–") and sd_ in ("BUY", "SELL") and not r.get("sl_hit"):
+                out.setdefault(r["symbol"], {})[t] = sd_
+    return {"d": {k: ("BUY" if v.get("5m") == v.get("15m") == "BUY" else "SELL" if v.get("5m") == v.get("15m") == "SELL" else "") for k, v in out.items()
+                  if len(v) == 2}}
+
+
 @app.post("/api/refresh")
 def api_refresh(tf: str = DEFAULT_INTERVAL):
     if tf not in INTERVALS:
@@ -8253,8 +8268,12 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .rcc .go{background:var(--rc);border-color:var(--rc);color:#fff;font-weight:700}
 .rcc ul.rcw{color:var(--ink)}
 .rcgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin:8px 0}.rcc{border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:13px}.rcc h4{margin:0 0 6px;font-size:15px}.rcl{display:grid;grid-template-columns:62px 1fr;gap:8px;padding:5px 0;border-top:1px solid var(--line)}.rcl>span{color:var(--mute);font-size:12px}.rcw{margin:4px 0 0;padding-left:16px;font-size:12px;color:var(--mute)}
-#cwList{height:min(66vh,640px);overflow-y:auto;display:flex;flex-direction:column;gap:2px}
+#cwList{height:calc(100vh - 230px);min-height:420px;overflow-y:auto;display:flex;flex-direction:column;gap:2px}
 #cwList button{display:flex;align-items:center;gap:6px;justify-content:space-between;text-align:left;border:0;background:transparent;color:var(--ink);padding:7px 8px;border-radius:8px;cursor:pointer;font:inherit}
+@keyframes cwfg{0%,100%{background:rgba(22,163,74,.18)}50%{background:rgba(22,163,74,.62)}}@keyframes cwfr{0%,100%{background:rgba(220,38,38,.18)}50%{background:rgba(220,38,38,.62)}}
+#cwList button.fg{animation:cwfg 1.2s ease-in-out infinite}#cwList button.fr{animation:cwfr 1.2s ease-in-out infinite}
+#cwList button[aria-selected=true].fg,#cwList button[aria-selected=true].fr{animation:none}#cwList button[aria-selected=true].fg{background:#16a34a;color:#fff}#cwList button[aria-selected=true].fr{background:#dc2626;color:#fff}
+@media(prefers-reduced-motion:reduce){#cwList button.fg,#cwList button.fr{animation:none}#cwList button.fg{background:rgba(22,163,74,.4)}#cwList button.fr{background:rgba(220,38,38,.4)}}
 #cwList button:hover{background:rgba(120,120,160,.12)}#cwList button[aria-selected=true]{background:var(--ink);color:var(--panel)}
 #cwList .nm{font-weight:600}#cwList .pc{font-size:12px}#cwList .sg{font-size:10px;border-radius:6px;padding:1px 5px;border:1px solid currentColor;opacity:.85}
 .cwm{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0}
@@ -8745,9 +8764,11 @@ const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)}</span>`;
 // ── Charts workspace: a watchlist and one big chart; the arrow keys move through the list ──
-const cw={sym:null,inst:"stock",tf:"15m",side:"CE",days:1,exp:"",strike:null,chain:{},obj:null,my:0,t:null,ready:false,view:[]};
+const cw={sym:null,inst:"stock",tf:"15m",side:"CE",days:1,exp:"",strike:null,chain:{},obj:null,my:0,t:null,ready:false,view:[],dirs:{}};
 try{const j=JSON.parse(localStorage.getItem("cw")||"{}");for(const k of ["sym","inst","tf","side","days"])if(j[k]!=null)cw[k]=j[k]}catch(e){}
 function cwSave(){try{localStorage.setItem("cw",JSON.stringify({sym:cw.sym,inst:cw.inst,tf:cw.tf,side:cw.side,days:cw.days}))}catch(e){}}
+async function cwDirs(){try{const d=await (await api("/api/dirs")).json();const n=JSON.stringify(d.d||{});if(n!==JSON.stringify(cw.dirs)){cw.dirs=d.d||{};cwBuild()}}catch(e){}}
+setInterval(()=>{if(cw.ready&&!document.hidden&&$("cwList")&&$("cwList").offsetParent)cwDirs()},20000);
 function cwRows(){return data?data.rows:[]}
 function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec=$("cwSec").value,so=$("cwSort").value;
  const secs=[...new Set(rows.map(r=>r.type==="index"?"Indices":(r.sector||"Others")))].sort();
@@ -8757,9 +8778,9 @@ function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec
  v.sort((a,b)=>(a.type==="index"?0:1)-(b.type==="index"?0:1)||(so==="chg"?ch(b)-ch(a):so==="chgd"?ch(a)-ch(b):so==="move"?Math.abs(ch(b)===-999?0:ch(b))-Math.abs(ch(a)===-999?0:ch(a)):so==="sig"?sg(a)-sg(b)||a.symbol.localeCompare(b.symbol):a.symbol.localeCompare(b.symbol)));
  cw.view=v.map(r=>r.symbol);const keepTop=$("cwList").scrollTop;
  $("cwList").innerHTML=v.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,sg=r.signal&&r.signal!=="–"?(r.side==="BUY"?"BUY":"SELL"):"";
-  return `<button role="option" data-s="${esc(r.symbol)}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${esc(r.symbol)}</span><span>${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
+  return `<button role="option" data-s="${esc(r.symbol)}" class="${cw.dirs[r.symbol]==="BUY"?"fg":cw.dirs[r.symbol]==="SELL"?"fr":""}" title="${cw.dirs[r.symbol]?"5 min and 15 min both "+(cw.dirs[r.symbol]==="BUY"?"green":"red"):""}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${esc(r.symbol)}</span><span>${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
 function cwMark(){document.querySelectorAll("#cwList button").forEach(b=>{const on=b.dataset.s===cw.sym;b.setAttribute("aria-selected",on);if(on)b.scrollIntoView({block:"nearest"})})}
-function cwShow(){if(!cw.ready){cw.ready=true;
+function cwShow(){cwDirs();if(!cw.ready){cw.ready=true;
   $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSort").onchange=()=>cwBuild();$("cwShow").onchange=()=>cwBuild();
   $("cwList").onclick=e=>{const b=e.target.closest("button[data-s]");if(b)cwPick(b.dataset.s)};
   $("cwInst").onclick=e=>{const b=e.target.closest("button");if(!b)return;cw.inst=b.dataset.i;cw.exp="";cw.strike=null;cwSave();cwPaintCtl();cwLoad()};
