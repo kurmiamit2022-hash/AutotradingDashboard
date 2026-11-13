@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-13d"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-13e"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8790,8 +8790,8 @@ function cwRecoPaint(){const box=$("cwReco");if(!box)return;const R=cw.rec;
   const buy=x.side==="BUY",cls=buy?"up":"dn";
   const opt=atm?(()=>{const l=atm[buy?"ce":"pe"].ltp;return l==null?"Option price not available":`Buy ATM <b>${ch.atm} ${buy?"CE":"PE"}</b> at ₹${f2(l)}<span class="sub"> · exit if the stock closes ${buy?"below":"above"} ${f2(x.sl)}</span> <button class="mini go" data-rc="opt" data-t="${t}">Buy ${buy?"CE":"PE"}</button>`})():'<span class="sub">Loading the chain…</span>';
   const fut=R.fut&&R.fut.lot?`${x.side} 1 lot (${R.fut.lot} qty), about ₹${Math.round(R.fut.lot*x.entry).toLocaleString("en-IN")}<span class="sub"> · same stop and targets as the stock</span> <button class="mini go" data-rc="fut" data-t="${t}">${buy?"Buy":"Sell"} futures</button>`:'<span class="sub">No futures lot found</span>';
-  const vc=x.verdict==="Favourable"?"fav":x.verdict==="Against"?"ag":"mix";
-  return `<div class="rcc ${vc}"><div class="rcact"><span>${nm} · ${buy?"▲ BUY":"▼ SELL"}</span><small>${x.verdict==="Favourable"?"✔ ":x.verdict==="Against"?"✖ ":"● "}${x.verdict.toUpperCase()}</small></div><div class="sub" style="margin:-2px 0 4px">${esc(x.signal_time||"")}${x.grade?` · grade ${x.grade}`:""}</div>
+  const vc=buy?"fav":"ag";   // the colour follows the stock's own signal (BUY green, SELL red), not NIFTY
+  return `<div class="rcc ${vc}"><div class="rcact"><span>${nm} · ${buy?"▲ BUY":"▼ SELL"}</span><small>Market check: ${x.verdict}</small></div><div class="sub" style="margin:-2px 0 4px">${esc(x.signal_time||"")}${x.grade?` · grade ${x.grade}`:""}</div>
    <div class="rcl"><span>Stock</span><div><b class="${cls}">${x.side}</b> near ${f2(x.entry)}<br><span class="sub">stop ${f2(x.sl)} · T1 ${f2(x.tp1)} · T2 ${f2(x.tp2)} · T3 ${f2(x.tp3)} · T4 ${f2(x.tp4)}</span> <button class="mini go" data-rc="eq" data-t="${t}">${buy?"Buy":"Sell"} stock</button></div></div>
    <div class="rcl"><span>Futures</span><div>${fut}</div></div>
    <div class="rcl"><span>Option</span><div>${opt}</div></div>
