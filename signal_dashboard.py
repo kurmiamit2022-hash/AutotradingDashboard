@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-13h"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-13i"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8424,7 +8424,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="futures">Futures</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -8858,6 +8858,8 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
    const r=await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${cw.tf}&inst=${cw.inst}`);const d=await r.json();if(my!==cw.my)return;
    if(d.error){$("cwMsg").textContent=d.error;cwClear();return}
    candles=d.candles;lines=d.lines;intraday=d.intraday;
+   if(cw.inst==="fut"){try{const bd=await (await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${cw.tf}&inst=stock`)).json();if(my!==cw.my)return;
+     if(bd.error||!bd.candles||!bd.candles.length)undErr=bd.error||"";else{und=bd.candles;if(bd.lines&&bd.lines.stop)undLines={stop:bd.lines.stop,ema:bd.lines.ema||[]}}}catch(e){}}
    markers=(d.markers||[]).map(m=>m.side==="BUY"?{time:m.time,position:"belowBar",color:"#0a7d5a",shape:"arrowUp",text:"BUY"}:{time:m.time,position:"aboveBar",color:"#c0392b",shape:"arrowDown",text:"SELL"});
    const row=cwRows().find(x=>x.symbol===sym)||{},c=row.ltp_chg!=null?row.ltp_chg:row.chg,last=candles[candles.length-1].close;
    legend.push(`<b>${esc(sym)}</b> <span>${last.toFixed(2)}${c!=null?` (${c>0?"+":""}${c.toFixed(2)}% today)`:""}${row.sector?" · "+esc(row.sector):""}</span>`);
@@ -8874,8 +8876,8 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
  if(levels){const lastT=candles[candles.length-1].time,lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title});s.setData([{time:levels.from,value:price},{time:lastT,value:price}])};
   lv(levels.entry,ink,"Entry",0);lv(levels.sl,dn,"SL"+(levels.sl_hit?" ✖":""),0);levels.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(levels.hits>i?" ✓":""),2))}
  $("cwLeg").innerHTML=legend.join("");ch.timeScale().fitContent();if(candles.length>120)ch.timeScale().setVisibleLogicalRange({from:candles.length-120,to:candles.length+4})
- $("cwBaseW").hidden=cw.inst!=="opt";document.querySelector(".cwm").classList.toggle("cwopt",cw.inst==="opt");
- if(cw.inst==="opt"){$("cwBaseT").innerHTML=und&&und.length?`<b>${esc(sym)}</b> stock chart, same candles and days as the option above`:esc(undErr||"The stock chart is not available for this symbol right now.");
+ $("cwBaseW").hidden=cw.inst==="stock";document.querySelector(".cwm").classList.toggle("cwopt",cw.inst!=="stock");
+ if(cw.inst!=="stock"){$("cwBaseT").innerHTML=und&&und.length?`<b>${esc(sym)}</b> stock chart, same candles${cw.inst==="opt"?" and days as the option":" as the futures"} above`:esc(undErr||"The stock chart is not available for this symbol right now.");
   if(und&&und.length){const c2=LightweightCharts.createChart($("cwChart2"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:true,secondsVisible:false},crosshair:{mode:0}});cw.obj2=c2;
    if(undLines){const sp2=c2.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp2.setData(undLines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
     if(undLines.ema&&undLines.ema.length){const e2=c2.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});e2.setData(undLines.ema.map(([t,v])=>({time:t,value:v})))}}
@@ -8883,7 +8885,7 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
    let lock=false;const link=(a,b)=>a.timeScale().subscribeVisibleTimeRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleRange(r)}catch(e){}lock=false});link(ch,c2);link(c2,ch);
    try{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}catch(e){}}}}
 function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
-function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
+function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
  const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
  ["stocks","charts","commodities","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  if(m==="charts")cwShow();
