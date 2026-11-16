@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-13l"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-13m"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5966,7 +5966,8 @@ def indicator_pack(symbol, df, tf, stamp, lo_t=None, minbars=60):
     buy = up & (c > ema) & within_lookback(green)
     sell = dn & (c < ema) & within_lookback(red)
     start = 0 if lo_t is None else next((i for i in range(n) if int(df.index[i].timestamp()) >= lo_t), n)
-    out = {"stop": [], "ema": [], "sig": None}
+    out = {"stop": [], "ema": [], "sig": None,
+           "marks": [[stamp(df.index[i]), "BUY" if buy[i] else "SELL"] for i in range(start, n) if buy[i] or sell[i]]}   # every signal on the shown candles
     if CHART_INDICATOR:
         for i in range(start, n):
             v = ls[i] if d[i] == 1 else ss[i]
@@ -6033,6 +6034,7 @@ def chart_data(symbol, tf, at=0, fut=False):
            "candles": [{"time": t[k], "open": round(float(df["Open"].iloc[i]), 2), "high": round(float(df["High"].iloc[i]), 2),
                         "low": round(float(df["Low"].iloc[i]), 2), "close": round(float(c[i]), 2)} for k, i in enumerate(range(start, n))],
            "markers": [{"time": t[i - start], "side": "BUY" if buy[i] else "SELL"} for i in range(start, n) if buy[i] or sell[i]][-1:],
+           "marks": [[t[i - start], "BUY" if buy[i] else "SELL"] for i in range(start, n) if buy[i] or sell[i]],   # every signal in the chart range, for the Trade Desk
            "lines": None, "signal": None}
     if CHART_INDICATOR:
         out["lines"] = {"stop": [[t[i - start], round(float(ls[i] if d[i] == 1 else ss[i]), 2), int(d[i])] for i in range(start, n) if np.isfinite(ls[i] if d[i] == 1 else ss[i])],
@@ -8978,7 +8980,8 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
   if(cwRecSym!==sym){cwRecSym=sym;cwRecLoad(sym)}}
  $("cwTitle").textContent=sym+(cw.inst==="fut"?" futures (nearest month)":"");$("cwMsg").textContent="Loading chart…";$("cwLeg").innerHTML="";
  try{await loadLW()}catch(e){$("cwMsg").textContent="The chart library did not load. Reload the page and try again.";return}
- let candles,lines=null,legend=[],markers=[],levels=null,intraday=true,und=null,undLines=null,undErr="";
+ let candles,lines=null,legend=[],markers=[],levels=null,intraday=true,und=null,undLines=null,undErr="",undMarks=[];
+ const mkOf=(a,sh)=>(a||[]).slice().sort((x,y)=>x[0]<y[0]?-1:x[0]>y[0]?1:0).map(([t,sd])=>sd==="BUY"?{time:sh?t+sh:t,position:"belowBar",color:"#0a7d5a",shape:"arrowUp",text:"BUY"}:{time:sh?t+sh:t,position:"aboveBar",color:"#c0392b",shape:"arrowDown",text:"SELL"});
  try{
   if(cw.inst==="opt"){
    const ch=await cwChain(sym);if(my!==cw.my)return;
@@ -8992,8 +8995,8 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
    const rows=h[cw.side.toLowerCase()]||[];if(!rows.length){$("cwMsg").textContent="No price history for this contract yet.";cwClear();return}
    candles=rows.map(r=>({time:r.t+19800,open:r.o,high:r.h,low:r.l,close:r.c}));
    und=(h.und||[]).map(r=>({time:r.t+19800,open:r.o,high:r.h,low:r.l,close:r.c}));undErr=h.und_error||"";
-   const iu=(h.ind||{}).und;if(iu&&iu.stop)undLines={stop:iu.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(iu.ema||[]).map(([t,v])=>[t+19800,v])};
-   const ind=(h.ind||{})[cw.side.toLowerCase()];if(ind&&ind.stop)lines={stop:ind.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(ind.ema||[]).map(([t,v])=>[t+19800,v])};
+   const iu=(h.ind||{}).und;if(iu&&iu.stop)undLines={stop:iu.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(iu.ema||[]).map(([t,v])=>[t+19800,v])};if(iu)undMarks=mkOf(iu.marks,19800);
+   const ind=(h.ind||{})[cw.side.toLowerCase()];if(ind&&ind.stop)lines={stop:ind.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(ind.ema||[]).map(([t,v])=>[t+19800,v])};if(ind)markers=mkOf(ind.marks,19800);
    const f=rows[0].c,l=rows[rows.length-1].c;legend.push(`<b>${esc(sym)} ${cw.strike} ${cw.side}</b> <span>expiry ${esc(cw.exp)} · last ${l.toFixed(2)} (${(l/f-1>=0?"+":"")+((l/f-1)*100).toFixed(1)}% over the period)</span>`);
    if(cw.tf==="1d")legend.push("<span>Option history is intraday only, so 15 minute candles of the last 3 days are shown.</span>")
   }else{
@@ -9001,8 +9004,8 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
    if(d.error){$("cwMsg").textContent=d.error;cwClear();return}
    candles=d.candles;lines=d.lines;intraday=d.intraday;
    if(cw.inst==="fut"){try{const bd=await (await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${cw.tf}&inst=stock`)).json();if(my!==cw.my)return;
-     if(bd.error||!bd.candles||!bd.candles.length)undErr=bd.error||"";else{und=bd.candles;if(bd.lines&&bd.lines.stop)undLines={stop:bd.lines.stop,ema:bd.lines.ema||[]}}}catch(e){}}
-   markers=(d.markers||[]).map(m=>m.side==="BUY"?{time:m.time,position:"belowBar",color:"#0a7d5a",shape:"arrowUp",text:"BUY"}:{time:m.time,position:"aboveBar",color:"#c0392b",shape:"arrowDown",text:"SELL"});
+     if(bd.error||!bd.candles||!bd.candles.length)undErr=bd.error||"";else{und=bd.candles;if(bd.lines&&bd.lines.stop)undLines={stop:bd.lines.stop,ema:bd.lines.ema||[]};undMarks=mkOf(bd.marks,0)}}catch(e){}}
+   markers=mkOf(d.marks,0);
    const row=cwRows().find(x=>x.symbol===sym)||{},c=row.ltp_chg!=null?row.ltp_chg:row.chg,last=candles[candles.length-1].close;
    legend.push(`<b>${esc(sym)}</b> <span>${last.toFixed(2)}${c!=null?` (${c>0?"+":""}${c.toFixed(2)}% today)`:""}${row.sector?" · "+esc(row.sector):""}</span>`);
    if(d.signal){levels=d.signal;legend.push(`<b class="${d.signal.side==="BUY"?"up":"dn"}">${esc(d.signal.state)}</b> <span>signal candle ${esc(d.signal.time)}, ${esc(d.signal.status)}</span>`)}else legend.push("<span>No signal on this timeframe.</span>")}
@@ -9023,7 +9026,7 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
   if(und&&und.length){const c2=LightweightCharts.createChart($("cwChart2"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:true,secondsVisible:false},crosshair:{mode:0}});cw.obj2=c2;
    if(undLines){const sp2=c2.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp2.setData(undLines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
     if(undLines.ema&&undLines.ema.length){const e2=c2.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});e2.setData(undLines.ema.map(([t,v])=>({time:t,value:v})))}}
-   const k2=c2.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});k2.setData(und);
+   const k2=c2.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});k2.setData(und);if(undMarks.length)k2.setMarkers(undMarks);
    let lock=false;const link=(a,b)=>a.timeScale().subscribeVisibleTimeRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleRange(r)}catch(e){}lock=false});link(ch,c2);link(c2,ch);
    try{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}catch(e){}}}}
 function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
