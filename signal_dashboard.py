@@ -169,6 +169,67 @@ _SECTOR_LISTS = {
 SECTOR_OF = {sym: sec for sec, names in _SECTOR_LISTS.items() for sym in names.split()}
 
 
+# ── Cash stocks: NSE shares that are not in the F&O list. Shown on the SWING tab only (no futures, options or autopilot).
+# Each name is checked at run time against the broker's instrument list, and any name that has futures is dropped, so this list can be a little too wide.
+# To use your own list put a cash_symbols.txt next to this file (lines like "Banking: CSBBANK DCBBANK", or bare symbols), or set CASH_EXTRA="ABC,XYZ".
+_CASH_LISTS = {
+    "Banking": "CSBBANK DCBBANK DHANBANK EQUITASBNK ESAFSFB J&KBANK KTKBANK SOUTHBANK TMB UCOBANK CENTRALBK IOB PSB SURYODAY CAPITALSFB UTKARSHBNK IDBI",
+    "Financial Services": "AAVAS APTUS AADHARHFC BAJAJHFL BAJAJHLDNG CANFINHOME CREDITACC CRISIL CHOLAHLDNG EDELWEISS FIVESTAR GICRE HOMEFIRST HUDCO ICRA INDIASHLTR IIFL JMFINANCIL M&MFIN MASFIN NIACL NUVAMA POONAWALLA PAISALO PNBGILTS REPCOHOME SBFC SPANDANA STARHEALTH SUNDARMFIN TATAINVEST UTIAMC ABSLAMC MUTHOOTMF GODIGIT NIVABUPA IRCTC SAMMAANCAP CGCL MANAPPURAM LICHSGFIN ARMANFIN IFCI PFS KFINTECH RELIGARE CAPLIPOINT MOTILALOFS GEOJITFSL ANANDRATHI JIOFIN SHRIRAMFIN NSDL",
+    "IT": "BSOFT CYIENT ECLERX FIRSTSOURCE HAPPSTMNDS INTELLECT LATENTVIEW LTTS MASTEK NEWGEN RATEGAIN SONATSOFTW TANLA TATATECH ZENSARTECH MAPMYINDIA NETWEB AFFLE ROUTE SAKSOFT DATAMATICS INFIBEAM CARTRADE JUSTDIAL INDIAMART IXIGO TEJASNET HFCL ITI STLTECH RAILTEL OPTIEMUS TATACOMM TTML CMSINFO INOXINDIA",
+    "Auto": "APOLLOTYRE BALKRISIND ESCORTS EXIDEIND ARE&M CEATLTD JKTYRE MRF SUNDRMFAST SCHAEFFLER SKFINDIA TIMKEN GABRIEL ENDURANCE MINDAIND CRAFTSMAN SUPRAJIT JBMA SANSERA OLECTRA GREAVESCOT VARROC ZFCVINDIA SWARAJENG ATULAUTO AUTOAXLES LUMAXTECH MSUMI SJS UNIPARTS TMCV BAJAJHLDNG SUBROS RICOAUTO TVSHLTD WHEELS",
+    "Pharma & Healthcare": "AARTIDRUGS AJANTPHARM ALEMBICLTD ANTHEM APLLTD ASTERDM BLISSGVS CONCORDBIO ERIS FDC GLAXO GLAND GRANULES IPCALAB IOLCP JBCHEPHARM JUBLPHARMA KIMS KRSNAA LALPATHLAB MEDANTA METROPOLIS NATCOPHARM NEULANDLAB NH PFIZER POLYMED RAINBOW SANOFI SEQUENT SHILPAMED STRIDES SUVEN SYNGENE TARSONS THYROCARE UNICHEMLAB VIJAYA WOCKPHARMA YATHARTH PPLPHARMA MARKSANS GUFICBIO EMCURE ABBOTINDIA INDOCO ORCHPHARMA SMSPHARMA HIKAL GLOBALHEALTH ALKEM AUROPHARMA PIRAMALPHA OPTIEMUS",
+    "FMCG": "AVANTIFEED BIKAJI CCL DEVYANI DOMS EMAMILTD GILLETTE HATSUN HERITGFOOD JYOTHYLAB KRBL LTFOODS TASTYBITE VADILALIND VENKEYS ZYDUSWELL BAJAJCON BALRAMCHIN RENUKA GODREJAGRO WESTLIFE SAPPHIRE BBTC HONASA AWL GLOBUSSPR PGHH BECTORFOOD MANORAMA ADVENZYMES",
+    "Metals & Mining": "GRAPHITE GRAVITA HINDCOPPER JSL KIOCL LLOYDSME MAHSEAMLES MOIL RATNAMANI SARDAEN SHYAMMETL STEELXIND WELCORP JINDALSAW MIDHANI ASHAPURMIN GPIL USHAMART HEG TINPLATE VISAKAIND ELECTCAST JSWHL ORISSAMET SUNFLAG MANAKSTEEL NSLNISP",
+    "Oil, Gas & Energy": "ATGL CASTROLIND CHENNPETRO GSPL GUJGASLTD GULFOILLUB IGL MGL MRPL HINDOILEXP GPPL AEGISLOG AEGISVOPAK DEEPINDS JINDALDRILL TECHNOE CONFIPET",
+    "Power": "CESC JPPOWER NLCINDIA NTPCGREEN SJVN TORNTPOWER ACMESOLAR BORORENEW RPOWER RELINFRA INOXGREEN KPIGREEN KPEL SWSOLAR WEBSOL SKIPPER GENUSPOWER GREENPOWER POWERMECH",
+    "Capital Goods & Defence": "AIAENG APARINDS ASTRAMICRO BEML CARBORUNIV ELGIEQUIP ENGINERSIN GRSE GMMPFAUDLR GRINDWELL HBLENGINE HONAUT INGERRAND ISGEC JYOTICNC KALPATPOWR KEC KIRLOSENG LMW LAKSHMIMACH MTARTECH PARAS PRAJIND SCHNEIDER TEXRAIL THERMAX TITAGARH TRITURBINE TRANSRAILL VOLTAMP WABCOINDIA AZAD ZENTEC DYNAMATECH HAPPYFORGE SHAKTIPUMP ELECON ESABINDIA LLOYDSENGG ANANTRAJ BHARATWIRE DATAPATTNS GESHIP APOLLO UNIMECH JASH KIRLOSBROS CHALET HLEGLAS DCXINDIA PATELENG",
+    "Consumer Durables": "BATAINDIA BAJAJELEC ORIENTELEC RAJESHEXPO RELAXO SYMPHONY VGUARD WHIRLPOOL VIPIND CERA CAMPUS METROBRAND EPACK IFBIND FINCABLES SOMANYCERA TTKPRESTIG AVALON CYIENTDLM IDEAFORGE BUTTERFLY STYLAMIND LIBERTSHOE KHADIM RAJRATAN",
+    "Retail & Consumer": "ABFRL BRAINBEES GOCOLORS LEMONTREE MEDPLUS PCJEWELLER RAYMONDLSL REDTAPE SENCO SHOPERSTOP THANGAMAYL TBOTEK THOMASCOOK VEDANTFASH VMART EIHOTEL CHALET ITCHOTELS SAMHI WONDERLA PVRINOX NAZARA TIPSMUSIC SUNTV ZEEL NETWORK18 TV18BRDCST DBCORP JAGRAN SAREGAMA APOLLOHOSP CELLO ARVIND LUXIND BIRLAMONEY",
+    "Infra & Logistics": "ALLCARGO BLUEDART GATEWAY HGINFRA IRB IRCON ITDCEM JWL JSWINFRA KNRCON MAHLOG NCC PNCINFRA RITES SCI TCI VRLLOG REDINGTON SIS GRINFRA ASHOKA AHLUCONT VATECH TCIEXP SOUTHWEST PTC TRIVENIGQ",
+    "Telecom": "VIL",
+    "Cement & Building": "ACC BIRLACORPN CENTURYPLY DALBHARAT HEIDELBERG INDIACEM JKCEMENT JKLAKSHMI KAJARIACER NUVOCO ORIENTCEM PRISMJOHN RAMCOCEM SAGCEM STARCEMENT GREENPANEL GREENLAM FINPIPE HIL EVERESTIND KANSAINER BERGEPAINT INDIGOPNTS AKZOINDIA PRINCEPIPE ASAHIINDIA CERA ASTRAL ANDHRSUGAR MAGADSUGAR",
+    "Chemicals & Paints": "AARTIIND ALKYLAMINE ANURAS ATUL BALAMINES BASF BAYERCROP CHAMBLFERT CHEMPLASTS CLEAN DEEPAKNTR DEEPAKFERT EIDPARRY FINEORG FLUOROCHEM GALAXYSURF GHCL GNFC GSFC HSCL JUBLINGREA LXCHEM NEOGEN NOCIL PCBL PRIVISCL RAIN RALLIS RCF ROSSARI SHARDACROP SUMICHEM SUDARSCHEM TATACHEM NFL PARADEEP FACT AETHER IGPL DHANUKA KSCL ICIL GUJALKALI VINATIORG TIRUMALCHM",
+    "Realty": "BRIGADE IBREALEST KOLTEPATIL MAHLIFE PURVA SOBHA SUNTECK SIGNATURE MAXESTATES DBREALTY PARSVNATH RUSTOMJEE KEYSTONE ARVSMART",
+    "Textiles": "KPRMILL TRIDENT WELSPUNLIV VTL ALOKINDS FILATEX RSWM GOKALDAS DOLLAR KITEX RUPA BANSWARA HIMATSEIDE SUTLEJTEX NITINSPIN",
+    "Agri & Fertilisers": "TRIVENI DALMIASUG DCMSHRIRAM BAJAJHIND BANARISUG AVADHSUGAR UGARSUGAR",
+    "Paper & Packaging": "JKPAPER WSTCSTPAPR TNPL UFLEX COSMOFIRST HUHTAMAKI MOLDTKPAC AGI SESHAPAPER EPL",
+    "Diversified": "GODREJIND TATAINVEST ADANIWILMAR BHARATSE ITC NAVNETEDUE",
+}
+
+
+def _load_cash():
+    lists = {k: v.split() for k, v in _CASH_LISTS.items()}
+    path = os.getenv("CASH_FILE", "cash_symbols.txt")
+    if os.path.exists(path):
+        custom = {}
+        with open(path) as f:
+            for ln in f:
+                ln = ln.split("#")[0].strip()
+                if not ln:
+                    continue
+                sec, _, rest = ln.partition(":") if ":" in ln else ("Others", "", ln)
+                custom.setdefault(sec.strip() or "Others", []).extend(rest.replace(",", " ").split())
+        if any(custom.values()):
+            lists = custom
+    extra = [x.strip().upper() for x in os.getenv("CASH_EXTRA", "").replace(";", ",").split(",") if x.strip()]
+    if extra:
+        lists.setdefault("Others", []).extend(extra)
+    known, names, sec_of = set(UNIVERSE), [], {}
+    for sec, syms in lists.items():
+        for sym in syms:
+            sym = sym.strip().upper()
+            if sym and sym not in known and sym not in sec_of:
+                names.append(sym)
+                sec_of[sym] = sec
+    return names, sec_of
+
+
+CASH_CAND, CASH_SECTOR = _load_cash()
+CASH_SET = set(CASH_CAND)
+for _n, _s in CASH_SECTOR.items():
+    SECTOR_OF.setdefault(_n, _s)
+
+
 def sector_of(symbol):
     return "Indices" if symbol in INDEX_YF else SECTOR_OF.get(symbol, "Others")
 
@@ -1230,7 +1291,7 @@ def dhan_on_packets(pkts, lookup, now_ts=None):
             continue
         LTP[sym] = {"p": float(price), "t": now_ts, "d": today}
         n += 1
-        if LIVE_CANDLES:
+        if LIVE_CANDLES and sym not in CASH_SET:
             live_tick(sym, float(price), now, p.get("vol") if (p.get("vol") or 0) > 0 else None)
     if n:
         DHAN_STAT["frames"] += n
@@ -1417,12 +1478,13 @@ def sector_build(store, interval):
     return out
 
 
-def fetch_all(interval, progress=None):
-    """Download in small batches, retry a failed batch once, and report partial results as they arrive."""
+def fetch_all(interval, progress=None, universe=None):
+    """Download in small batches, retry a failed batch once, and report partial results as they arrive. `universe` replaces the main symbol list (used for the cash stocks)."""
+    uni = UNIVERSE if universe is None else universe
     rows, errors, hist = [], [], []
     sec_items = {}
-    for i in range(0, len(UNIVERSE), YF_BATCH):
-        names = UNIVERSE[i:i + YF_BATCH]
+    for i in range(0, len(uni), YF_BATCH):
+        names = uni[i:i + YF_BATCH]
         tickers = [yf_ticker(n) for n in names]
         if use_dhan():
             frames, errs = dhan_frames(names, interval, _days(PERIODS[interval]),
@@ -1447,10 +1509,10 @@ def fetch_all(interval, progress=None):
                     errors.append(f"{sname}: {e}")
             if DHAN_STAT["hist_error"] and not frames and any("Stopped:" in e for e in errs):
                 if progress:
-                    progress(list(rows), list(errors), len(UNIVERSE))
+                    progress(list(rows), list(errors), len(uni))
                 break
             if progress:
-                progress(list(rows), list(errors), min(i + YF_BATCH, len(UNIVERSE)))
+                progress(list(rows), list(errors), min(i + YF_BATCH, len(uni)))
             continue
         import yfinance as yf  # imported lazily so the module loads without it
         data = None
@@ -1484,10 +1546,10 @@ def fetch_all(interval, progress=None):
                 except Exception as e:  # keep going if one symbol fails
                     errors.append(f"{sname}: {e}")
         if progress:
-            progress(list(rows), list(errors), min(i + YF_BATCH, len(UNIVERSE)))
+            progress(list(rows), list(errors), min(i + YF_BATCH, len(uni)))
         time.sleep(0.5)
     try:
-        if rows:
+        if rows and universe is None:
             SECTOR_CHARTS[interval] = sector_build(sec_items, interval)
     except Exception as e:
         print("sector charts failed:", e, flush=True)
@@ -1541,6 +1603,71 @@ def ensure_fresh(interval):
         stale = not st["refreshing"] and time.time() - st["checked"] > ttl
     if stale:
         threading.Thread(target=refresh, args=(interval,), daemon=True).start()
+
+
+# ── Cash stocks scan (Daily and Weekly only, run when somebody opens SWING) ──
+CASH_TFS = ("1d", "1w")
+CASH_STATES_ORDER = ("1d", "1w")
+CASH_STATES = {tf: {"rows": [], "updated": None, "errors": [], "refreshing": False, "checked": 0.0, "progress": None} for tf in CASH_TFS}
+CASH_TTL = max(REFRESH_SECONDS, 600)
+
+
+def cash_universe():
+    """The cash stocks to scan: the candidate list, minus any name with futures, and (when the instrument list is loaded) minus any the broker does not list."""
+    order = ["dhan", "angel"] if use_dhan() else ["angel", "dhan"]
+    eq, fut, have = set(), set(), False
+    for nm in order:
+        m = MASTERS[nm]
+        if m["day"]:
+            fut |= set(m["fut"])
+            if not have:
+                eq, have = set(m["eq"]), True
+    return [x for x in CASH_CAND if x not in fut and (not have or x in eq)]
+
+
+def refresh_cash(tf):
+    st = CASH_STATES[tf]
+    with LOCK:
+        if st["refreshing"]:
+            return
+        st["refreshing"] = True
+    try:
+        try:
+            load_master("dhan" if use_dhan() else DATA_BROKER)
+        except Exception:
+            pass
+        uni = cash_universe()
+        with LOCK:
+            st["progress"] = [0, len(uni)]
+
+        def partial(rows, errors, done):
+            with LOCK:
+                st["progress"] = [done, len(uni)]
+                if not st["rows"] or not st["updated"]:
+                    st.update(rows=[{**r, "cash": True} for r in rows], errors=errors)
+
+        rows, errors, _hist = fetch_all(tf, partial, universe=uni)
+        with LOCK:
+            if rows:
+                st.update(rows=[{**r, "cash": True} for r in rows], errors=errors, updated=ist_now().strftime("%d %b %H:%M:%S"))
+            else:
+                st["errors"] = errors or ["No data came back for the cash stocks."]
+    except Exception as e:
+        with LOCK:
+            st["errors"] = [f"Data fetch failed: {e}"]
+    finally:
+        with LOCK:
+            st["refreshing"] = False
+            st["progress"] = None
+            st["checked"] = time.time()
+
+
+def ensure_fresh_cash(tf):
+    st = CASH_STATES[tf]
+    with LOCK:
+        stale = not st["refreshing"] and time.time() - st["checked"] > CASH_TTL
+    if stale:
+        threading.Thread(target=refresh_cash, args=(tf,), daemon=True).start()
 
 
 # ── Option chain (NSE public website, unofficial) ──
@@ -1737,7 +1864,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16l"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16o"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2382,7 +2509,7 @@ def master_name(broker_id):
 def _angel_master():
     r = requests.get(MASTER_URL, timeout=90)
     r.raise_for_status()
-    names, eq, opt, fut = set(UNIVERSE), {}, {}, {}
+    names, eq, opt, fut = set(UNIVERSE) | CASH_SET, {}, {}, {}
     for it in r.json():
         name = it.get("name")
         if name not in names:
@@ -2397,7 +2524,7 @@ def _angel_master():
             except ValueError:
                 continue
             fut.setdefault(name, []).append((exp, it["token"], sym, lot, seg))
-        elif seg in ("NFO", "BFO") and typ in ("OPTSTK", "OPTIDX") and sym[-2:] in ("CE", "PE"):
+        elif seg in ("NFO", "BFO") and typ in ("OPTSTK", "OPTIDX") and sym[-2:] in ("CE", "PE") and name not in CASH_SET:
             try:
                 strike = float(it["strike"]) / 100
             except (KeyError, ValueError):
@@ -2422,7 +2549,7 @@ COMMODITIES = {"GOLD": "Gold", "GOLDM": "Gold Mini", "SILVER": "Silver", "SILVER
 
 
 def _dhan_master():
-    names, eq, opt, fut = set(UNIVERSE) | set(COMMODITIES), {}, {}, {}
+    names, eq, opt, fut = set(UNIVERSE) | set(COMMODITIES) | CASH_SET, {}, {}, {}
     g = lambda row, *keys: next((str(row[k]).strip() for k in keys if row.get(k) not in (None, "")), "")
     with requests.get(DHAN_MASTER_URL, stream=True, timeout=120) as r:
         r.raise_for_status()
@@ -2451,7 +2578,7 @@ def _dhan_master():
                 exp = _parse_date(g(row, "SM_EXPIRY_DATE", "SEM_EXPIRY_DATE"))
                 if exp:
                     fut.setdefault(sym, []).append((exp, sid, label, lot, seg))
-            elif inst in ("OPTSTK", "OPTIDX") and seg:
+            elif inst in ("OPTSTK", "OPTIDX") and seg and sym not in CASH_SET:
                 right = g(row, "OPTION_TYPE", "SEM_OPTION_TYPE").upper()[:2]
                 exp = _parse_date(g(row, "SM_EXPIRY_DATE", "SEM_EXPIRY_DATE"))
                 try:
@@ -2527,6 +2654,10 @@ def row_for(symbol, tf):
             row = next((r for r in STATES[t]["rows"] if r["symbol"] == symbol), None)
             if row:
                 return row, t
+        for t in CASH_STATES_ORDER:
+            row = next((r for r in CASH_STATES[t]["rows"] if r["symbol"] == symbol), None)
+            if row:
+                return row, t
     return None, None
 
 
@@ -2559,8 +2690,10 @@ def make_order(p, u, dry=False, force=None):
     mname = master_name(broker_id)
     if kind not in ("equity", "option", "future"):
         return fail("Unknown order type.")
-    if symbol not in UNIVERSE:
+    if symbol not in UNIVERSE and symbol not in CASH_SET:
         return fail("This symbol is not on the dashboard list, so it cannot be traded here.")
+    if symbol in CASH_SET and kind != "equity":
+        return fail("This is a cash stock with no futures or options. Trade it as shares.")
     if kind == "equity" and symbol in INDEX_YF:
         return fail("An index cannot be bought as shares. Use futures or options.")
     if side not in ("BUY", "SELL") or otype not in ("MARKET", "LIMIT"):
@@ -2832,6 +2965,12 @@ def candle_close(symbol):
             upd = STATES[t]["updated"]
         if row and (best is None or str(upd) > str(best[1])):
             best = (row["close"], upd)
+    if best is None:
+        with LOCK:
+            for t in CASH_STATES_ORDER:
+                row = next((r for r in CASH_STATES[t]["rows"] if r["symbol"] == symbol), None)
+                if row:
+                    return row["close"]
     return best[0] if best else None
 
 
@@ -2847,6 +2986,9 @@ def feed_items(broker):
     eq = M(broker)["eq"]
     seg = "NSE" if broker == "angel" else "NSE_EQ"
     for name in SYMBOLS:
+        if name in eq:
+            out.append((name, seg, str(eq[name][0])))
+    for name in cash_universe():   # live prices for the cash stocks on SWING
         if name in eq:
             out.append((name, seg, str(eq[name][0])))
     for name, (ex, tok) in INDEX_FEED.get(broker, {}).items():
@@ -2890,7 +3032,7 @@ def feed_once():
             continue
         LTP[sym] = {"p": float(p), "t": now}
         n += 1
-        if LIVE_CANDLES:
+        if LIVE_CANDLES and sym not in CASH_SET:
             live_tick(sym, float(p), pd.Timestamp.now(tz=IST))
     FEED.update(count=n, t=now, error=None)
     if LIVE_CANDLES:
@@ -4978,7 +5120,7 @@ def _events_job():
         cal = nse.get_json("/api/event-calendar", prm)
         acts = nse.get_json("/api/corporates-corporateActions", prm)
         ok = cal is not None or acts is not None
-        by = parse_events(cal, acts, today, EVENT_DAYS, set(UNIVERSE), EVENTS_EXTRA)
+        by = parse_events(cal, acts, today, EVENT_DAYS, set(UNIVERSE) | CASH_SET, EVENTS_EXTRA)
         if ok or EVENTS_EXTRA:
             EVENTS["by"] = by
         EVENTS["ok"] = ok
@@ -5012,7 +5154,7 @@ def api_watchlist(request: Request):
 @app.put("/api/watchlist")
 def api_watchlist_save(request: Request, payload: dict = Body(...)):
     uid = request.state.user["id"]
-    ok = set(UNIVERSE)
+    ok = set(UNIVERSE) | CASH_SET
     syms = []
     for s_ in payload.get("symbols") or []:
         s_ = str(s_).strip().upper()
@@ -5216,6 +5358,7 @@ def start_worker():
     start_engine()
     threading.Thread(target=warm_scans, daemon=True).start()
     ensure_events()
+    ensure_vix()
 
 
 def warm_scans():
@@ -5397,15 +5540,100 @@ def api_signals(tf: str = DEFAULT_INTERVAL):
     })
 
 
+@app.get("/api/cash")
+def api_cash(tf: str = "1d"):
+    """The cash stocks (not in F&O) for the SWING tab, in the same row shape as /api/signals."""
+    if tf not in CASH_STATES:
+        tf = "1d"
+    ensure_fresh_cash(tf)
+    with LOCK:
+        snap = dict(CASH_STATES[tf])
+        rows = apply_live(snap["rows"])
+    return JSONResponse({"rows": add_conf(rows, tf), "updated": snap["updated"], "refreshing": snap["refreshing"], "progress": snap["progress"],
+                         "errors": snap["errors"][:20], "interval": tf, "n": len(rows)})
+
+
 @app.get("/api/ticks")
 def api_ticks(tf: str = DEFAULT_INTERVAL):
     """Just the live prices (a few KB), so the page can update every couple of seconds without reloading every row."""
     if tf not in INTERVALS:
         tf = DEFAULT_INTERVAL
     with LOCK:
-        rows = list(STATES[tf]["rows"])
+        rows = list(STATES[tf]["rows"]) + (list(CASH_STATES[tf]["rows"]) if tf in CASH_STATES else [])
     out = {r["symbol"]: [r["ltp"], r.get("ltp_chg")] for r in apply_live(rows) if r.get("ltp")}
     return {"p": out, "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "source": FEED["source"]}
+
+
+# ── Market mood strip: advances and declines, India VIX, strongest and weakest sector ──
+VIX = {"v": None, "chg": None, "ts": 0.0, "busy": False}
+VIX_TTL = 60
+
+
+def _vix_job():
+    try:
+        import yfinance as yf
+        df = yf.download("^INDIAVIX", period="7d", interval="1d", auto_adjust=False, progress=False)
+        if df is not None and len(df):
+            if hasattr(df.columns, "levels") and df.columns.nlevels > 1:
+                df.columns = df.columns.get_level_values(0)
+            c = df["Close"].dropna()
+            if len(c):
+                last = float(c.iloc[-1])
+                prev = float(c.iloc[-2]) if len(c) > 1 else None
+                VIX["v"] = round(last, 2)
+                VIX["chg"] = round((last / prev - 1) * 100, 2) if prev else None
+    except Exception as e:
+        print("india vix failed:", type(e).__name__, flush=True)
+    finally:
+        VIX["ts"] = time.time()
+        VIX["busy"] = False
+
+
+def ensure_vix():
+    if VIX["busy"] or time.time() - VIX["ts"] < VIX_TTL:
+        return
+    VIX["busy"] = True
+    threading.Thread(target=_vix_job, daemon=True).start()
+
+
+def mood_summary(rows, vix=None, vix_chg=None):
+    """Breadth from the stock rows (live change when there is one): advances, declines, unchanged, the sector averages, and a one-word mood."""
+    adv = dec = flat = 0
+    secs = {}
+    for r in rows:
+        if r.get("type") == "index" or r["symbol"] in INDEX_YF:
+            continue
+        c = r.get("ltp_chg") if r.get("ltp_chg") is not None else r.get("chg")
+        if c is None:
+            continue
+        if c > 0:
+            adv += 1
+        elif c < 0:
+            dec += 1
+        else:
+            flat += 1
+        sec = r.get("sector") or "Others"
+        if sec != "Others":
+            secs.setdefault(sec, []).append(c)
+    avg = {k: sum(v) / len(v) for k, v in secs.items() if len(v) >= 2}
+    best = max(avg, key=avg.get) if avg else None
+    worst = min(avg, key=avg.get) if avg else None
+    n = adv + dec + flat
+    ratio = adv / (adv + dec) if (adv + dec) else None
+    mood = None if ratio is None else "Bullish" if ratio >= 0.65 else "Bearish" if ratio <= 0.35 else "Mixed"
+    return {"adv": adv, "dec": dec, "flat": flat, "n": n, "mood": mood,
+            "best": {"name": best, "chg": round(avg[best], 2)} if best else None,
+            "worst": {"name": worst, "chg": round(avg[worst], 2)} if worst else None,
+            "vix": vix, "vix_chg": vix_chg}
+
+
+@app.get("/api/mood")
+def api_mood():
+    ensure_vix()
+    with LOCK:
+        pick = max(BASE_TFS, key=lambda t: (len(STATES[t]["rows"]), str(STATES[t]["updated"])))
+        rows = list(STATES[pick]["rows"])
+    return mood_summary(apply_live(rows), VIX["v"], VIX["chg"])
 
 
 @app.get("/api/dirs")
@@ -6346,7 +6574,7 @@ def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0, inst: str = 
     symbol = symbol.upper().strip()
     if tf not in INTERVALS:
         tf = DEFAULT_INTERVAL
-    if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol) or (symbol not in UNIVERSE and symbol not in INDEX_YF and symbol not in COMMODITIES):
+    if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol) or (symbol not in UNIVERSE and symbol not in INDEX_YF and symbol not in COMMODITIES and symbol not in CASH_SET):
         return JSONResponse({"error": "Unknown symbol."}, status_code=400)
     fut = inst == "fut" and symbol not in COMMODITIES
     key = (symbol, tf, at, fut)
@@ -8518,6 +8746,10 @@ PAGE = r"""<!doctype html>
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 "Schibsted Grotesk",system-ui,sans-serif;font-variant-numeric:tabular-nums}
 main{max-width:1180px;margin:0 auto;padding:28px 20px 60px}
+#mood{display:flex;flex-wrap:wrap;align-items:center;gap:6px 18px;margin:-8px 0 14px;padding:8px 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);font-size:13px}
+#mood .mi{display:flex;align-items:baseline;gap:6px;white-space:nowrap}#mood .l{color:var(--mute)}#mood b{font-weight:600}
+#mood .bar{display:inline-flex;width:90px;height:8px;border-radius:4px;overflow:hidden;background:var(--line);align-self:center}#mood .bar i{display:block;height:100%}#mood .bar .a{background:var(--buy)}#mood .bar .d{background:var(--sell)}
+#mood .pill2{padding:1px 9px;border-radius:999px;font-weight:600;border:1px solid currentColor}
 header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:20px}
 h1{margin:0;font-size:26px;font-weight:700;letter-spacing:-.01em}
 .sub{color:var(--mute);font-size:13px;margin-top:2px}
@@ -8549,6 +8781,7 @@ button,input{font:inherit;color:inherit}
 .tally span{color:var(--mute);font-size:13px}
 .buy b{color:var(--buy)}.sell b{color:var(--sell)}
 .bar{display:flex;gap:10px;margin-bottom:10px}
+.bar select{-webkit-appearance:none;appearance:none;background-color:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 30px 8px 12px;font:inherit;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239a98c0' stroke-width='1.6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 11px center;cursor:pointer}
 .bar input{flex:1;max-width:260px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
 .wrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow-x:auto}
 table{width:100%;border-collapse:collapse;min-width:900px}
@@ -8627,13 +8860,13 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .chtfs button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
 .chleg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--mute);margin-bottom:6px}.chleg i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
 #chart{height:min(62vh,560px);width:100%}
-.cwrap{display:grid;grid-template-columns:270px minmax(0,1fr);gap:12px;align-items:start}
+.cwrap{display:grid;grid-template-columns:316px minmax(0,1fr);gap:12px;align-items:start}
 .cwl{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px}
 .cwl input,.cwl select{width:100%;box-sizing:border-box}.cwl input,.cwl select{font:inherit;font-size:13px;color:var(--ink);background-color:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;outline:none}
 .cwl select{-webkit-appearance:none;appearance:none;padding-right:28px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239a98c0' stroke-width='1.6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;cursor:pointer}
 .cwl input:focus,.cwl select:focus{border-color:var(--acc,var(--ink))}
 .cwstar{background:none;border:0;font-size:20px;line-height:1;cursor:pointer;color:var(--mute);padding:0 6px}.cwstar[aria-pressed=true]{color:#f5b301}
-#cwList .st{display:inline-block;width:16px;margin-right:4px;font-size:14px;color:var(--mute);opacity:0;cursor:pointer}#cwList button:hover .st,#cwList .st.on{opacity:1}#cwList .st.on{color:#f5b301}
+#cwList .st{display:inline-block;flex:none;width:16px;margin-right:4px;font-size:14px;color:var(--mute);opacity:0;cursor:pointer}#cwList button:hover .st,#cwList .st.on{opacity:1}#cwList .st.on{color:#f5b301}
 @media(hover:none){#cwList .st{opacity:.5}#cwList .st.on{opacity:1}}
 #cwList .st.sp{opacity:0!important;cursor:default}#cwList .evb{color:#f59e0b;font-size:13px;margin-right:4px}
 .cwev{margin:6px 0;padding:6px 10px;border-radius:8px;font-size:13px;border:1px solid var(--line);color:var(--mute)}.cwev.soon{color:#f59e0b;border-color:#f59e0b;background:rgba(245,158,11,.08)}
@@ -8659,7 +8892,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 #cwSec option.up,#cwSec.up{color:var(--buy)}#cwSec option.dn,#cwSec.dn{color:var(--sell)}
 .cwsb{display:flex;gap:6px;align-items:center;margin:6px 0 4px}.cwsb button{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);background:var(--panel);color:inherit;cursor:pointer}.cwsb button[aria-pressed=true]{background:var(--g);color:#fff;border-color:transparent}
 #cwList .gd{font-size:10px;font-weight:700;border-radius:50%;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;color:#fff;background:#6b7280}#cwList .gd.gA{background:#0a7d5a}#cwList .gd.gB{background:#2563eb}#cwList .gd.gC{background:#b7791f}
-#cwList .nm{font-weight:600}#cwList .pc{font-size:12px}#cwList .sg{font-size:10px;border-radius:6px;padding:1px 5px;border:1px solid currentColor;opacity:.85}
+#cwList .nm{font-weight:600;display:flex;align-items:center;flex:1 1 auto;min-width:0}#cwList .nt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#cwList .rt{display:flex;align-items:center;gap:5px;flex:none;white-space:nowrap}#cwList .pc{font-size:12px}#cwList .sg{font-size:10px;border-radius:6px;padding:1px 5px;border:1px solid currentColor;opacity:.85}
 .cwm{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0}
 .cwbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}.cwbar b{font-size:18px}.cwbar .seg{margin:0}
 #cwOpt{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
@@ -8805,6 +9038,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div><h1>SignalDesk</h1><div class="sub" id="meta">Loading first scan…</div></div>
  <div class="ctl"><div class="seg" id="tfs" role="group" aria-label="Timeframe"></div><button class="btn" id="installBtn" hidden>Install app</button><button class="btn" id="refresh">Refresh now</button><div class="seg tm" id="modeSw" role="group" aria-label="Trading mode"><button data-tm="paper" aria-pressed="true">Paper</button><button data-tm="live" aria-pressed="false">Live</button></div><button id="themeBtn" title="Switch between automatic, light and dark">◐ Auto</button><button id="snd" aria-pressed="false" title="Play a sound when a new signal arrives">🔔 Sound off</button><span class="sub" id="who"></span><button class="mini" id="logout">Sign out</button></div>
 </header>
+<div class="mood" id="mood" role="status" aria-label="Market mood" hidden></div>
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
@@ -8814,7 +9048,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
 <div class="sectors" id="sectors"></div>
 <div class="tally" id="tally"></div>
-<div class="bar"><input id="q" placeholder="Search symbol" aria-label="Search symbol"><label class="chk" title="Show only signals where most checks agree. Hover a grade badge to see why."><input type="checkbox" id="confOnly"> Grade A only</label></div>
+<div class="bar"><select id="swUni" aria-label="Which stocks"><option value="all">All stocks</option><option value="fo">F&amp;O stocks</option><option value="cash">Cash stocks (not in F&amp;O)</option></select><input id="q" placeholder="Search symbol" aria-label="Search symbol"><label class="chk" title="Show only signals where most checks agree. Hover a grade badge to see why."><input type="checkbox" id="confOnly"> Grade A only</label></div>
 <div class="wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
 <div class="note" id="note"></div>
 </section>
@@ -9068,7 +9302,9 @@ const fmt=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,max
 const curCols=()=>mode==="futures"?colsFut:colsStocks;
 function renderHead(){document.getElementById("head").innerHTML=curCols().map(c=>`<th data-k="${c[0]}">${c[1]}</th>`).join("")}
 document.getElementById("head").onclick=e=>{const k=e.target.dataset.k;if(!k||k==="_t")return;sortDir=sortKey===k?-sortDir:1;sortKey=k;render()};
+let swUni="all",cash={rows:[],interval:null,updated:null,refreshing:false,errors:[]},cashT=null;try{swUni=localStorage.getItem("swUni")||"all"}catch(e){}
 document.getElementById("q").oninput=e=>{q=e.target.value.trim().toUpperCase();render()};
+document.getElementById("swUni").value=swUni;document.getElementById("swUni").onchange=e=>{swUni=e.target.value;try{localStorage.setItem("swUni",swUni)}catch(x){}render();loadCash()};
 document.getElementById("refresh").onclick=async()=>{const b=document.getElementById("refresh");b.disabled=true;await api("/api/refresh?tf="+(tf||""),{method:"POST"});setTimeout(()=>{load();b.disabled=false},4000)};
 document.getElementById("tfs").onclick=e=>{const b=e.target.closest("button");if(!b||b.dataset.tf===tf)return;
  tf=b.dataset.tf;try{localStorage.setItem("tf",tf)}catch(x){}
@@ -9080,11 +9316,11 @@ function ensureTf(){if(!tfAllowed().includes(tf)){tf=mode==="stocks"?"1d":"15m";
 let tickT=null,tickBusy=false;
 async function tick(){clearTimeout(tickT);
  try{if(mode==="stocks"&&data&&data.feed&&data.feed.source&&!document.hidden&&!tickBusy){tickBusy=true;const asked=tf;const d=await (await api("/api/ticks?tf="+asked)).json();tickBusy=false;
-  if(asked===tf&&data&&d.p&&d.age!=null&&d.age<30){let ch=false;for(const r of data.rows){const x=d.p[r.symbol];if(x&&(r.ltp!==x[0]||r.ltp_chg!==x[1])){r.ltp=x[0];if(x[1]!=null)r.ltp_chg=x[1];ch=true}}if(ch)render()}}}
+  if(asked===tf&&data&&d.p&&d.age!=null&&d.age<30){let ch=false;for(const r of data.rows.concat(cash&&cash.interval===tf?cash.rows:[])){const x=d.p[r.symbol];if(x&&(r.ltp!==x[0]||r.ltp_chg!==x[1])){r.ltp=x[0];if(x[1]!=null)r.ltp_chg=x[1];ch=true}}if(ch)render()}}}
  catch(e){tickBusy=false}
  tickT=setTimeout(tick,2000)}
 async function load(){clearTimeout(timer);const asked=tf;
- try{const d=await (await api("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;detectNew(d);render();
+ try{const d=await (await api("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;detectNew(d);render();if(!cashT||cash.interval!==tf)loadCash();
   timer=setTimeout(load,(d.refreshing||!d.updated)?3000:20000);if(!tickT)tick()}
  catch(e){document.getElementById("meta").textContent="Cannot reach the server.";timer=setTimeout(load,10000)}}
 async function loadFutInfo(){if(futLoaded)return;futLoaded=true;
@@ -9093,7 +9329,7 @@ const isOpen=r=>r.signal.startsWith("Open");
 function cellFor(r,k){
  const tp=n=>`<td class="${r.hits>=n?"up":""}">${fmt(r["tp"+n])}${r.hits>=n?" ✓":""}</td>`;
  switch(k){
-  case "symbol":return `<td><b>${esc(r.symbol)}</b>${r.type==="index"?'<span class="tag">Index</span>':""}${r.signal==="BUY"||r.signal==="SELL"?'<span class="newb">NEW</span>':""}</td>`;
+  case "symbol":return `<td><b>${esc(r.symbol)}</b>${r.cash?'<span class="tag" title="Cash stock: not in the F&O list">Cash</span>':""}${r.type==="index"?'<span class="tag">Index</span>':""}${r.signal==="BUY"||r.signal==="SELL"?'<span class="newb">NEW</span>':""}</td>`;
   case "sector":return `<td class="sub">${esc(r.sector||"")}</td>`;
   case "chg":{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?"<td>–</td>":`<td class="${c>=0?"up":"dn"}">${c>0?"+":""}${c.toFixed(2)}%</td>`}
   case "signal":return `<td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span>${confBadge(r)}</td>`;
@@ -9111,7 +9347,8 @@ function render(){
  paintTfs();
  if(mode==="charts"&&cw.ready)cwBuild();
  const fut=mode==="futures";
- const rows=fut?data.rows:data.rows.filter(r=>r.type!=="index");
+ const base=fut?data.rows:data.rows.filter(r=>r.type!=="index"),cr=(mode==="stocks"&&cash&&cash.interval===tf)?cash.rows:[];
+ const rows=mode==="stocks"?(swUni==="cash"?cr:swUni==="fo"?base:base.concat(cr)):base;
  rows.forEach(r=>{const f=futInfo[r.symbol];r.lot=f?f.lot:null;r.fexp=f?f.expiry:null});
  // sector tiles: average day change of the symbols in each sector
  const grp={};rows.forEach(r=>{const k=r.sector||"Others";(grp[k]=grp[k]||[]).push(r)});
@@ -9119,15 +9356,15 @@ function render(){
  const avg=a=>{const v=a.filter(r=>r.chg!=null).map(r=>r.chg);return v.length?v.reduce((x,y)=>x+y,0)/v.length:null};
  const pc=n=>n==null?"–":(n>0?"+":"")+n.toFixed(2)+"%";
  const tile=(key,name,a)=>{const m=avg(a),up=a.filter(r=>r.chg>0).length,dn=a.filter(r=>r.chg<0).length,b=a.filter(r=>r.signal==="BUY").length,se=a.filter(r=>r.signal==="SELL").length;
-  return `<button class="${m==null?"":m>=0?"pos":"neg"}" data-sec="${esc(key)}" aria-pressed="${sector===key}"><span class="sn" title="${esc(name)}">${esc(name)}${secDir[name]?` <i class="dir ${secDir[name].direction}" title="Sector direction: ${secDir[name].direction}, ${secDir[name].above_pct}% of stocks above their trend line">${secDir[name].direction==="Up"?"▲":secDir[name].direction==="Down"?"▼":"◆"}</i>`:""}</span><span class="sc ${m==null?"":m>=0?"up":"dn"}">${pc(m)}</span><span class="ss">${a.length} · ${up} up, ${dn} down</span>${b||se?`<span class="ss">${b} buy, ${se} sell</span>`:""}</button>`};
- const order=Object.keys(grp).sort((a,b)=>(avg(grp[b])??-1e9)-(avg(grp[a])??-1e9));
+  return `<button data-sec="${esc(key)}" aria-pressed="${sector===key}"><span class="sn" title="${esc(name)}">${esc(name)}${secDir[name]?` <i class="dir ${secDir[name].direction}" title="Sector direction: ${secDir[name].direction}, ${secDir[name].above_pct}% of stocks above their trend line">${secDir[name].direction==="Up"?"▲":secDir[name].direction==="Down"?"▼":"◆"}</i>`:""}</span><span class="ss">${a.length} stocks</span>${b||se?`<span class="ss">${b} buy, ${se} sell</span>`:""}</button>`};
+ const order=Object.keys(grp).sort((a,b)=>a==="Others"?1:b==="Others"?-1:a.localeCompare(b));
  const sc=document.getElementById("sectors");
  sc.innerHTML=order.map(k=>tile(k,k,grp[k])).join("");
  sc.onclick=e=>{const b=e.target.closest("button");if(b){sector=sector===b.dataset.sec?"ALL":b.dataset.sec;render()}};
  const ix=["NIFTY","BANKNIFTY","SENSEX"].map(n=>data.rows.find(r=>r.symbol===n)).filter(Boolean);
  document.getElementById("idxTiles").innerHTML=ix.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,px=r.ltp!=null?r.ltp:r.close;
   return `<div><span class="sn">${esc(r.symbol)}</span><span class="sc ${c==null?"":c>=0?"up":"dn"}">${fmt(px)}</span><span class="ss ${c==null?"":c>=0?"up":"dn"}">${c==null?"–":(c>0?"+":"")+c.toFixed(2)+"%"}${r.signal&&r.signal!=="–"?` · ${esc(r.signal)}`:""}</span></div>`}).join("");
- document.getElementById("secnote").innerHTML="Average change since the previous session's close, best sector first. Click a sector to filter, click again to clear. ▲▼ shows the sector's direction."+(sector!=="ALL"&&grp[sector]?` <button class="btn ghost" id="secChart">Chart ${esc(sector)}</button>`:"");
+ document.getElementById("secnote").innerHTML="Click a sector to filter the list, click again to clear. ▲▼ shows the sector's direction."+(sector!=="ALL"&&grp[sector]?` <button class="btn ghost" id="secChart">Chart ${esc(sector)}</button>`:"");
  const scb=document.getElementById("secChart");if(scb)scb.onclick=()=>openChart(sector,tf,0,true);
  const dk=tf+"|"+(data.updated||"");if(dk!==secDirKey){secDirKey=dk;api("/api/sectors?tf="+encodeURIComponent(tf)).then(r=>r.json()).then(j=>{secDir=j.sectors||{};if(secDirKey===dk)paintSecDir()}).catch(()=>{})}
  const srows=sector==="ALL"?rows:grp[sector];
@@ -9141,17 +9378,30 @@ function render(){
  v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
   if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
  const cs=curCols();
- document.getElementById("body").innerHTML=v.length?v.map(r=>`<tr${rowCls(r)}>${cs.map(c=>cellFor(r,c[0])).join("")}</tr>`).join(""):`<tr><td colspan="${cs.length}" class="empty">${data.updated?"No symbols match this filter.":"First scan is running. This page updates on its own."}</td></tr>`;
- document.getElementById("note").textContent=(data.errors.length?`${data.errors.length} symbol(s) skipped: ${data.errors.slice(0,3).join("; ")}${data.errors.length>3?"…":""}. `:"")+`BUY and SELL show for ${data.fresh_bars} candles after a signal. Open trades are older signals whose stop and T4 have not been reached. Entry, SL and targets come from the latest signal for each symbol.`+(fut?" Futures signals come from the same indicator on the stock's or index's own candles (spot prices). The lot size and expiry shown are for the nearest-month contract, from Angel One's instrument list.":"");
+ document.getElementById("body").innerHTML=v.length?v.map(r=>`<tr${rowCls(r)}>${cs.map(c=>cellFor(r,c[0])).join("")}</tr>`).join(""):`<tr><td colspan="${cs.length}" class="empty">${data.updated?"No symbols match this filter.":(swUni==="cash"&&cash.refreshing?"Scanning the cash stocks. This takes a minute the first time, then updates on its own.":"First scan is running. This page updates on its own.")}</td></tr>`;
+ document.getElementById("note").textContent=(swUni!=="fo"&&mode==="stocks"?(cash.refreshing?(cash.progress?`Scanning cash stocks: ${cash.progress[0]} of ${cash.progress[1]}. `:"Scanning cash stocks. "):cash.n?`${cash.n} cash stocks (not in F&O) are included. `:""):"")+(data.errors.length?`${data.errors.length} symbol(s) skipped: ${data.errors.slice(0,3).join("; ")}${data.errors.length>3?"…":""}. `:"")+`BUY and SELL show for ${data.fresh_bars} candles after a signal. Open trades are older signals whose stop and T4 have not been reached. Entry, SL and targets come from the latest signal for each symbol.`+(fut?" Futures signals come from the same indicator on the stock's or index's own candles (spot prices). The lot size and expiry shown are for the nearest-month contract, from Angel One's instrument list.":"");
 }
 // ── Options tab ──
 let mode="stocks",osym="",oexp="",oreq=0;
+async function loadCash(){clearTimeout(cashT);if(mode!=="stocks"||swUni==="fo")return;const asked=tf;
+ try{const d=await (await api("/api/cash?tf="+asked)).json();if(asked!==tf||mode!=="stocks")return;cash=d;render();cashT=setTimeout(loadCash,(d.refreshing||!d.updated)?4000:30000)}catch(e){cashT=setTimeout(loadCash,10000)}}
 let optOverride="";
 const optTf=()=>mode==="charts"?cw.tf:(optOverride||tf||"");
 const chainMem={};
 function chainFetch(sym,exp,tfv){const u=`/api/options/chain?symbol=${encodeURIComponent(sym)}&tf=${tfv}`+(exp?`&expiry=${encodeURIComponent(exp)}`:"");const h=chainMem[u];
  if(h&&Date.now()-h.at<15000)return h.p;const p=api(u).then(r=>r.json());chainMem[u]={at:Date.now(),p};p.catch(()=>{delete chainMem[u]});return p}
 try{mode=localStorage.getItem("mode")||"stocks"}catch(e){}
+function moodPaint(d){const b=$("mood");if(!b)return;if(!d||!d.n){b.hidden=true;return}
+ const sg=n=>(n>0?"+":"")+n.toFixed(2)+"%",cl=n=>n>=0?"up":"dn",tot=d.adv+d.dec||1,pa=d.adv/tot*100;
+ const mc=d.mood==="Bullish"?"up":d.mood==="Bearish"?"dn":"";
+ b.hidden=false;
+ b.innerHTML=`<span class="mi" title="Stocks up versus down today, out of ${d.n} tracked"><span class="l">Advances / declines</span><b class="up">${d.adv}</b><span class="bar" aria-hidden="true"><i class="a" style="width:${pa}%"></i><i class="d" style="width:${100-pa}%"></i></span><b class="dn">${d.dec}</b>${d.flat?`<span class="l">(${d.flat} flat)</span>`:""}</span>`
+  +(d.mood?`<span class="mi"><span class="l">Breadth</span><span class="pill2 ${mc}">${d.mood}</span></span>`:"")
+  +(d.vix!=null?`<span class="mi" title="India VIX: how much movement the options market expects. Rising means more fear, so expect bigger swings."><span class="l">India VIX</span><b>${d.vix.toFixed(2)}</b>${d.vix_chg!=null?`<span class="${d.vix_chg>0?"dn":"up"}">${sg(d.vix_chg)}</span>`:""}</span>`:"")
+  +(d.best?`<span class="mi" title="Average move of the stocks in the sector today"><span class="l">Strongest</span><b>${esc(d.best.name)}</b><span class="${cl(d.best.chg)}">${sg(d.best.chg)}</span></span>`:"")
+  +(d.worst&&d.worst.name!==(d.best&&d.best.name)?`<span class="mi"><span class="l">Weakest</span><b>${esc(d.worst.name)}</b><span class="${cl(d.worst.chg)}">${sg(d.worst.chg)}</span></span>`:"")}
+async function moodLoad(){try{if(document.hidden)return;moodPaint(await (await api("/api/mood")).json())}catch(e){}}
+setTimeout(moodLoad,1500);setInterval(moodLoad,30000);
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(a>=1e7?(a/1e7).toFixed(2)+" Cr":a>=1e5?(a/1e5).toFixed(2)+" L":a>=1e3?(a/1e3).toFixed(1)+" K":String(Math.round(a)))};
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
@@ -9178,9 +9428,9 @@ function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec
  const secOf=r=>r.type==="index"?"Indices":(r.sector||"Others"),chgOf=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?null:c},sa={};
  rows.forEach(r=>{const c=chgOf(r);if(c==null)return;const k=secOf(r);(sa[k]=sa[k]||[]).push(c)});
  const avg=k=>sa[k]&&k!=="Others"&&k!=="Indices"?sa[k].reduce((x,y)=>x+y,0)/sa[k].length:null;   // a sector's average move today, from the stocks in it
- const secs=[...new Set(rows.map(secOf))].sort((a,b)=>{const x=avg(a),y=avg(b);return x==null&&y==null?a.localeCompare(b):x==null?1:y==null?-1:y-x});
- const scls=k=>{const a=avg(k);return a==null?"":a>=0?"up":"dn"},lab=k=>{const a=avg(k);return a==null?k:`${k}  ${a>0?"+":""}${a.toFixed(2)}%`},sel=$("cwSec"),sig=secs.join("|");
- if(sel.dataset.sig!==sig&&document.activeElement!==sel){sel.dataset.sig=sig;sel.innerHTML='<option value="ALL">All sectors (best to worst)</option>'+secs.map(x=>`<option value="${esc(x)}" class="${scls(x)}">${esc(lab(x))}</option>`).join("");sel.value=secs.includes(sec)?sec:"ALL"}
+ const secs=[...new Set(rows.map(secOf))].sort((a,b)=>a==="Others"?1:b==="Others"?-1:a.localeCompare(b));
+ const scls=k=>"",lab=k=>k,sel=$("cwSec"),sig=secs.join("|");
+ if(sel.dataset.sig!==sig&&document.activeElement!==sel){sel.dataset.sig=sig;sel.innerHTML='<option value="ALL">All sectors</option>'+secs.map(x=>`<option value="${esc(x)}" class="${scls(x)}">${esc(lab(x))}</option>`).join("");sel.value=secs.includes(sec)?sec:"ALL"}
  else[...sel.options].forEach(o=>{if(o.value!=="ALL"){o.textContent=lab(o.value);o.className=scls(o.value)}});
  sel.className=sel.value==="ALL"?"":scls(sel.value)   // green for a sector that is up today, red for one that is down
  let v=rows.filter(r=>{if(q&&!r.symbol.includes(q))return false;if(r.type==="index")return true;   // the indices stay on top whatever the sector and Show filters say; only a typed search narrows them
@@ -9192,7 +9442,7 @@ function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec
  [...document.querySelectorAll("#cwSortBar button")].forEach(x=>{const on=x.dataset.k===so;x.setAttribute("aria-pressed",on);x.textContent=({az:"A–Z",grade:"Grade",chg:"% change"})[x.dataset.k]+(on?(dr===1?" ↓":" ↑"):"")});
  cw.view=v.map(r=>r.symbol);const keepTop=$("cwList").scrollTop;
  $("cwList").innerHTML=v.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,sg=r.signal&&r.signal!=="–"?(r.side==="BUY"?"BUY":"SELL"):"";
-  return `<button role="option" data-s="${esc(r.symbol)}" class="${cw.dirs[r.symbol]==="BUY"?"fg":cw.dirs[r.symbol]==="SELL"?"fr":""}" title="${cw.dirs[r.symbol]?"5 min and 15 min both "+(cw.dirs[r.symbol]==="BUY"?"green":"red"):""}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${r.type==="index"?'<span class="st sp"></span>':`<span class="st${cw.wl.has(r.symbol)?" on":""}" data-star="${esc(r.symbol)}" title="${cw.wl.has(r.symbol)?"Remove from my watchlist":"Add to my watchlist"}" aria-hidden="true">${cw.wl.has(r.symbol)?"★":"☆"}</span>`}${esc(r.symbol)}</span><span>${evSoon(r.symbol).length?`<span class="evb" title="${esc(evSoon(r.symbol).map(e=>e.kind+" "+evWhen(e)).join(", "))}" aria-label="Event soon">⚠</span>`:""}${r.conf&&r.conf.g?`<span class="gd g${r.conf.g}" title="Grade ${r.conf.g}, score ${r.conf.s} of 100">${r.conf.g}</span> `:""}${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
+  return `<button role="option" data-s="${esc(r.symbol)}" class="${cw.dirs[r.symbol]==="BUY"?"fg":cw.dirs[r.symbol]==="SELL"?"fr":""}" title="${cw.dirs[r.symbol]?"5 min and 15 min both "+(cw.dirs[r.symbol]==="BUY"?"green":"red"):""}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${r.type==="index"?'<span class="st sp"></span>':`<span class="st${cw.wl.has(r.symbol)?" on":""}" data-star="${esc(r.symbol)}" title="${cw.wl.has(r.symbol)?"Remove from my watchlist":"Add to my watchlist"}" aria-hidden="true">${cw.wl.has(r.symbol)?"★":"☆"}</span>`}<span class="nt">${esc(r.symbol)}</span></span><span class="rt">${evSoon(r.symbol).length?`<span class="evb" title="${esc(evSoon(r.symbol).map(e=>e.kind+" "+evWhen(e)).join(", "))}" aria-label="Event soon">⚠</span>`:""}${r.conf&&r.conf.g?`<span class="gd g${r.conf.g}" title="Grade ${r.conf.g}, score ${r.conf.s} of 100">${r.conf.g}</span> `:""}${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
 function cwMark(){document.querySelectorAll("#cwList button").forEach(b=>{const on=b.dataset.s===cw.sym;b.setAttribute("aria-selected",on);if(on)b.scrollIntoView({block:"nearest"})})}
 function cwShow(){cwDirs();if(!cw.ready){cw.ready=true;
   $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSortBar").onclick=e=>{const b=e.target.closest("button");if(!b)return;if(cw.sk===b.dataset.k)cw.sd=-(cw.sd||1);else{cw.sk=b.dataset.k;cw.sd=1}cwBuild()};$("cwShow").onchange=()=>cwBuild();
@@ -9348,7 +9598,7 @@ function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
  if(m==="autopilot")botLoad();else clearTimeout(botTimer);
  if(m==="orders")loadOrders();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
- if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render()}}
+ if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render();if(m==="stocks")loadCash()}}
 function initConf(){$("confOnly").onchange=()=>render()}
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
 document.getElementById("omore").onchange=()=>{if(lastChain)renderChain(lastChain)};
