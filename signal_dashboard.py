@@ -1864,7 +1864,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16o"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16p"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -9428,9 +9428,9 @@ function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec
  const secOf=r=>r.type==="index"?"Indices":(r.sector||"Others"),chgOf=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?null:c},sa={};
  rows.forEach(r=>{const c=chgOf(r);if(c==null)return;const k=secOf(r);(sa[k]=sa[k]||[]).push(c)});
  const avg=k=>sa[k]&&k!=="Others"&&k!=="Indices"?sa[k].reduce((x,y)=>x+y,0)/sa[k].length:null;   // a sector's average move today, from the stocks in it
- const secs=[...new Set(rows.map(secOf))].sort((a,b)=>a==="Others"?1:b==="Others"?-1:a.localeCompare(b));
- const scls=k=>"",lab=k=>k,sel=$("cwSec"),sig=secs.join("|");
- if(sel.dataset.sig!==sig&&document.activeElement!==sel){sel.dataset.sig=sig;sel.innerHTML='<option value="ALL">All sectors</option>'+secs.map(x=>`<option value="${esc(x)}" class="${scls(x)}">${esc(lab(x))}</option>`).join("");sel.value=secs.includes(sec)?sec:"ALL"}
+ const secs=[...new Set(rows.map(secOf))].sort((a,b)=>{const x=avg(a),y=avg(b);return x==null&&y==null?a.localeCompare(b):x==null?1:y==null?-1:y-x});
+ const scls=k=>{const a=avg(k);return a==null?"":a>=0?"up":"dn"},lab=k=>{const a=avg(k);return a==null?k:`${k}  ${a>0?"+":""}${a.toFixed(2)}%`},sel=$("cwSec"),sig=secs.join("|");
+ if(sel.dataset.sig!==sig&&document.activeElement!==sel){sel.dataset.sig=sig;sel.innerHTML='<option value="ALL">All sectors (best to worst)</option>'+secs.map(x=>`<option value="${esc(x)}" class="${scls(x)}">${esc(lab(x))}</option>`).join("");sel.value=secs.includes(sec)?sec:"ALL"}
  else[...sel.options].forEach(o=>{if(o.value!=="ALL"){o.textContent=lab(o.value);o.className=scls(o.value)}});
  sel.className=sel.value==="ALL"?"":scls(sel.value)   // green for a sector that is up today, red for one that is down
  let v=rows.filter(r=>{if(q&&!r.symbol.includes(q))return false;if(r.type==="index")return true;   // the indices stay on top whatever the sector and Show filters say; only a typed search narrows them
