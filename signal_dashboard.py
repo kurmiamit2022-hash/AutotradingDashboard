@@ -1864,7 +1864,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16p"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16q"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8858,6 +8858,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .chbox{padding:14px 16px}.chhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}.chhead b{font-size:18px}
 .chtfs{display:flex;gap:4px;margin-left:auto}.chtfs button{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:4px 12px;cursor:pointer;font:inherit}
 .chtfs button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
+.chnav{display:inline-flex;align-items:center;gap:6px}.chnav .btn{padding:4px 10px}
 .chleg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--mute);margin-bottom:6px}.chleg i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
 #chart{height:min(62vh,560px);width:100%}
 .cwrap{display:grid;grid-template-columns:316px minmax(0,1fr);gap:12px;align-items:start}
@@ -9249,8 +9250,9 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div class="tkbtns"><button class="btn ghost" id="limClose">Close</button><button class="btn" id="limSave">Save</button></div>
 </div></dialog>
 <dialog id="chartDlg"><div class="chbox">
- <div class="chhead"><b id="chTitle"></b><div class="chtfs" id="chTfs"></div><button class="btn ghost" id="chClose">Close</button></div>
+ <div class="chhead"><b id="chTitle"></b><span class="chnav" id="chNav" hidden><button class="btn ghost" id="chPrev" title="Previous stock (↑ or K)" aria-label="Previous stock">▲</button><button class="btn ghost" id="chNext" title="Next stock (↓ or J)" aria-label="Next stock">▼</button><span class="sub" id="chPos"></span></span><div class="chtfs" id="chTfs"></div><button class="btn ghost" id="chClose">Close</button></div>
  <div class="chleg" id="chLeg"></div>
+ <div class="sub" id="chHint" hidden>↑ ↓ next or previous stock in your list · ← → timeframe · Esc closes</div>
  <div class="chtrade" id="chTrade"></div>
  <div id="chMsg" class="tkmsg" role="status"></div>
  <div id="chart"></div>
@@ -9377,14 +9379,14 @@ function render(){
  let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q))&&(!$("confOnly").checked||(r.conf&&r.conf.g==="A"))&&(sector==="ALL"||(r.sector||"Others")===sector));
  v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
   if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
- const cs=curCols();
+ const cs=curCols();swView=v.map(r=>r.symbol);
  document.getElementById("body").innerHTML=v.length?v.map(r=>`<tr${rowCls(r)}>${cs.map(c=>cellFor(r,c[0])).join("")}</tr>`).join(""):`<tr><td colspan="${cs.length}" class="empty">${data.updated?"No symbols match this filter.":(swUni==="cash"&&cash.refreshing?"Scanning the cash stocks. This takes a minute the first time, then updates on its own.":"First scan is running. This page updates on its own.")}</td></tr>`;
  document.getElementById("note").textContent=(swUni!=="fo"&&mode==="stocks"?(cash.refreshing?(cash.progress?`Scanning cash stocks: ${cash.progress[0]} of ${cash.progress[1]}. `:"Scanning cash stocks. "):cash.n?`${cash.n} cash stocks (not in F&O) are included. `:""):"")+(data.errors.length?`${data.errors.length} symbol(s) skipped: ${data.errors.slice(0,3).join("; ")}${data.errors.length>3?"…":""}. `:"")+`BUY and SELL show for ${data.fresh_bars} candles after a signal. Open trades are older signals whose stop and T4 have not been reached. Entry, SL and targets come from the latest signal for each symbol.`+(fut?" Futures signals come from the same indicator on the stock's or index's own candles (spot prices). The lot size and expiry shown are for the nearest-month contract, from Angel One's instrument list.":"");
 }
 // ── Options tab ──
 let mode="stocks",osym="",oexp="",oreq=0;
 async function loadCash(){clearTimeout(cashT);if(mode!=="stocks"||swUni==="fo")return;const asked=tf;
- try{const d=await (await api("/api/cash?tf="+asked)).json();if(asked!==tf||mode!=="stocks")return;cash=d;render();cashT=setTimeout(loadCash,(d.refreshing||!d.updated)?4000:30000)}catch(e){cashT=setTimeout(loadCash,10000)}}
+ try{const d=await (await api("/api/cash?tf="+asked)).json();if(asked!==tf||mode!=="stocks")return;cash=d;cashSet=new Set((d.rows||[]).map(r=>r.symbol));render();cashT=setTimeout(loadCash,(d.refreshing||!d.updated)?4000:30000)}catch(e){cashT=setTimeout(loadCash,10000)}}
 let optOverride="";
 const optTf=()=>mode==="charts"?cw.tf:(optOverride||tf||"");
 const chainMem={};
@@ -9877,15 +9879,22 @@ function initScanner(){
   else{cw.sym=sy;cw.tf=scTf;cw.inst="opt";cw.exp="";cw.strike=null;cwSave();setMode("charts")}}}
 // ── chart popup (TradingView's open-source Lightweight Charts) ──
 let lwPromise=null,chSym="",chTf="",chAt=0,chObj=null;
+let chList=[],swView=[],cashSet=new Set();const chMem=new Map();
+function chFetch(sym,t,at){const k=sym+"|"+t+"|"+(at||0),h=chMem.get(k);if(h&&Date.now()-h.at<90000)return h.p;
+ const p=api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${t}${at?'&at='+at:''}`).then(r=>r.json());chMem.set(k,{at:Date.now(),p});p.catch(()=>chMem.delete(k));
+ if(chMem.size>60)chMem.delete(chMem.keys().next().value);return p}
+function chPrefetch(){if(!chList.length||chSec)return;const i=chList.indexOf(chSym);if(i<0)return;for(const j of [1,2,3,-1]){const n=chList[i+j];if(n)chFetch(n,chTf,0).catch(()=>{})}}
+function chPaintNav(){const on=chList.length>1&&!chSec,i=chList.indexOf(chSym);$("chNav").hidden=!on;$("chHint").hidden=!on;if(on)$("chPos").textContent=(i+1)+" of "+chList.length}
+function chGo(d){if(chList.length<2||chSec)return;let i=chList.indexOf(chSym);if(i<0)i=0;i=(i+d+chList.length)%chList.length;chSym=chList[i];chAt=0;$("chTitle").textContent=chSym;chPaintNav();drawChart()}
 function loadLW(){if(window.LightweightCharts)return Promise.resolve();
  return lwPromise||(lwPromise=new Promise((ok,no)=>{const s=document.createElement("script");s.src="/lw.js";s.onload=ok;s.onerror=()=>{lwPromise=null;no()};document.head.appendChild(s)}))}
 function paintSecDir(){document.querySelectorAll("#sectors button[data-sec]").forEach(b=>{const d=secDir[b.dataset.sec],sn=b.querySelector(".sn");if(!d||!sn||sn.querySelector(".dir"))return;const i=document.createElement("i");i.className="dir "+d.direction;i.textContent=d.direction==="Up"?"▲":d.direction==="Down"?"▼":"◆";i.title="Sector direction: "+d.direction+", "+d.above_pct+"% of stocks above their trend line";sn.append(" ",i)})}
 let chSec=false;
-function openChart(sym,t,at,isSec){chSec=!!isSec;chSym=sym;chTf=t||tf||"15m";chAt=at||0;$("chTitle").textContent=chSec?sym+" sector (equal-weight index of its stocks)":sym;$("chTfs").innerHTML=(data?data.intervals:["5m","15m","1d"]).map(x=>`<button data-ct="${x}" aria-pressed="${x===chTf}">${tfName[x]||x}</button>`).join("");
- if(!$("chartDlg").open)$("chartDlg").showModal();drawChart()}
+function openChart(sym,t,at,isSec){chSec=!!isSec;chList=(!isSec&&mode==="stocks"&&swView.includes(sym))?swView.slice():[];chSym=sym;chTf=t||tf||"15m";chAt=at||0;$("chTitle").textContent=chSec?sym+" sector (equal-weight index of its stocks)":sym;$("chTfs").innerHTML=(data?data.intervals:["5m","15m","1d"]).map(x=>`<button data-ct="${x}" aria-pressed="${x===chTf}">${tfName[x]||x}</button>`).join("");
+ if(!$("chartDlg").open)$("chartDlg").showModal();chPaintNav();drawChart()}
 function chTradeBar(d){if(d.commodity){$("chTrade").innerHTML='<span class="sub">Commodities are view-only here. Orders are not available yet.</span>';$("chTrade").onclick=null;return}
  const last=d.candles[d.candles.length-1].close,idx=d.index,sy=d.symbol,bt=(c,a,t)=>`<button class="${c}" data-ct2="${a}">${t}</button>`;
- $("chTrade").innerHTML=(idx?"":bt("b","eq-BUY","Buy shares")+bt("s","eq-SELL","Sell shares")+bt("b","fut-BUY","Buy futures")+bt("s","fut-SELL","Sell futures"))+bt("b","opt-CE","Buy Call (CE)")+bt("s","opt-PE","Buy Put (PE)")+'<span class="sub">Opens the order ticket to review. Nothing is sent yet.</span>';
+ const cs=cashSet.has(sy);$("chTrade").innerHTML=(idx?"":bt("b","eq-BUY","Buy shares")+bt("s","eq-SELL","Sell shares")+(cs?"":bt("b","fut-BUY","Buy futures")+bt("s","fut-SELL","Sell futures")))+(cs?"":bt("b","opt-CE","Buy Call (CE)")+bt("s","opt-PE","Buy Put (PE)"))+'<span class="sub">Opens the order ticket to review. Nothing is sent yet.</span>';
  $("chTrade").onclick=async e=>{const b=e.target.closest("button[data-ct2]");if(!b)return;const [k,v]=b.dataset.ct2.split("-");
   if(k==="eq")openTicket({kind:"equity",symbol:sy,label:sy,side:v,price:last});
   else if(k==="fut")openTicket({kind:"future",symbol:sy,label:sy+" futures, nearest month",side:v,price:last,tf:chTf});
@@ -9893,15 +9902,19 @@ function chTradeBar(d){if(d.commodity){$("chTrade").innerHTML='<span class="sub"
 function initChart(){
  $("chTfs").onclick=e=>{const b=e.target.closest("button");if(b){chTf=b.dataset.ct;chAt=0;$("chTfs").querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.ct===chTf));drawChart()}};
  $("chClose").onclick=()=>$("chartDlg").close();
+ $("chPrev").onclick=()=>chGo(-1);$("chNext").onclick=()=>chGo(1);
+ $("chartDlg").addEventListener("keydown",e=>{if(e.target.closest("input,select,textarea")||e.ctrlKey||e.metaKey||e.altKey)return;const k=e.key;
+  if(k==="ArrowDown"||k==="j"||k==="J"){e.preventDefault();chGo(1)}else if(k==="ArrowUp"||k==="k"||k==="K"){e.preventDefault();chGo(-1)}
+  else if(k==="ArrowLeft"||k==="ArrowRight"){const bs=[...$("chTfs").querySelectorAll("button")],i=bs.findIndex(b=>b.dataset.ct===chTf),n=bs[i+(k==="ArrowRight"?1:-1)];if(n){e.preventDefault();n.click()}}});
  $("chartDlg").addEventListener("close",()=>{if(chObj){chObj.remove();chObj=null}})}
 async function drawChart(){
  const my=chSym+chTf+chAt;$("chMsg").textContent="Loading chart…";$("chLeg").innerHTML="";
  if(chObj){chObj.remove();chObj=null}
  try{await loadLW()}catch(e){$("chMsg").textContent="The chart library did not load. Reload the page and try again.";return}
- let d;try{const r=await api(chSec?`/api/sector_chart?sector=${encodeURIComponent(chSym)}&tf=${chTf}`:`/api/chart?symbol=${encodeURIComponent(chSym)}&tf=${chTf}${chAt?'&at='+chAt:''}`);d=await r.json();if(chSec&&d.candles){d.markers=[];d.signal=null;d.lines=d.trend?{stop:[],ema:d.trend}:null}}catch(e){$("chMsg").textContent="The server did not return chart data. Try again in a moment.";return}
+ let d;try{d=chSec?await (await api(`/api/sector_chart?sector=${encodeURIComponent(chSym)}&tf=${chTf}`)).json():await chFetch(chSym,chTf,chAt);if(chSec&&d.candles){d.markers=[];d.signal=null;d.lines=d.trend?{stop:[],ema:d.trend}:null}}catch(e){$("chMsg").textContent="The server did not return chart data. Try again in a moment.";return}
  if(my!==chSym+chTf+chAt)return;
- if(d.error){$("chMsg").textContent=d.error;return}
- $("chMsg").textContent="";
+ if(d.error){$("chMsg").textContent=d.error;chMem.delete(chSym+"|"+chTf+"|"+(chAt||0));return}
+ $("chMsg").textContent="";setTimeout(chPrefetch,50);
  const css=getComputedStyle(document.documentElement),col=(n,f)=>css.getPropertyValue(n).trim()||f;
  const ink=col("--ink","#222"),line=col("--line","#ddd"),up=col("--buy","#0a7d5a"),dn=col("--sell","#c0392b");
  const ch=LightweightCharts.createChart($("chart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{rightOffset:7,borderColor:line,timeVisible:d.intraday,secondsVisible:false},crosshair:{mode:0}});
