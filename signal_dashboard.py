@@ -1737,7 +1737,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16i"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16j"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8495,7 +8495,10 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 #chart{height:min(62vh,560px);width:100%}
 .cwrap{display:grid;grid-template-columns:270px minmax(0,1fr);gap:12px;align-items:start}
 .cwl{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px}
-.cwl input,.cwl select{width:100%;box-sizing:border-box}
+.cwl input,.cwl select{width:100%;box-sizing:border-box}.cwl input,.cwl select{font:inherit;font-size:13px;color:var(--ink);background-color:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;outline:none}
+.cwl select{-webkit-appearance:none;appearance:none;padding-right:28px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239a98c0' stroke-width='1.6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;cursor:pointer}
+.cwl input:focus,.cwl select:focus{border-color:var(--acc,var(--ink))}
+#cwSec option,#cwShow option{font-size:13px;font-family:inherit;background:var(--panel);color:var(--ink);font-weight:400}
 #cwReco{border:2px solid transparent;border-radius:14px;background:linear-gradient(var(--panel),var(--panel)) padding-box,linear-gradient(135deg,#f97316,#dc2626,#7c3aed) border-box}
 .rcc{--rc:#b45309;--rcbg:rgba(245,158,11,.13);border-left:6px solid var(--rc)!important;background:var(--rcbg)}
 .rcc.fav{--rc:#047857;--rcbg:rgba(16,185,129,.15)}.rcc.ag{--rc:#b91c1c;--rcbg:rgba(239,68,68,.14)}.rcc.no{--rc:#6b7280;--rcbg:transparent}
@@ -8513,7 +8516,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 @media(prefers-reduced-motion:reduce){#cwList button.fg,#cwList button.fr{animation:none}#cwList button.fg{background:rgba(22,163,74,.4)}#cwList button.fr{background:rgba(220,38,38,.4)}}
 #cwList button:hover{background:rgba(120,120,160,.12)}#cwList button[aria-selected=true]{background:var(--ink);color:var(--panel)}
 .cwlive{margin-left:10px;font-size:12px;color:var(--buy);font-weight:600}
-#cwSec option.up,#cwSec.up{color:var(--buy);font-weight:600}#cwSec option.dn,#cwSec.dn{color:var(--sell);font-weight:600}
+#cwSec option.up,#cwSec.up{color:var(--buy)}#cwSec option.dn,#cwSec.dn{color:var(--sell)}
 .cwsb{display:flex;gap:6px;align-items:center;margin:6px 0 4px}.cwsb button{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);background:var(--panel);color:inherit;cursor:pointer}.cwsb button[aria-pressed=true]{background:var(--g);color:#fff;border-color:transparent}
 #cwList .gd{font-size:10px;font-weight:700;border-radius:50%;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;color:#fff;background:#6b7280}#cwList .gd.gA{background:#0a7d5a}#cwList .gd.gB{background:#2563eb}#cwList .gd.gC{background:#b7791f}
 #cwList .nm{font-weight:600}#cwList .pc{font-size:12px}#cwList .sg{font-size:10px;border-radius:6px;padding:1px 5px;border:1px solid currentColor;opacity:.85}
