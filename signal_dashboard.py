@@ -44,7 +44,10 @@ from fastapi import Body, FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # ── Settings: keep these equal to the indicator's inputs ──
-INTERVALS = ["5m", "15m", "1d"]   # timeframes offered on the dashboard
+BASE_TFS = ["5m", "15m", "1d"]       # the timeframes every part of the app works with
+INTERVALS = BASE_TFS + ["1w"]         # plus Weekly, which only the SWING view uses; it is scanned on demand and built from the daily candles
+DAYLIKE = ("1d", "1w")                # timeframes made of whole days
+YF_IV = {"1w": "1wk"}                 # Yahoo's name for Weekly
 DEFAULT_INTERVAL = os.getenv("INTERVAL", "15m")
 if DEFAULT_INTERVAL not in INTERVALS:
     DEFAULT_INTERVAL = "15m"
@@ -66,10 +69,11 @@ HOST = os.getenv("HOST", "127.0.0.1")
 OPTION_TTL = int(os.getenv("OPTION_TTL", "120"))                 # seconds an option chain stays cached
 STRIKES_EACH_SIDE = int(os.getenv("STRIKES_EACH_SIDE", "25"))       # strikes shown above and below the money (set STRIKES_EACH_SIDE in Render to change)
 
-PERIODS = {"5m": "30d", "15m": "60d", "1d": "2y"}
+PERIODS = {"5m": "30d", "15m": "60d", "1d": "2y", "1w": "6y"}
 STEP = {"5m": pd.Timedelta(minutes=5), "15m": pd.Timedelta(minutes=15), "1h": pd.Timedelta(hours=1)}
 IST = "Asia/Kolkata"
 MIN_BARS = 150
+MIN_BARS_WEEKLY = 100   # Weekly has far fewer candles to go on
 
 DEFAULT_SYMBOLS = [
     "360ONE", "ABB", "ABCAPITAL", "ADANIENSOL", "ADANIENT",
@@ -267,7 +271,10 @@ def drop_forming(df, interval):
         return df
     now = pd.Timestamp.now(tz=IST)
     last = df.index[-1]
-    if interval == "1d":
+    if interval == "1w":   # the week is still running until Friday's close (`last` is the week's first trading day)
+        fri = (last + pd.Timedelta(days=4 - last.weekday())).normalize() + pd.Timedelta(hours=15, minutes=30)
+        forming = now < fri
+    elif interval == "1d":
         forming = last.date() == now.date() and now.time() < dtime(15, 30)
     else:
         forming = last + STEP[interval] > now
@@ -275,7 +282,7 @@ def drop_forming(df, interval):
 
 
 def fmt_time(ts, interval):
-    return ts.strftime("%d %b %H:%M") if interval != "1d" else ts.strftime("%d %b")
+    return ts.strftime("%d %b %H:%M") if interval not in DAYLIKE else ts.strftime("%d %b")
 
 
 def eval_signals(symbol, df, interval, idxs, buy, c, hi, lo, atr, ls, ss):
@@ -303,11 +310,12 @@ def eval_signals(symbol, df, interval, idxs, buy, c, hi, lo, atr, ls, ss):
                     hits += 1
         ts = df.index[j]
         out.append({"symbol": symbol, "sector": sector, "side": "BUY" if side == 1 else "SELL", "t": int(ts.timestamp()),
-                    "time": fmt_time(ts, interval), "hour": int(ts.hour) if interval != "1d" else None,
+                    "time": fmt_time(ts, interval), "hour": int(ts.hour) if interval not in DAYLIKE else None,
                     "entry": round(entry, 2), "sl": round(float(sl), 2), "hits": hits, "sl_hit": sl_i is not None})
     return out
 
 
+DAILY_PREV = {}   # symbol -> yesterday's daily close, kept when the weekly candles are built
 INTRA_CHG = {}   # symbol -> today's change from the latest 5 or 15 minute candles, used for the daily view when Dhan's daily history has no candle for today
 INTERNAL = {}   # (symbol, timeframe) -> values the options autopilot needs; never sent to the browser
 
@@ -322,7 +330,7 @@ def analyse(symbol, df, interval):
     stale_day = False
     vol = val_cr = None
     try:
-        if interval != "1d" and "Volume" in df:
+        if interval not in DAYLIKE and "Volume" in df:
             day = np.array([t.date() for t in df.index]) == df.index[-1].date()
             v = df["Volume"].to_numpy(float)[day]
             vol = int(np.nansum(v))
@@ -331,7 +339,9 @@ def analyse(symbol, df, interval):
         vol = val_cr = None
     try:
         cl = df["Close"].to_numpy(float)
-        if interval == "1d":
+        if interval == "1w":
+            prev_close = DAILY_PREV.get(symbol)   # the SWING list shows today's move, measured from yesterday's close
+        elif interval == "1d":
             if len(cl) >= 2 and cl[-2] > 0:
                 chg = (cl[-1] / cl[-2] - 1) * 100
                 prev_close = float(cl[-2])
@@ -347,12 +357,12 @@ def analyse(symbol, df, interval):
                 prev_close = float(cl[before[-1]])
     except Exception:
         chg = None
-    if interval != "1d" and chg is not None:
+    if interval not in DAYLIKE and chg is not None:
         INTRA_CHG[symbol] = chg
     if CONFIRMED_ONLY:
         df = drop_forming(df, interval)
     n = len(df)
-    if n < MIN_BARS:
+    if n < (MIN_BARS_WEEKLY if interval == "1w" else MIN_BARS):
         return None
 
     close = df["Close"]
@@ -1027,6 +1037,29 @@ def add_today_candle(sym, sid, seg, kind, df, now):
         return df
 
 
+def weekly_candles(sym, dd):
+    """Daily candles joined into weekly ones, dated by the week's first trading day. The week still running is included (it is dropped as unfinished until Friday's close)."""
+    if dd is None or dd.empty:
+        return dd
+    try:
+        idx = pd.DatetimeIndex(dd.index)
+        today = ist_now().date()
+        cl = dd["Close"].to_numpy(float)
+        if sym:
+            prev = cl[-2] if (len(cl) >= 2 and idx[-1].date() >= today) else cl[-1]
+            if prev > 0:
+                DAILY_PREV[sym] = float(prev)
+        wk = idx.to_period("W-FRI")
+        g = dd.groupby(wk)
+        out = pd.DataFrame({"Open": g["Open"].first(), "High": g["High"].max(), "Low": g["Low"].min(), "Close": g["Close"].last(), "Volume": g["Volume"].sum() if "Volume" in dd else 0.0})
+        first = pd.Series(idx).groupby(wk).min()
+        out.index = pd.DatetimeIndex(first.values)
+        return out
+    except Exception as e:
+        print("weekly candles:", e, flush=True)
+        return None
+
+
 def dhan_future_inst(sym):
     """(security id, segment, instrument) of the nearest futures contract, or None."""
     f = near_future(sym, "dhan")
@@ -1044,6 +1077,9 @@ def dhan_candles(sym, interval, days, fut=False):
     now = ist_now()
     end = now.date() + timedelta(days=1)
     parts = []
+    if interval == "1w":
+        dd = dhan_candles(sym, "1d", days, fut)
+        return weekly_candles(sym, dd)
     if interval == "1d":
         res = dhan_post("/charts/historical", {"securityId": sid, "exchangeSegment": seg, "instrument": kind, "expiryCode": 0, "oi": False,
                                                "fromDate": (end - timedelta(days=days + 2)).isoformat(), "toDate": end.isoformat()})
@@ -1073,10 +1109,10 @@ def yahoo_frames(symbols, interval, days):
     """Candles per symbol from Yahoo (only used as the optional fallback)."""
     import yfinance as yf
     out = {}
-    span = {"period": f"{min(days, 58)}d"} if interval != "1d" else {"start": (ist_now().date() - timedelta(days=days + 5)).isoformat()}
+    span = {"period": f"{min(days, 58)}d"} if interval not in DAYLIKE else {"start": (ist_now().date() - timedelta(days=days + 5)).isoformat()}
     tk = [yf_ticker(s) for s in symbols]
     try:
-        data = yf.download(tk, interval=interval, group_by="ticker", auto_adjust=False, threads=True, progress=False, **span)
+        data = yf.download(tk, interval=YF_IV.get(interval, interval), group_by="ticker", auto_adjust=False, threads=True, progress=False, **span)
     except Exception:
         return out
     for s, t in zip(symbols, tk):
@@ -1354,7 +1390,7 @@ def sector_build(store, interval):
             cl = d["Close"]
             ema = cl.ewm(span=EMA_LEN, adjust=False).mean()
             days = np.array([t.date() for t in d.index])
-            before = np.nonzero(days != days[-1])[0] if interval != "1d" else np.array([len(d) - 2])
+            before = np.nonzero(days != days[-1])[0] if interval not in DAYLIKE else np.array([len(d) - 2])
             ch = (float(cl.iloc[-1]) / float(cl.iloc[before[-1]]) - 1) * 100 if len(before) and before[-1] >= 0 and cl.iloc[before[-1]] > 0 else None
             flags.append(bool(cl.iloc[-1] > ema.iloc[-1]))
             moves.append((sym, None if ch is None else round(ch, 2), bool(cl.iloc[-1] > ema.iloc[-1])))
@@ -1369,11 +1405,11 @@ def sector_build(store, interval):
         up_now, rising = comp["Close"].iloc[-1] > ema.iloc[-1], ema.iloc[-1] > ema.iloc[-4]
         above = round(100 * sum(flags) / len(flags))
         direction = "Up" if up_now and rising else "Down" if (not up_now) and (not rising) else "Mixed"
-        tm = (lambda t: t.strftime("%Y-%m-%d")) if interval == "1d" else (lambda t: int(t.timestamp()) + 19800)
+        tm = (lambda t: t.strftime("%Y-%m-%d")) if interval in DAYLIKE else (lambda t: int(t.timestamp()) + 19800)
         mv = sorted([m for m in moves if m[1] is not None], key=lambda m: -m[1])
         out[sec] = {"sector": sec, "tf": interval, "n": len(reb), "direction": direction, "above_pct": above,
-                    "chg": round(float(comp["Close"].iloc[-1] / comp["Close"].iloc[-2] - 1) * 100, 2) if interval == "1d" else None,
-                    "intraday": interval != "1d", "commodity": False, "index": True,
+                    "chg": round(float(comp["Close"].iloc[-1] / comp["Close"].iloc[-2] - 1) * 100, 2) if interval in DAYLIKE else None,
+                    "intraday": interval not in DAYLIKE, "commodity": False, "index": True,
                     "candles": [{"time": tm(t), "open": round(float(r.Open), 2), "high": round(float(r.High), 2), "low": round(float(r.Low), 2), "close": round(float(r.Close), 2)}
                                 for t, r in comp.iterrows()],
                     "trend": [[tm(t), round(float(v), 2)] for t, v in ema.items()] if CHART_INDICATOR else None,
@@ -1420,7 +1456,7 @@ def fetch_all(interval, progress=None):
         data = None
         for attempt in range(2):
             try:
-                data = yf.download(tickers, period=PERIODS[interval], interval=interval, group_by="ticker",
+                data = yf.download(tickers, period=PERIODS[interval], interval=YF_IV.get(interval, interval), group_by="ticker",
                                    auto_adjust=False, threads=True, progress=False)
             except Exception as e:
                 data = None
@@ -1701,7 +1737,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16h"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16i"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2486,7 +2522,7 @@ def near_future(symbol, name="angel"):
 
 def row_for(symbol, tf):
     with LOCK:
-        for t in [tf] + [x for x in INTERVALS if x != tf]:
+        for t in [tf] + [x for x in BASE_TFS if x != tf]:
             row = next((r for r in STATES[t]["rows"] if r["symbol"] == symbol), None)
             if row:
                 return row, t
@@ -2789,7 +2825,7 @@ def fresh_ltp(symbol):
 
 def candle_close(symbol):
     best = None
-    for t in INTERVALS:
+    for t in BASE_TFS:
         with LOCK:
             row = next((r for r in STATES[t]["rows"] if r["symbol"] == symbol), None)
             upd = STATES[t]["updated"]
@@ -3115,7 +3151,7 @@ def broker_chain(symbol, expiry, u):
     strikes = sorted({k for (sym, e, k, r) in opt if sym == symbol and e == ek})
     spot = None
     with LOCK:
-        for t_ in INTERVALS:
+        for t_ in BASE_TFS:
             row = next((r for r in STATES[t_]["rows"] if r["symbol"] == symbol), None)
             if row:
                 spot = apply_live([row])[0].get("ltp", row["close"])
@@ -3971,7 +4007,7 @@ def conf_context(tf):
             b = rec.setdefault(h["symbol"], [0, 0])
             b[1] += 1
             b[0] += 1 if h.get("hits") else 0
-    return {"others": {t: {r["symbol"]: r for r in snaps[t]} for t in INTERVALS if t != tf}, "nifty": (nifty or {}).get("chg"),
+    return {"others": {t: {r["symbol"]: r for r in snaps[t]} for t in BASE_TFS if t != tf}, "nifty": (nifty or {}).get("chg"),
             "sec": {k: sum(v) / len(v) for k, v in sec.items() if v}, "rec": rec}
 
 
@@ -3988,7 +4024,7 @@ def conf_row(r, tf, ctx):
     chg = r.get("ltp_chg", r.get("chg"))
     hh = mm = None
     try:
-        if tf != "1d":
+        if tf not in DAYLIKE:
             hh, mm = map(int, r["signal_time"][-5:].split(":"))
     except Exception:
         hh = mm = None
@@ -4621,7 +4657,7 @@ def api_history(tf: str = DEFAULT_INTERVAL, symbol: str = "", sector: str = "", 
     return {"tf": tf, "scanned": scanned, "progress": progress, "step": DHAN_STAT.get("step") if progress else None, "stats": hist_stats(recs),
             "by_side": hist_groups(recs, "side"), "by_sector": sorted(hist_groups(recs, "sector"), key=lambda r: -r["n"]),
             "best": [r for r in by_rate[:min(8, half)] if r["exp2"] > 0], "worst": [r for r in reversed(by_rate[len(by_rate) - min(8, half):]) if r["exp2"] < 0] if half else [],
-            "by_hour": sorted(hist_groups([r for r in recs if r["hour"] is not None], "hour"), key=lambda r: r["key"]) if tf != "1d" else [],
+            "by_hour": sorted(hist_groups([r for r in recs if r["hour"] is not None], "hour"), key=lambda r: r["key"]) if tf not in DAYLIKE else [],
             "recent": [{**r, "status": hist_status(r)} for r in recs[:300]],
             "since": pd.Timestamp(oldest, unit="s", tz="UTC").tz_convert(IST).strftime("%d %b %Y") if oldest else None,
             "sector_names": sector_names()}
@@ -4664,7 +4700,7 @@ ALERT_MAX_AGE_BARS = 1      # only candles this fresh are announced
 ALERT_DIGEST_AT = 5         # more new signals than this at once are sent as one summary
 ALERT_HOURLY_CAP = 80       # most messages one person can receive per hour
 ALERT_SYNC = False          # tests set this so messages are sent immediately
-TF_NAMES = {"5m": "5 min", "15m": "15 min", "1d": "Daily"}
+TF_NAMES = {"5m": "5 min", "15m": "15 min", "1d": "Daily", "1w": "Weekly"}
 TG = {"name": None}
 LINK_CODES = {}             # code -> (user id, expires)
 ALERT_STATE = {"baseline": set(), "sent": {}, "last": {}, "test": {}}
@@ -5942,7 +5978,7 @@ def lw_js(request: Request):
 
 # ── Chart popup: candles, EMA, Chandelier line, signal markers and the latest signal's levels ──
 CHART_CACHE = {}
-CHART_BARS = {"5m": 400, "15m": 400, "1d": 500}
+CHART_BARS = {"5m": 400, "15m": 400, "1d": 500, "1w": 400}
 CHART_BARS_N = 500
 
 
@@ -6023,7 +6059,7 @@ def chart_data(symbol, tf, at=0, fut=False):
         df = dhan_frames([symbol], tf, _days(PERIODS[tf]))[0].get(symbol)
     else:
         import yfinance as yf
-        df = yf.download(yf_ticker(symbol), period=PERIODS[tf], interval=tf, auto_adjust=False, progress=False)
+        df = yf.download(yf_ticker(symbol), period=PERIODS[tf], interval=YF_IV.get(tf, tf), auto_adjust=False, progress=False)
     if df is None or df.empty:
         return None
     if getattr(df.columns, "nlevels", 1) > 1:
@@ -6036,7 +6072,7 @@ def chart_data(symbol, tf, at=0, fut=False):
     if tf == "1d":
         df = live_daily_candle(symbol, df, fut)   # today's candle, still forming, so the Daily chart is live during the session
     n = len(df)
-    if n < MIN_BARS or not row:
+    if n < (MIN_BARS_WEEKLY if tf == "1w" else MIN_BARS) or not row:
         return None
     c = df["Close"].to_numpy(float)
     ls, ss, d, atr = chandelier(df)
@@ -6050,7 +6086,7 @@ def chart_data(symbol, tf, at=0, fut=False):
     sell = flip_dn & (c < ema) & within_lookback(red)
 
     def tm(ts):
-        return ts.strftime("%Y-%m-%d") if tf == "1d" else int(ts.timestamp()) + 19800  # IST on the axis
+        return ts.strftime("%Y-%m-%d") if tf in DAYLIKE else int(ts.timestamp()) + 19800  # IST on the axis
 
     past = next((i for i in range(n) if at and int(df.index[i].timestamp()) == at and (buy[i] or sell[i])), None) if at else None
     start = max(0, n - CHART_BARS[tf])
@@ -6058,7 +6094,7 @@ def chart_data(symbol, tf, at=0, fut=False):
         start = min(start, max(0, past - 60))   # an older signal opened from a list or a replay is shown with some candles before it
     t = [tm(df.index[i]) for i in range(start, n)]
 
-    out = {"symbol": symbol, "tf": tf, "intraday": tf != "1d", "index": symbol in INDEX_YF, "commodity": symbol in COMMODITIES,
+    out = {"symbol": symbol, "tf": tf, "intraday": tf not in DAYLIKE, "index": symbol in INDEX_YF, "commodity": symbol in COMMODITIES,
            "candles": [{"time": t[k], "open": round(float(df["Open"].iloc[i]), 2), "high": round(float(df["High"].iloc[i]), 2),
                         "low": round(float(df["Low"].iloc[i]), 2), "close": round(float(c[i]), 2)} for k, i in enumerate(range(start, n))],
            "markers": [{"time": t[i - start], "side": "BUY" if buy[i] else "SELL"} for i in range(start, n) if buy[i] or sell[i]][-1:],
@@ -6100,7 +6136,7 @@ def api_recommend(symbol: str):
             out["fut"] = {"expiry": None, "lot": bt_lot_for(symbol)}
     except Exception:
         pass
-    for t in INTERVALS:
+    for t in BASE_TFS:
         with LOCK:
             row = next((dict(r) for r in STATES[t]["rows"] if r["symbol"] == symbol), None)
         if not row:
@@ -6355,7 +6391,7 @@ def api_chain(request: Request, symbol: str, expiry: str = "", tf: str = DEFAULT
     sig_info = {"status": row["status"], "signal_time": row["signal_time"], "bars_ago": row["bars_ago"], "side": row.get("side")} if row else None
     all_tf = {}
     with LOCK:
-        for t_ in INTERVALS:
+        for t_ in BASE_TFS:
             r_ = next((r for r in STATES[t_]["rows"] if r["symbol"] == symbol), None)
             if r_:
                 all_tf[t_] = {"signal": r_["signal"], "status": r_["status"], "signal_time": r_["signal_time"]}
@@ -7099,7 +7135,7 @@ def replay_fetch(names, tf, progress):
                 out.update({k: v for k, v in frames.items() if v is not None})
             else:
                 import yfinance as yf
-                data = yf.download([yf_ticker(x) for x in part], period=PERIODS[tf], interval=tf, group_by="ticker", auto_adjust=False, threads=True, progress=False)
+                data = yf.download([yf_ticker(x) for x in part], period=PERIODS[tf], interval=YF_IV.get(tf, tf), group_by="ticker", auto_adjust=False, threads=True, progress=False)
                 for x in part:
                     try:
                         df = data[yf_ticker(x)] if len(part) > 1 else data
@@ -8477,6 +8513,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 @media(prefers-reduced-motion:reduce){#cwList button.fg,#cwList button.fr{animation:none}#cwList button.fg{background:rgba(22,163,74,.4)}#cwList button.fr{background:rgba(220,38,38,.4)}}
 #cwList button:hover{background:rgba(120,120,160,.12)}#cwList button[aria-selected=true]{background:var(--ink);color:var(--panel)}
 .cwlive{margin-left:10px;font-size:12px;color:var(--buy);font-weight:600}
+#cwSec option.up,#cwSec.up{color:var(--buy);font-weight:600}#cwSec option.dn,#cwSec.dn{color:var(--sell);font-weight:600}
 .cwsb{display:flex;gap:6px;align-items:center;margin:6px 0 4px}.cwsb button{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);background:var(--panel);color:inherit;cursor:pointer}.cwsb button[aria-pressed=true]{background:var(--g);color:#fff;border-color:transparent}
 #cwList .gd{font-size:10px;font-weight:700;border-radius:50%;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;color:#fff;background:#6b7280}#cwList .gd.gA{background:#0a7d5a}#cwList .gd.gB{background:#2563eb}#cwList .gd.gC{background:#b7791f}
 #cwList .nm{font-weight:600}#cwList .pc{font-size:12px}#cwList .sg{font-size:10px;border-radius:6px;padding:1px 5px;border:1px solid currentColor;opacity:.85}
@@ -8628,7 +8665,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">Stocks</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">SWING</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -8879,7 +8916,7 @@ const colsStocks=[["symbol","Symbol"],["signal","Signal"],["status","Status"],["
 const colsFut=[["symbol","Symbol"],["signal","Signal"],["status","Status"],["signal_time","Signal candle"],["_t",""],["close","Spot"],["chg","Day %"],["entry","Entry"],["sl","SL"],["tp1","T1"],["tp2","T2"],["tp3","T3"],["tp4","T4"],["lot","Lot"],["fexp","Expiry"]];
 let secDir={},secDirKey="",data=null,sector="ALL",filter="ALL",sortKey="signal",sortDir=1,q="",timer=null,tf=null,futInfo={},futLoaded=false;
 try{tf=localStorage.getItem("tf")}catch(e){}
-const tfName={"5m":"5 min","15m":"15 min","1d":"Daily"};
+const tfName={"5m":"5 min","15m":"15 min","1d":"Daily","1w":"Weekly"};
 const rank={BUY:0,SELL:1,"Open BUY":2,"Open SELL":2,"–":3};
 const fmt=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
 const curCols=()=>mode==="futures"?colsFut:colsStocks;
@@ -8891,6 +8928,9 @@ document.getElementById("tfs").onclick=e=>{const b=e.target.closest("button");if
  tf=b.dataset.tf;try{localStorage.setItem("tf",tf)}catch(x){}
  data=null;document.getElementById("body").innerHTML=`<tr><td colspan="14" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;
  optOverride="";document.querySelectorAll("#tfs button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.tf===tf));load();if(mode==="charts")cwShow();if(mode==="history")loadHistory()};
+function tfAllowed(){const all=(data&&data.intervals)||["5m","15m","1d","1w"];return mode==="stocks"?["1d","1w"]:mode==="history"?all:all.filter(x=>x!=="1w")}   // SWING: Daily and Weekly; the other views keep the intraday timeframes (Weekly only in SWING and History)
+function paintTfs(){document.getElementById("tfs").innerHTML=tfAllowed().map(x=>`<button data-tf="${x}" aria-pressed="${x===tf}">${tfName[x]||x}</button>`).join("")}
+function ensureTf(){if(!tfAllowed().includes(tf)){tf=mode==="stocks"?"1d":"15m";try{localStorage.setItem("tf",tf)}catch(x){}data=null;optOverride="";if(mode==="stocks")document.getElementById("body").innerHTML=`<tr><td colspan="14" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;load()}paintTfs()}
 let tickT=null,tickBusy=false;
 async function tick(){clearTimeout(tickT);
  try{if(mode==="stocks"&&data&&data.feed&&data.feed.source&&!document.hidden&&!tickBusy){tickBusy=true;const asked=tf;const d=await (await api("/api/ticks?tf="+asked)).json();tickBusy=false;
@@ -8922,7 +8962,7 @@ function cellFor(r,k){
   default:return `<td class="act"><button class="mini" data-chart="${esc(r.symbol)}" title="Open chart">Chart</button> ${r.entry!=null&&r.signal!=="–"?`<button class="mini" data-trade="${esc(r.symbol)}">Trade</button>`:""}</td>`}}
 function render(){
  if(!data)return;
- document.getElementById("tfs").innerHTML=data.intervals.map(x=>`<button data-tf="${x}" aria-pressed="${x===tf}">${tfName[x]||x}</button>`).join("");
+ paintTfs();
  if(mode==="charts"&&cw.ready)cwBuild();
  const fut=mode==="futures";
  const rows=fut?data.rows:data.rows.filter(r=>r.type!=="index");
@@ -8982,9 +9022,10 @@ function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec
  rows.forEach(r=>{const c=chgOf(r);if(c==null)return;const k=secOf(r);(sa[k]=sa[k]||[]).push(c)});
  const avg=k=>sa[k]&&k!=="Others"&&k!=="Indices"?sa[k].reduce((x,y)=>x+y,0)/sa[k].length:null;   // a sector's average move today, from the stocks in it
  const secs=[...new Set(rows.map(secOf))].sort((a,b)=>{const x=avg(a),y=avg(b);return x==null&&y==null?a.localeCompare(b):x==null?1:y==null?-1:y-x});
- const lab=k=>{const a=avg(k);return a==null?k:`${k}  ${a>0?"+":""}${a.toFixed(2)}%`},sel=$("cwSec"),sig=secs.join("|");
- if(sel.dataset.sig!==sig&&document.activeElement!==sel){sel.dataset.sig=sig;sel.innerHTML='<option value="ALL">All sectors (best to worst)</option>'+secs.map(x=>`<option value="${esc(x)}">${esc(lab(x))}</option>`).join("");sel.value=secs.includes(sec)?sec:"ALL"}
- else[...sel.options].forEach(o=>{if(o.value!=="ALL")o.textContent=lab(o.value)})
+ const scls=k=>{const a=avg(k);return a==null?"":a>=0?"up":"dn"},lab=k=>{const a=avg(k);return a==null?k:`${k}  ${a>0?"+":""}${a.toFixed(2)}%`},sel=$("cwSec"),sig=secs.join("|");
+ if(sel.dataset.sig!==sig&&document.activeElement!==sel){sel.dataset.sig=sig;sel.innerHTML='<option value="ALL">All sectors (best to worst)</option>'+secs.map(x=>`<option value="${esc(x)}" class="${scls(x)}">${esc(lab(x))}</option>`).join("");sel.value=secs.includes(sec)?sec:"ALL"}
+ else[...sel.options].forEach(o=>{if(o.value!=="ALL"){o.textContent=lab(o.value);o.className=scls(o.value)}});
+ sel.className=sel.value==="ALL"?"":scls(sel.value)   // green for a sector that is up today, red for one that is down
  let v=rows.filter(r=>{if(q&&!r.symbol.includes(q))return false;if(r.type==="index")return true;   // the indices stay on top whatever the sector and Show filters say; only a typed search narrows them
   const g=r.signal||"–",f=$("cwShow").value;return(f==="all"||(f==="fl"?!!cw.dirs[r.symbol]:g!=="–"))&&($("cwSec").value==="ALL"||(r.sector||"Others")===$("cwSec").value)});
  const ch=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?-999:c},sg=r=>(r.signal&&r.signal!=="–")?0:1;
@@ -9137,6 +9178,7 @@ setInterval(cwLiveTick,3000);
 setInterval(()=>{if(mode==="charts"&&cw.ready&&!document.hidden&&cw.sym&&cwOpenNow())cwLoad(true)},cw_REFRESH_MS);
 function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
 function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
+ ensureTf();
  const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
  ["stocks","charts","commodities","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  if(m==="charts")cwShow();
