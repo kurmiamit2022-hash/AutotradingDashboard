@@ -1864,7 +1864,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16r"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16t"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8968,6 +8968,12 @@ h1::before{content:"";width:12px;height:26px;border-radius:4px;background:linear
 .mode button{border-radius:10px;border-bottom:0;margin:0;padding:8px 16px;white-space:nowrap}
 .mode button[aria-pressed=true]{background:var(--g);color:#fff}
 .mode button:hover{background:var(--flat)}.mode button[aria-pressed=true]:hover{background:var(--g)}
+.mode button[data-m=stocks]{font-weight:800;color:#1d4ed8;letter-spacing:.2px}
+.mode button[data-m=autopilot]{font-weight:800;color:#15803d;letter-spacing:.2px}
+.mode button[data-m=stocks][aria-pressed=true],.mode button[data-m=stocks][aria-pressed=true]:hover{background:linear-gradient(135deg,#2563eb,#06b6d4);color:#fff}
+.mode button[data-m=autopilot][aria-pressed=true],.mode button[data-m=autopilot][aria-pressed=true]:hover{background:linear-gradient(135deg,#16a34a,#0d9488);color:#fff}
+:root[data-theme=dark] .mode button[data-m=stocks]:not([aria-pressed=true]){color:#93c5fd}:root[data-theme=dark] .mode button[data-m=autopilot]:not([aria-pressed=true]){color:#86efac}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]) .mode button[data-m=stocks]:not([aria-pressed=true]){color:#93c5fd}:root:not([data-theme=light]) .mode button[data-m=autopilot]:not([aria-pressed=true]){color:#86efac}}
 .mode button[data-m=charts]{font-weight:800;color:#c2410c;letter-spacing:.2px}
 .mode button[data-m=charts][aria-pressed=true],.mode button[data-m=charts][aria-pressed=true]:hover{background:linear-gradient(135deg,#f97316,#dc2626);color:#fff}
 :root[data-theme=dark] .mode button[data-m=charts]:not([aria-pressed=true]){color:#fdba74}
@@ -9261,7 +9267,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div class="tkbtns"><button class="btn ghost" id="limClose">Close</button><button class="btn" id="limSave">Save</button></div>
 </div></dialog>
 <dialog id="chartDlg"><div class="chbox">
- <div class="chhead"><b id="chTitle"></b><span class="chnav" id="chNav" hidden><button class="btn ghost" id="chPrev" title="Previous stock (↑ or K)" aria-label="Previous stock">▲</button><button class="btn ghost" id="chNext" title="Next stock (↓ or J)" aria-label="Next stock">▼</button><span class="sub" id="chPos"></span></span><div class="chtfs" id="chTfs"></div><button class="btn ghost" id="chClose">Close</button></div>
+ <div class="chhead"><b id="chTitle"></b><span class="chnav" id="chNav" hidden><button class="btn ghost" id="chPrev" title="Previous stock (↑ or K)" aria-label="Previous stock">▲</button><button class="btn ghost" id="chNext" title="Next stock (↓ or J)" aria-label="Next stock">▼</button><span class="sub" id="chPos"></span></span><span class="sub chlive" id="chLive" aria-live="off"></span><div class="chtfs" id="chTfs"></div><button class="btn ghost" id="chClose">Close</button></div>
  <div class="chleg" id="chLeg"></div>
  <div class="sub" id="chHint" hidden>↑ ↓ next or previous stock in your list · ← → timeframe · Esc closes</div>
  <div class="chtrade" id="chTrade"></div>
@@ -9583,13 +9589,14 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
    try{if(same){const r=ch.timeScale().getVisibleLogicalRange();if(r)c2.timeScale().setVisibleLogicalRange(r)}else{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}}catch(e){}}}}
 const cw_REFRESH_MS=20000;
 const cwOpenNow=()=>{const n=new Date(Date.now()+19800000),d=n.getUTCDay(),m=n.getUTCHours()*60+n.getUTCMinutes();return d>0&&d<6&&m>=555&&m<930};   // 09:15 to 15:30 India time, Monday to Friday
-function cwTick(ser,bar,p){   // the live price moves the forming candle; a new candle starts when its time comes
- if(!ser||!bar||!(p>0))return null;let t;
- if(cw.tf==="1d")t=new Date(Date.now()+19800000).toISOString().slice(0,10);else{const st=cw.tf==="5m"?300:900;t=Math.floor((Date.now()/1000+19800)/st)*st}
+function cwTick(ser,bar,p,tfv){   // the live price moves the forming candle; a new candle starts when its time comes
+ tfv=tfv||cw.tf;if(!ser||!bar||!(p>0)||tfv==="1w")return null;let t;
+ if(bar.time&&typeof bar.time==="object")bar.time=bar.time.year+"-"+String(bar.time.month).padStart(2,"0")+"-"+String(bar.time.day).padStart(2,"0");   // the chart library turns a date into an object after an update
+ if(tfv==="1d")t=new Date(Date.now()+19800000).toISOString().slice(0,10);else{const st=tfv==="5m"?300:900;t=Math.floor((Date.now()/1000+19800)/st)*st}
  if(bar.time===t){bar.high=Math.max(bar.high,p);bar.low=Math.min(bar.low,p);bar.close=p}
  else if(t>bar.time){const nb={time:t,open:bar.close,high:Math.max(bar.close,p),low:Math.min(bar.close,p),close:p};Object.keys(nb).forEach(k=>bar[k]=nb[k])}
  else return null;
- try{ser.update(bar)}catch(e){return null}return bar}
+ try{ser.update(Object.assign({},bar))}catch(e){return null}return bar}
 let cwTickBusy=false;
 async function cwLiveTick(){if(cwTickBusy||document.hidden||mode!=="charts"||!cw.sym||!cw.obj)return;
  const main=cw.inst==="stock",ser=main?cw.cs:cw.k2,bar=main?cw.bar:cw.bar2;if(!ser||!bar)return;
@@ -9896,7 +9903,15 @@ function feedBadge(){const f=feedInfo;if(!f||!f.source)return ' · <span class="
  if(f.age!=null&&f.age<30)return ` · <span class="fdb on" title="${f.n!=null?f.n+' prices in the last update. ':''}Prices come from the live broker feed">● Live prices · ${f.age}s ago</span>`;
  const why=f.ws_error||f.error||(f.age==null?"no price has arrived since the server started":"the last price was "+f.age+"s ago");
  return ` · <span class="fdb off" title="Prices shown are the last candle close until the feed returns. Check Admin, Data source.">○ Prices NOT live: ${esc(String(why).slice(0,110))}</span>`}
-let chList=[],swView=[],cashSet=new Set();const chMem=new Map();
+let chList=[],swView=[],cashSet=new Set(),chCs=null,chBar=null,chBusy=false;
+async function chLiveTick(){const dlg=$("chartDlg");if(chBusy||document.hidden||!dlg||!dlg.open||!chCs||!chBar||chSec||chAt)return;const el=$("chLive");
+ if(chTf==='1w'){el.textContent='';return}
+ if(!cwOpenNow()){el.textContent='market closed';return}
+ chBusy=true;const sym=chSym;
+ try{const d=await (await api('/api/ltp?symbol='+encodeURIComponent(sym))).json();if(sym!==chSym||!chCs)return;
+  if(d.p&&cwTick(chCs,chBar,d.p,chTf))el.textContent='● live '+new Date(Date.now()+19800000).toISOString().slice(11,19)+' · '+d.p.toFixed(2);else if(!d.p)el.textContent='no live price right now'}
+ catch(e){}finally{chBusy=false}}
+setInterval(chLiveTick,3000);const chMem=new Map();
 function chFetch(sym,t,at){const k=sym+"|"+t+"|"+(at||0),h=chMem.get(k);if(h&&Date.now()-h.at<90000)return h.p;
  const p=api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${t}${at?'&at='+at:''}`).then(r=>r.json());chMem.set(k,{at:Date.now(),p});p.catch(()=>chMem.delete(k));
  if(chMem.size>60)chMem.delete(chMem.keys().next().value);return p}
@@ -9923,7 +9938,7 @@ function initChart(){
  $("chartDlg").addEventListener("keydown",e=>{if(e.target.closest("input,select,textarea")||e.ctrlKey||e.metaKey||e.altKey)return;const k=e.key;
   if(k==="ArrowDown"||k==="j"||k==="J"){e.preventDefault();chGo(1)}else if(k==="ArrowUp"||k==="k"||k==="K"){e.preventDefault();chGo(-1)}
   else if(k==="ArrowLeft"||k==="ArrowRight"){const bs=[...$("chTfs").querySelectorAll("button")],i=bs.findIndex(b=>b.dataset.ct===chTf),n=bs[i+(k==="ArrowRight"?1:-1)];if(n){e.preventDefault();n.click()}}});
- $("chartDlg").addEventListener("close",()=>{if(chObj){chObj.remove();chObj=null}})}
+ $("chartDlg").addEventListener("close",()=>{chCs=null;chBar=null;if(chObj){chObj.remove();chObj=null}})}
 async function drawChart(){
  const my=chSym+chTf+chAt;$("chMsg").textContent="Loading chart…";$("chLeg").innerHTML="";
  if(chObj){chObj.remove();chObj=null}
@@ -9938,7 +9953,7 @@ async function drawChart(){
  chObj=ch;
  if(d.lines){const sp=ch.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp.setData(d.lines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
   const ep=ch.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ep.setData(d.lines.ema.map(([t,v])=>({time:t,value:v})))}
- const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(d.candles);
+ const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(d.candles);chCs=(chSec||chAt)?null:cs;chBar=chCs?Object.assign({},d.candles[d.candles.length-1]):null;$("chLive").textContent="";
  cs.setMarkers(d.markers.map(m=>m.side==="BUY"?{time:m.time,position:"belowBar",color:up,shape:"arrowUp",text:"BUY"}:{time:m.time,position:"aboveBar",color:dn,shape:"arrowDown",text:"SELL"}));
  const sg=d.signal,last=d.candles[d.candles.length-1].time,leg=[];
  if(sg){const lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title});s.setData([{time:sg.from,value:price},{time:last,value:price}])};
