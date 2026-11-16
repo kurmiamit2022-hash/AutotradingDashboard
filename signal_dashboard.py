@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16b"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16e"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5986,6 +5986,32 @@ def indicator_pack(symbol, df, tf, stamp, lo_t=None, minbars=60):
     return out
 
 
+def live_daily_candle(symbol, df, fut=False):
+    """While the market is open Dhan's daily history stops at yesterday. Today's candle so far is built from today's 15 minute candles and added to the chart table (India-time index)."""
+    try:
+        now = ist_now()
+        if (df is None or df.empty or not use_dhan() or symbol in COMMODITIES or now.weekday() >= 5 or not (dtime(9, 15) <= now.time() < dtime(15, 30))
+                or df.index[-1].date() >= now.date()):
+            return df
+        inst = dhan_future_inst(symbol) if fut else dhan_inst(symbol)
+        if not inst:
+            return df
+        res = dhan_post("/charts/intraday", {"securityId": inst[0], "exchangeSegment": inst[1], "instrument": inst[2], "interval": 15, "oi": False,
+                                             "fromDate": f"{now.date().isoformat()} 00:00:00", "toDate": f"{(now.date() + timedelta(days=1)).isoformat()} 00:00:00"})
+        d = dhan_to_df(res, False)
+        if d is None or d.empty:
+            return df
+        d = d[[t.date() == now.date() for t in d.index]]
+        if d.empty:
+            return df
+        row = pd.DataFrame({"Open": [d["Open"].iloc[0]], "High": [d["High"].max()], "Low": [d["Low"].min()], "Close": [d["Close"].iloc[-1]], "Volume": [d["Volume"].sum()]},
+                           index=pd.DatetimeIndex([pd.Timestamp(now.date())]).tz_localize(IST))
+        return pd.concat([df, row])
+    except Exception as e:
+        print("live daily candle:", e, flush=True)
+        return df
+
+
 def chart_data(symbol, tf, at=0, fut=False):
     if fut:
         if not use_dhan():
@@ -6007,6 +6033,8 @@ def chart_data(symbol, tf, at=0, fut=False):
     df.index = df.index.tz_localize("UTC").tz_convert(IST) if df.index.tz is None else df.index.tz_convert(IST)
     if CONFIRMED_ONLY:
         df = drop_forming(df, tf)
+    if tf == "1d":
+        df = live_daily_candle(symbol, df, fut)   # today's candle, still forming, so the Daily chart is live during the session
     n = len(df)
     if n < MIN_BARS or not row:
         return None
@@ -6165,7 +6193,7 @@ def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0, inst: str = 
 OPT_HIST = {}   # (symbol, expiry, strike, right, minutes, days) -> (time, candles): option price history kept for a short while
 
 
-def dhan_option_candles(symbol, expiry, strike, right, minutes, days):
+def dhan_option_candles(symbol, expiry, strike, right, minutes, days, span=7):
     """Intraday candles of one option contract from Dhan: [{t, lbl, d, o, h, l, c, v}] for the last `days` trading days."""
     ek = datetime.strptime(expiry, EXPIRY_FMT).strftime("%d%b%Y").upper()
     if not load_master("dhan"):
@@ -6175,7 +6203,7 @@ def dhan_option_candles(symbol, expiry, strike, right, minutes, days):
         raise DhanDataError(f"{symbol} {strike:g} {right} is not in Dhan's instrument list")
     end = ist_now().date() + timedelta(days=1)
     res = dhan_post("/charts/intraday", {"securityId": str(inst[0]), "exchangeSegment": inst[3], "instrument": "OPTIDX" if symbol in INDICES or symbol in BSE_INDICES else "OPTSTK",
-                                         "interval": minutes, "oi": False, "fromDate": f"{(end - timedelta(days=7)).isoformat()} 00:00:00", "toDate": f"{end.isoformat()} 00:00:00"})
+                                         "interval": minutes, "oi": False, "fromDate": f"{(end - timedelta(days=span)).isoformat()} 00:00:00", "toDate": f"{end.isoformat()} 00:00:00"})
     df = dhan_to_df(res, False)
     if df is None or df.empty:
         return []
@@ -6185,7 +6213,7 @@ def dhan_option_candles(symbol, expiry, strike, right, minutes, days):
             for t, r in df.iterrows()]
 
 
-def dhan_underlying_candles(symbol, minutes, days):
+def dhan_underlying_candles(symbol, minutes, days, span=7):
     """Candles of the option's parent stock or index from Dhan, in the same shape and for the same days as the option candles."""
     inst = dhan_inst(symbol)
     if not inst:
@@ -6193,7 +6221,7 @@ def dhan_underlying_candles(symbol, minutes, days):
     sid, seg, kind = inst
     end = ist_now().date() + timedelta(days=1)
     res = dhan_post("/charts/intraday", {"securityId": sid, "exchangeSegment": seg, "instrument": kind, "interval": minutes, "oi": False,
-                                         "fromDate": f"{(end - timedelta(days=7)).isoformat()} 00:00:00", "toDate": f"{end.isoformat()} 00:00:00"})
+                                         "fromDate": f"{(end - timedelta(days=span)).isoformat()} 00:00:00", "toDate": f"{end.isoformat()} 00:00:00"})
     df = dhan_to_df(res, False)
     if df is None or df.empty:
         return []
@@ -6201,6 +6229,19 @@ def dhan_underlying_candles(symbol, minutes, days):
     df = df[[t.date() in keep for t in df.index]]
     return [{"t": int(t.timestamp()), "lbl": t.strftime("%H:%M"), "d": t.strftime("%d %b"), "o": float(r.Open), "h": float(r.High), "l": float(r.Low), "c": float(r.Close), "v": int(r.Volume or 0)}
             for t, r in df.iterrows()]
+
+
+def daily_rows(rows):
+    """Hourly candles as daily candles (the last one is today's, still forming). `t` is the date, which is how the Daily chart is timed."""
+    days = {}
+    for r in rows:
+        k = pd.Timestamp(r["t"], unit="s", tz="UTC").tz_convert(IST).strftime("%Y-%m-%d")
+        b = days.get(k)
+        if not b:
+            days[k] = {"t": k, "lbl": k[5:], "d": k, "o": r["o"], "h": r["h"], "l": r["l"], "c": r["c"], "v": r["v"]}
+        else:
+            b["h"], b["l"], b["c"], b["v"] = max(b["h"], r["h"]), min(b["l"], r["l"]), r["c"], b["v"] + r["v"]
+    return [days[k] for k in sorted(days)]
 
 
 def candle_last_days(rows, days):
@@ -6226,22 +6267,24 @@ def api_option_history(request: Request, symbol: str, expiry: str, strike: float
     symbol = symbol.upper().strip()
     if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol):
         return {"error": "Enter a valid symbol."}
-    minutes = {"1m": 1, "5m": 5, "15m": 15}.get(tf)
+    minutes = {"1m": 1, "5m": 5, "15m": 15, "1d": 60}.get(tf)   # Daily: hourly candles over about a month, joined into days
     if not minutes:
-        return {"error": "Choose 1, 5 or 15 minutes."}
+        return {"error": "Choose 1, 5, 15 minutes or Daily."}
+    daily = tf == "1d"
+    span = 35 if daily else 7
     days = 3 if days >= 3 else 1
     if DATA_BROKER != "dhan":
         return {"error": "Option price history comes from Dhan's data feed. Set DATA_BROKER=dhan on the server."}
     out = {"symbol": symbol, "expiry": expiry, "strike": strike, "tf": tf, "days": days}
     full = {}   # a week of candles per series: the indicator needs the earlier days to warm up, the chart shows only the last `days`
     for side in ("CE", "PE"):
-        key = (symbol, expiry, float(strike), side, minutes, 7)
+        key = (symbol, expiry, float(strike), side, minutes, span)
         hit = OPT_HIST.get(key)
         if hit and time.time() - hit[0] < 20:
             full[side.lower()] = hit[1]
             continue
         try:
-            rows = dhan_option_candles(symbol, expiry, strike, side, minutes, 7)
+            rows = dhan_option_candles(symbol, expiry, strike, side, minutes, 40 if daily else 7, span)
         except DhanDataError as e:
             return {"error": f"Dhan: {e}"}
         except ValueError:
@@ -6250,17 +6293,27 @@ def api_option_history(request: Request, symbol: str, expiry: str, strike: float
             return {"error": f"Could not read the price history ({type(e).__name__}: {str(e)[:100]})."}
         OPT_HIST[key] = (time.time(), rows)
         full[side.lower()] = rows
-    ukey = (symbol, "UND", 0.0, "", minutes, 7)   # the parent script, on the same candle size and days, for a like-for-like comparison
+    ukey = (symbol, "UND", 0.0, "", minutes, span)   # the parent script, on the same candle size and days, for a like-for-like comparison
     hit = OPT_HIST.get(ukey)
     if hit and time.time() - hit[0] < 20:
         full["und"] = hit[1]
     else:
         try:
-            full["und"] = dhan_underlying_candles(symbol, minutes, 7)
+            full["und"] = dhan_underlying_candles(symbol, minutes, 40 if daily else 7, span)
             OPT_HIST[ukey] = (time.time(), full["und"])
         except Exception as e:
             full["und"] = []
             out["und_error"] = f"The {symbol} chart could not be loaded ({str(e)[:90]})."
+    if daily:
+        out["daily"] = True
+        for k in list(full):
+            full[k] = daily_rows(full[k])
+        for k in ("ce", "pe", "und"):
+            out[k] = full[k]
+        out["ind"] = {}   # too few days of an option's own history for the indicator; the stock's Daily chart supplies the signals
+        if not out["ce"] and not out["pe"]:
+            out["error"] = "Dhan returned no candles for these contracts. They may not have traded yet, or the Data API is not subscribed."
+        return out
     ind = {}
     for k, rows in full.items():
         shown = candle_last_days(rows, days)
@@ -8416,6 +8469,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 #cwList button[aria-selected=true].fg,#cwList button[aria-selected=true].fr{animation:none}#cwList button[aria-selected=true].fg{background:#16a34a;color:#fff}#cwList button[aria-selected=true].fr{background:#dc2626;color:#fff}
 @media(prefers-reduced-motion:reduce){#cwList button.fg,#cwList button.fr{animation:none}#cwList button.fg{background:rgba(22,163,74,.4)}#cwList button.fr{background:rgba(220,38,38,.4)}}
 #cwList button:hover{background:rgba(120,120,160,.12)}#cwList button[aria-selected=true]{background:var(--ink);color:var(--panel)}
+#cwList .gd{font-size:10px;font-weight:700;border-radius:50%;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;color:#fff;background:#6b7280}#cwList .gd.gA{background:#0a7d5a}#cwList .gd.gB{background:#2563eb}#cwList .gd.gC{background:#b7791f}
 #cwList .nm{font-weight:600}#cwList .pc{font-size:12px}#cwList .sg{font-size:10px;border-radius:6px;padding:1px 5px;border:1px solid currentColor;opacity:.85}
 .cwm{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0}
 .cwbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}.cwbar b{font-size:18px}.cwbar .seg{margin:0}
@@ -8580,7 +8634,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <aside class="cwl" aria-label="Watchlist">
   <input id="cwQ" placeholder="Search symbol" aria-label="Search symbol" autocomplete="off">
   <select id="cwSec" aria-label="Sector"><option value="ALL">All sectors</option></select>
-  <select id="cwShow" aria-label="Show"><option value="all">All symbols</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option><option value="fl">Flashing (5 and 15 min agree)</option><option value="flg">Flashing green</option><option value="flr">Flashing red</option></select>
+  <select id="cwShow" aria-label="Show"><option value="all">All symbols</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option><option value="fl">Flashing (5 and 15 min agree)</option><option value="flg">Flashing green</option><option value="flr">Flashing red</option><option value="gA">Grade A only</option><option value="gAB">Grade A or B</option></select>
   <select id="cwSort" aria-label="Sort"><option value="az">A to Z</option><option value="chg">% change, highest first</option><option value="chgd">% change, lowest first</option><option value="sig">Signals first</option><option value="move">Biggest move, up or down</option></select>
   <div id="cwList" role="listbox" aria-label="Symbols" tabindex="0"></div>
  </aside>
@@ -8922,12 +8976,12 @@ function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec
  const lab=k=>{const a=avg(k);return a==null?k:`${k}  ${a>0?"+":""}${a.toFixed(2)}%`},sel=$("cwSec"),sig=secs.join("|");
  if(sel.dataset.sig!==sig&&document.activeElement!==sel){sel.dataset.sig=sig;sel.innerHTML='<option value="ALL">All sectors (best to worst)</option>'+secs.map(x=>`<option value="${esc(x)}">${esc(lab(x))}</option>`).join("");sel.value=secs.includes(sec)?sec:"ALL"}
  else[...sel.options].forEach(o=>{if(o.value!=="ALL")o.textContent=lab(o.value)})
- let v=rows.filter(r=>{const g=r.signal||"–",f=$("cwShow").value;const fd=cw.dirs[r.symbol]||"";return f==="all"||(f==="fl"?!!fd:f==="flg"?fd==="BUY":f==="flr"?fd==="SELL":f==="sig"?g!=="–":g.includes(f))}).filter(r=>(!q||r.symbol.includes(q))&&($("cwSec").value==="ALL"||(r.type==="index"?"Indices":(r.sector||"Others"))===$("cwSec").value));
+ let v=rows.filter(r=>{const g=r.signal||"–",f=$("cwShow").value;const fd=cw.dirs[r.symbol]||"",gr=(r.conf&&r.conf.g)||"";return f==="all"||(f==="gA"?gr==="A":f==="gAB"?gr==="A"||gr==="B":false)||(f==="fl"?!!fd:f==="flg"?fd==="BUY":f==="flr"?fd==="SELL":f==="sig"?g!=="–":g.includes(f))}).filter(r=>(!q||r.symbol.includes(q))&&($("cwSec").value==="ALL"||(r.type==="index"?"Indices":(r.sector||"Others"))===$("cwSec").value));
  const ch=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?-999:c},sg=r=>(r.signal&&r.signal!=="–")?0:1;
  v.sort((a,b)=>(a.type==="index"?0:1)-(b.type==="index"?0:1)||(so==="chg"?ch(b)-ch(a):so==="chgd"?ch(a)-ch(b):so==="move"?Math.abs(ch(b)===-999?0:ch(b))-Math.abs(ch(a)===-999?0:ch(a)):so==="sig"?sg(a)-sg(b)||a.symbol.localeCompare(b.symbol):a.symbol.localeCompare(b.symbol)));
  cw.view=v.map(r=>r.symbol);const keepTop=$("cwList").scrollTop;
  $("cwList").innerHTML=v.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,sg=r.signal&&r.signal!=="–"?(r.side==="BUY"?"BUY":"SELL"):"";
-  return `<button role="option" data-s="${esc(r.symbol)}" class="${cw.dirs[r.symbol]==="BUY"?"fg":cw.dirs[r.symbol]==="SELL"?"fr":""}" title="${cw.dirs[r.symbol]?"5 min and 15 min both "+(cw.dirs[r.symbol]==="BUY"?"green":"red"):""}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${esc(r.symbol)}</span><span>${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
+  return `<button role="option" data-s="${esc(r.symbol)}" class="${cw.dirs[r.symbol]==="BUY"?"fg":cw.dirs[r.symbol]==="SELL"?"fr":""}" title="${cw.dirs[r.symbol]?"5 min and 15 min both "+(cw.dirs[r.symbol]==="BUY"?"green":"red"):""}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${esc(r.symbol)}</span><span>${r.conf&&r.conf.g?`<span class="gd g${r.conf.g}" title="Grade ${r.conf.g}, score ${r.conf.s} of 100">${r.conf.g}</span> `:""}${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
 function cwMark(){document.querySelectorAll("#cwList button").forEach(b=>{const on=b.dataset.s===cw.sym;b.setAttribute("aria-selected",on);if(on)b.scrollIntoView({block:"nearest"})})}
 function cwShow(){cwDirs();if(!cw.ready){cw.ready=true;
   $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSort").onchange=()=>cwBuild();$("cwShow").onchange=()=>cwBuild();
@@ -8994,16 +9048,27 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
    const exps=ch.expiries||[ch.expiry];if(!cw.exp||!exps.includes(cw.exp))cw.exp=ch.expiry||exps[0];
    const strikes=ch.rows.map(r=>r.strike);if(cw.strike==null||!strikes.includes(cw.strike))cw.strike=ch.atm!=null?ch.atm:strikes[Math.floor(strikes.length/2)];
    $("cwExp").innerHTML=exps.map(x=>`<option${x===cw.exp?" selected":""}>${esc(x)}</option>`).join("");$("cwStrike").innerHTML=strikes.map(x=>`<option value="${x}"${x===cw.strike?" selected":""}>${x}${x===ch.atm?" (ATM)":""}</option>`).join("");
-   const m=cw.tf==="5m"?"5m":"15m",days=cw.tf==="1d"?3:cw.days;
+   const m=cw.tf==="5m"?"5m":cw.tf==="1d"?"1d":"15m",days=cw.tf==="1d"?3:cw.days;
    const h=await (await api(`/api/options/history?symbol=${encodeURIComponent(sym)}&expiry=${encodeURIComponent(cw.exp)}&strike=${cw.strike}&tf=${m}&days=${days}`)).json();if(my!==cw.my)return;
    if(h.error){$("cwMsg").textContent=h.error;cwClear();return}
    const rows=h[cw.side.toLowerCase()]||[];if(!rows.length){$("cwMsg").textContent="No price history for this contract yet.";cwClear();return}
+   if(h.daily){   // Daily: the option's days are built from hourly candles (today's is still forming); the stock's own Daily chart gives the base chart and the signals
+    candles=rows.map(r=>({time:r.t,open:r.o,high:r.h,low:r.l,close:r.c}));const t0=candles[0].time;
+    try{const bd=await (await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=1d&inst=stock`)).json();if(my!==cw.my)return;
+     if(bd.error||!bd.candles||!bd.candles.length)undErr=bd.error||"";else{und=bd.candles.filter(c=>c.time>=t0);if(bd.lines&&bd.lines.stop)undLines={stop:bd.lines.stop.filter(x=>x[0]>=t0),ema:(bd.lines.ema||[]).filter(x=>x[0]>=t0)};undMarks=mkOf((bd.marks||[]).filter(x=>x[0]>=t0),0);
+      const T=candles.map(c=>c.time),ce=cw.side==="CE",put=new Map();
+      for(const [t,sd] of (bd.marks||[])){let k=-1;for(let i=T.length-1;i>=0;i--)if(T[i]<=t){k=i;break}if(k<0)continue;put.set(T[k],(ce?sd==="BUY":sd==="SELL")?{time:T[k],position:"belowBar",color:"#0a7d5a",shape:"arrowUp",text:"BUY "+cw.side}:{time:T[k],position:"aboveBar",color:"#c0392b",shape:"arrowDown",text:"EXIT "+cw.side})}
+      markers=[...put.values()].sort((a,b)=>a.time<b.time?-1:1)}}catch(e){}
+   }else{
    candles=rows.map(r=>({time:r.t+19800,open:r.o,high:r.h,low:r.l,close:r.c}));
    und=(h.und||[]).map(r=>({time:r.t+19800,open:r.o,high:r.h,low:r.l,close:r.c}));undErr=h.und_error||"";
    const iu=(h.ind||{}).und;if(iu&&iu.stop)undLines={stop:iu.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(iu.ema||[]).map(([t,v])=>[t+19800,v])};if(iu)undMarks=mkOf(iu.marks,19800);
-   const ind=(h.ind||{})[cw.side.toLowerCase()];if(ind&&ind.stop)lines={stop:ind.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(ind.ema||[]).map(([t,v])=>[t+19800,v])};if(ind)markers=mkOf(ind.marks,19800);
+   const ind=(h.ind||{})[cw.side.toLowerCase()];if(ind&&ind.stop)lines={stop:ind.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(ind.ema||[]).map(([t,v])=>[t+19800,v])};if(iu&&iu.marks){const T=candles.map(c=>c.time),ce=cw.side==="CE",put=new Map();   // the stock's signals as option trades: a CE is bought on a stock BUY and sold on a stock SELL, a PE the other way round
+    for(const [t0,sd] of iu.marks){const t=t0+19800;let k=-1;for(let i=T.length-1;i>=0;i--)if(T[i]<=t){k=i;break}if(k<0)continue;put.set(T[k],(ce?sd==="BUY":sd==="SELL")?{time:T[k],position:"belowBar",color:"#0a7d5a",shape:"arrowUp",text:"BUY "+cw.side}:{time:T[k],position:"aboveBar",color:"#c0392b",shape:"arrowDown",text:"EXIT "+cw.side})}
+    markers=[...put.values()].sort((a,b)=>a.time-b.time)}
+   }
    const f=rows[0].c,l=rows[rows.length-1].c;legend.push(`<b>${esc(sym)} ${cw.strike} ${cw.side}</b> <span>expiry ${esc(cw.exp)} · last ${l.toFixed(2)} (${(l/f-1>=0?"+":"")+((l/f-1)*100).toFixed(1)}% over the period)</span>`);
-   if(cw.tf==="1d")legend.push("<span>Option history is intraday only, so 15 minute candles of the last 3 days are shown.</span>")
+   if(cw.tf==="1d")legend.push("<span>Daily candles are built from hourly option prices (about a month); today's candle is still forming.</span>")
   }else{
    const r=await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${cw.tf}&inst=${cw.inst}`);const d=await r.json();if(my!==cw.my)return;
    if(d.error){$("cwMsg").textContent=d.error;cwClear();return}
