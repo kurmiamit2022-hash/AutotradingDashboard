@@ -1737,7 +1737,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16j"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16k"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8498,6 +8498,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .cwl input,.cwl select{width:100%;box-sizing:border-box}.cwl input,.cwl select{font:inherit;font-size:13px;color:var(--ink);background-color:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;outline:none}
 .cwl select{-webkit-appearance:none;appearance:none;padding-right:28px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239a98c0' stroke-width='1.6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;cursor:pointer}
 .cwl input:focus,.cwl select:focus{border-color:var(--acc,var(--ink))}
+.cwtr{display:flex;gap:8px;align-items:center;margin:8px 0 2px}.cwtr button{border:0;border-radius:8px;padding:7px 16px;font:inherit;font-size:13px;font-weight:600;color:#fff;cursor:pointer}.cwtr .b{background:#0a7d5a}.cwtr .s{background:#c0392b}.cwtr button:disabled{opacity:.4;cursor:not-allowed}
 #cwSec option,#cwShow option{font-size:13px;font-family:inherit;background:var(--panel);color:var(--ink);font-weight:400}
 #cwReco{border:2px solid transparent;border-radius:14px;background:linear-gradient(var(--panel),var(--panel)) padding-box,linear-gradient(135deg,#f97316,#dc2626,#7c3aed) border-box}
 .rcc{--rc:#b45309;--rcbg:rgba(245,158,11,.13);border-left:6px solid var(--rc)!important;background:var(--rcbg)}
@@ -8690,6 +8691,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div class="cwm">
   <div class="cwbar"><b id="cwTitle">Charts</b><div class="seg" id="cwInst" role="group" aria-label="Instrument"><button data-i="stock">Stock</button><button data-i="fut">Futures</button><button data-i="opt">Option</button></div>
    <div class="seg" id="cwTf" role="group" aria-label="Timeframe" style="margin-left:auto"></div></div>
+  <div class="cwtr" id="cwTr"><button class="b" data-sd="BUY" id="cwBuy">Buy</button><button class="s" data-sd="SELL" id="cwSell">Sell</button><span class="sub" id="cwTrN"></span></div>
   <div id="cwOpt" hidden><label class="sub">Expiry <select id="cwExp"></select></label><label class="sub">Strike <select id="cwStrike"></select></label>
    <div class="seg" id="cwSide" role="group" aria-label="Call or put"><button data-r="CE">Call (CE)</button><button data-r="PE">Put (PE)</button></div>
    <div class="seg" id="cwDays" role="group" aria-label="Days"><button data-d="1">1 day</button><button data-d="3">3 days</button></div></div>
@@ -9043,6 +9045,10 @@ function cwMark(){document.querySelectorAll("#cwList button").forEach(b=>{const 
 function cwShow(){cwDirs();if(!cw.ready){cw.ready=true;
   $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSortBar").onclick=e=>{const b=e.target.closest("button");if(!b)return;if(cw.sk===b.dataset.k)cw.sd=-(cw.sd||1);else{cw.sk=b.dataset.k;cw.sd=1}cwBuild()};$("cwShow").onchange=()=>cwBuild();
   $("cwList").onclick=e=>{const b=e.target.closest("button[data-s]");if(b)cwPick(b.dataset.s)};
+  $("cwTr").onclick=e=>{const b=e.target.closest("button[data-sd]");if(!b||b.disabled||!cw.sym||!cw.bar)return;const side=b.dataset.sd,sym=cw.sym,px=cw.bar.close;
+   if(cw.inst==="opt"){if(cw.strike==null||!cw.exp)return;openTicket({kind:"option",symbol:sym,expiry:cw.exp,strike:cw.strike,right:cw.side,side,price:px,label:`${sym} ${cw.strike} ${cw.side} ${cw.exp}`})}
+   else if(cw.inst==="fut")openTicket({kind:"future",symbol:sym,label:sym+" futures, nearest month",side,price:px,tf:cw.tf});
+   else openTicket({kind:"equity",symbol:sym,label:sym,side,price:px,tf:cw.tf})};
   $("cwInst").onclick=e=>{const b=e.target.closest("button");if(!b)return;cw.inst=b.dataset.i;cw.exp="";cw.strike=null;cwSave();cwPaintCtl();cwLoad()};
   $("cwTf").onclick=e=>{const b=e.target.closest("button");if(b)cwTf(b.dataset.t)};
   $("cwSide").onclick=e=>{const b=e.target.closest("button");if(b){cw.side=b.dataset.r;cwSave();cwPaintCtl();cwLoad()}};
@@ -9054,7 +9060,8 @@ function cwShow(){cwDirs();if(!cw.ready){cw.ready=true;
  cwBuild();if(!cw.sym||!cw.view.includes(cw.sym))cw.sym=cw.view.includes("NIFTY")?"NIFTY":cw.view[0];cwPaintCtl();cwMark();cwLoad()}
 function cwPaintCtl(){$("cwInst").querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.i===cw.inst));
  $("cwTf").innerHTML=["5m","15m","1d"].map(x=>`<button data-t="${x}" aria-pressed="${x===cw.tf}">${tfName[x]||x}</button>`).join("");
- $("cwOpt").hidden=cw.inst!=="opt";$("cwSide").querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.r===cw.side));$("cwDays").querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",+b.dataset.d===cw.days))}
+ $("cwOpt").hidden=cw.inst!=="opt";{const idx=["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","NIFTYNXT50","SENSEX","BANKEX"].includes(cw.sym),no=idx&&cw.inst!=="opt",w=cw.inst==="opt"?(cw.side==="CE"?"Call":"Put"):cw.inst==="fut"?"futures":"shares";
+  $("cwBuy").textContent="Buy "+w;$("cwSell").textContent="Sell "+w;$("cwBuy").disabled=$("cwSell").disabled=no;$("cwTrN").textContent=no?"Indices can only be traded through Futures or Option.":"Opens the order ticket. Nothing is sent until you confirm."}$("cwSide").querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.r===cw.side));$("cwDays").querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",+b.dataset.d===cw.days))}
 function cwTf(t){if(!t||t===cw.tf)return;cw.tf=t;cwSave();cwPaintCtl();cwLoad()}
 function cwPick(sym){if(!sym)return;cw.sym=sym;cw.exp="";cw.strike=null;cwSave();cwMark();clearTimeout(cw.t);cw.t=setTimeout(cwLoad,140)}
 function cwKey(e){if(mode!=="charts"||e.ctrlKey||e.metaKey||e.altKey)return;const el=document.activeElement,tg=el&&el.tagName;if(tg==="INPUT"||tg==="TEXTAREA"||tg==="SELECT"||$("chartDlg").open||$("optDlg").open)return;
