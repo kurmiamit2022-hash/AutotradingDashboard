@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16e"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16h"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -6164,6 +6164,13 @@ def api_sector_chart(sector: str, tf: str = DEFAULT_INTERVAL):
     return JSONResponse(d)
 
 
+@app.get("/api/ltp")
+def api_ltp(symbol: str):
+    """The latest live price the server holds for a symbol (None when it is stale or unknown); the Trade Desk charts use it to move the forming candle."""
+    symbol = symbol.upper().strip()
+    return {"p": fresh_ltp(symbol), "t": (LTP.get(symbol) or {}).get("t")}
+
+
 @app.get("/api/chart")
 def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0, inst: str = "stock"):
     symbol = symbol.upper().strip()
@@ -8469,6 +8476,8 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 #cwList button[aria-selected=true].fg,#cwList button[aria-selected=true].fr{animation:none}#cwList button[aria-selected=true].fg{background:#16a34a;color:#fff}#cwList button[aria-selected=true].fr{background:#dc2626;color:#fff}
 @media(prefers-reduced-motion:reduce){#cwList button.fg,#cwList button.fr{animation:none}#cwList button.fg{background:rgba(22,163,74,.4)}#cwList button.fr{background:rgba(220,38,38,.4)}}
 #cwList button:hover{background:rgba(120,120,160,.12)}#cwList button[aria-selected=true]{background:var(--ink);color:var(--panel)}
+.cwlive{margin-left:10px;font-size:12px;color:var(--buy);font-weight:600}
+.cwsb{display:flex;gap:6px;align-items:center;margin:6px 0 4px}.cwsb button{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);background:var(--panel);color:inherit;cursor:pointer}.cwsb button[aria-pressed=true]{background:var(--g);color:#fff;border-color:transparent}
 #cwList .gd{font-size:10px;font-weight:700;border-radius:50%;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;color:#fff;background:#6b7280}#cwList .gd.gA{background:#0a7d5a}#cwList .gd.gB{background:#2563eb}#cwList .gd.gC{background:#b7791f}
 #cwList .nm{font-weight:600}#cwList .pc{font-size:12px}#cwList .sg{font-size:10px;border-radius:6px;padding:1px 5px;border:1px solid currentColor;opacity:.85}
 .cwm{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0}
@@ -8634,8 +8643,8 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <aside class="cwl" aria-label="Watchlist">
   <input id="cwQ" placeholder="Search symbol" aria-label="Search symbol" autocomplete="off">
   <select id="cwSec" aria-label="Sector"><option value="ALL">All sectors</option></select>
-  <select id="cwShow" aria-label="Show"><option value="all">All symbols</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option><option value="fl">Flashing (5 and 15 min agree)</option><option value="flg">Flashing green</option><option value="flr">Flashing red</option><option value="gA">Grade A only</option><option value="gAB">Grade A or B</option></select>
-  <select id="cwSort" aria-label="Sort"><option value="az">A to Z</option><option value="chg">% change, highest first</option><option value="chgd">% change, lowest first</option><option value="sig">Signals first</option><option value="move">Biggest move, up or down</option></select>
+  <select id="cwShow" aria-label="Show"><option value="all">All symbols</option><option value="sig">With a signal</option><option value="fl">Flashing (5 and 15 min agree)</option></select>
+  <div class="cwsb" id="cwSortBar" role="group" aria-label="Sort the list"><span class="sub">Sort</span><button data-k="az">A–Z</button><button data-k="grade">Grade</button><button data-k="chg">% change</button></div>
   <div id="cwList" role="listbox" aria-label="Symbols" tabindex="0"></div>
  </aside>
  <div class="cwm">
@@ -8968,7 +8977,7 @@ function cwSave(){try{localStorage.setItem("cw",JSON.stringify({sym:cw.sym,inst:
 async function cwDirs(){try{const d=await (await api("/api/dirs")).json();const n=JSON.stringify(d.d||{});if(n!==JSON.stringify(cw.dirs)){cw.dirs=d.d||{};cwBuild()}}catch(e){}}
 setInterval(()=>{if(cw.ready&&!document.hidden&&$("cwList")&&$("cwList").offsetParent)cwDirs()},20000);
 function cwRows(){return data?data.rows:[]}
-function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec=$("cwSec").value,so=$("cwSort").value;
+function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec=$("cwSec").value,so=cw.sk||"az",dr=cw.sd||1;
  const secOf=r=>r.type==="index"?"Indices":(r.sector||"Others"),chgOf=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?null:c},sa={};
  rows.forEach(r=>{const c=chgOf(r);if(c==null)return;const k=secOf(r);(sa[k]=sa[k]||[]).push(c)});
  const avg=k=>sa[k]&&k!=="Others"&&k!=="Indices"?sa[k].reduce((x,y)=>x+y,0)/sa[k].length:null;   // a sector's average move today, from the stocks in it
@@ -8976,15 +8985,19 @@ function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec
  const lab=k=>{const a=avg(k);return a==null?k:`${k}  ${a>0?"+":""}${a.toFixed(2)}%`},sel=$("cwSec"),sig=secs.join("|");
  if(sel.dataset.sig!==sig&&document.activeElement!==sel){sel.dataset.sig=sig;sel.innerHTML='<option value="ALL">All sectors (best to worst)</option>'+secs.map(x=>`<option value="${esc(x)}">${esc(lab(x))}</option>`).join("");sel.value=secs.includes(sec)?sec:"ALL"}
  else[...sel.options].forEach(o=>{if(o.value!=="ALL")o.textContent=lab(o.value)})
- let v=rows.filter(r=>{const g=r.signal||"–",f=$("cwShow").value;const fd=cw.dirs[r.symbol]||"",gr=(r.conf&&r.conf.g)||"";return f==="all"||(f==="gA"?gr==="A":f==="gAB"?gr==="A"||gr==="B":false)||(f==="fl"?!!fd:f==="flg"?fd==="BUY":f==="flr"?fd==="SELL":f==="sig"?g!=="–":g.includes(f))}).filter(r=>(!q||r.symbol.includes(q))&&($("cwSec").value==="ALL"||(r.type==="index"?"Indices":(r.sector||"Others"))===$("cwSec").value));
+ let v=rows.filter(r=>{if(q&&!r.symbol.includes(q))return false;if(r.type==="index")return true;   // the indices stay on top whatever the sector and Show filters say; only a typed search narrows them
+  const g=r.signal||"–",f=$("cwShow").value;return(f==="all"||(f==="fl"?!!cw.dirs[r.symbol]:g!=="–"))&&($("cwSec").value==="ALL"||(r.sector||"Others")===$("cwSec").value)});
  const ch=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?-999:c},sg=r=>(r.signal&&r.signal!=="–")?0:1;
- v.sort((a,b)=>(a.type==="index"?0:1)-(b.type==="index"?0:1)||(so==="chg"?ch(b)-ch(a):so==="chgd"?ch(a)-ch(b):so==="move"?Math.abs(ch(b)===-999?0:ch(b))-Math.abs(ch(a)===-999?0:ch(a)):so==="sig"?sg(a)-sg(b)||a.symbol.localeCompare(b.symbol):a.symbol.localeCompare(b.symbol)));
+ const gv=r=>({A:3,B:2,C:1})[(r.conf&&r.conf.g)||""]||0,sc=r=>(r.conf&&r.conf.s)||0,nm=(a,b)=>a.symbol.localeCompare(b.symbol);
+ // dr 1 = the first click's order: A to Z, best grade first, highest % change first; a second click on the same button reverses it. Stocks without a grade or a price always go last.
+ v.sort((a,b)=>(a.type==="index"?0:1)-(b.type==="index"?0:1)||(so==="grade"?((gv(a)===0)-(gv(b)===0))||dr*(gv(b)-gv(a)||sc(b)-sc(a))||nm(a,b):so==="chg"?((ch(a)===-999)-(ch(b)===-999))||dr*(ch(b)-ch(a))||nm(a,b):dr*nm(a,b)));
+ [...document.querySelectorAll("#cwSortBar button")].forEach(x=>{const on=x.dataset.k===so;x.setAttribute("aria-pressed",on);x.textContent=({az:"A–Z",grade:"Grade",chg:"% change"})[x.dataset.k]+(on?(dr===1?" ↓":" ↑"):"")});
  cw.view=v.map(r=>r.symbol);const keepTop=$("cwList").scrollTop;
  $("cwList").innerHTML=v.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,sg=r.signal&&r.signal!=="–"?(r.side==="BUY"?"BUY":"SELL"):"";
   return `<button role="option" data-s="${esc(r.symbol)}" class="${cw.dirs[r.symbol]==="BUY"?"fg":cw.dirs[r.symbol]==="SELL"?"fr":""}" title="${cw.dirs[r.symbol]?"5 min and 15 min both "+(cw.dirs[r.symbol]==="BUY"?"green":"red"):""}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${esc(r.symbol)}</span><span>${r.conf&&r.conf.g?`<span class="gd g${r.conf.g}" title="Grade ${r.conf.g}, score ${r.conf.s} of 100">${r.conf.g}</span> `:""}${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
 function cwMark(){document.querySelectorAll("#cwList button").forEach(b=>{const on=b.dataset.s===cw.sym;b.setAttribute("aria-selected",on);if(on)b.scrollIntoView({block:"nearest"})})}
 function cwShow(){cwDirs();if(!cw.ready){cw.ready=true;
-  $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSort").onchange=()=>cwBuild();$("cwShow").onchange=()=>cwBuild();
+  $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSortBar").onclick=e=>{const b=e.target.closest("button");if(!b)return;if(cw.sk===b.dataset.k)cw.sd=-(cw.sd||1);else{cw.sk=b.dataset.k;cw.sd=1}cwBuild()};$("cwShow").onchange=()=>cwBuild();
   $("cwList").onclick=e=>{const b=e.target.closest("button[data-s]");if(b)cwPick(b.dataset.s)};
   $("cwInst").onclick=e=>{const b=e.target.closest("button");if(!b)return;cw.inst=b.dataset.i;cw.exp="";cw.strike=null;cwSave();cwPaintCtl();cwLoad()};
   $("cwTf").onclick=e=>{const b=e.target.closest("button");if(b)cwTf(b.dataset.t)};
@@ -9034,24 +9047,24 @@ document.addEventListener("click",e=>{const b=e.target.closest("[data-rc]");if(!
  else if(b.dataset.rc==="fut")openTicket({kind:"future",symbol:sym,label:sym+" futures, nearest month",side:x.side,price:x.entry,tf:b.dataset.t});
  else if(b.dataset.rc==="opt"&&lastChain&&lastChain.symbol===sym){const r=lastChain.rows.find(z=>z.strike===lastChain.atm),right=x.side==="BUY"?"CE":"PE",l=r&&r[right.toLowerCase()].ltp;
   openTicket({kind:"option",symbol:sym,expiry:lastChain.expiry,strike:lastChain.atm,right,side:"BUY",price:l,label:`${sym} ${lastChain.atm} ${right} ${lastChain.expiry}`,tf:b.dataset.t})}});
-async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
- {const k=sym+"|"+cw.tf,same=(cw.optKey||"").split("|")[0]===sym;if(cw.optKey!==k){cw.optKey=k;osym=sym;if(!same)oexp="";loadChain(same)}
+async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!silent)cwPaintCtl();
+ if(!silent){const k=sym+"|"+cw.tf,same=(cw.optKey||"").split("|")[0]===sym;if(cw.optKey!==k){cw.optKey=k;osym=sym;if(!same)oexp="";loadChain(same)}
   if(cwRecSym!==sym){cwRecSym=sym;cwRecLoad(sym)}}
- $("cwTitle").textContent=sym+(cw.inst==="fut"?" futures (nearest month)":"");$("cwMsg").textContent="Loading chart…";$("cwLeg").innerHTML="";
- try{await loadLW()}catch(e){$("cwMsg").textContent="The chart library did not load. Reload the page and try again.";return}
+ if(!silent){$("cwTitle").textContent=sym+(cw.inst==="fut"?" futures (nearest month)":"");$("cwMsg").textContent="Loading chart…";$("cwLeg").innerHTML=""}
+ try{await loadLW()}catch(e){if(!silent)$("cwMsg").textContent="The chart library did not load. Reload the page and try again.";return}
  let candles,lines=null,legend=[],markers=[],levels=null,intraday=true,und=null,undLines=null,undErr="",undMarks=[];
  const mkOf=(a,sh)=>(a||[]).slice().sort((x,y)=>x[0]<y[0]?-1:x[0]>y[0]?1:0).map(([t,sd])=>sd==="BUY"?{time:sh?t+sh:t,position:"belowBar",color:"#0a7d5a",shape:"arrowUp",text:"BUY"}:{time:sh?t+sh:t,position:"aboveBar",color:"#c0392b",shape:"arrowDown",text:"SELL"});
  try{
   if(cw.inst==="opt"){
    const ch=await cwChain(sym);if(my!==cw.my)return;
-   if(ch.error||!ch.rows||!ch.rows.length){$("cwMsg").textContent=ch.error||"No option chain for this symbol (it may not be in F&O).";cwClear();return}
+   if(ch.error||!ch.rows||!ch.rows.length){if(silent)return;$("cwMsg").textContent=ch.error||"No option chain for this symbol (it may not be in F&O).";cwClear();return}
    const exps=ch.expiries||[ch.expiry];if(!cw.exp||!exps.includes(cw.exp))cw.exp=ch.expiry||exps[0];
    const strikes=ch.rows.map(r=>r.strike);if(cw.strike==null||!strikes.includes(cw.strike))cw.strike=ch.atm!=null?ch.atm:strikes[Math.floor(strikes.length/2)];
    $("cwExp").innerHTML=exps.map(x=>`<option${x===cw.exp?" selected":""}>${esc(x)}</option>`).join("");$("cwStrike").innerHTML=strikes.map(x=>`<option value="${x}"${x===cw.strike?" selected":""}>${x}${x===ch.atm?" (ATM)":""}</option>`).join("");
    const m=cw.tf==="5m"?"5m":cw.tf==="1d"?"1d":"15m",days=cw.tf==="1d"?3:cw.days;
    const h=await (await api(`/api/options/history?symbol=${encodeURIComponent(sym)}&expiry=${encodeURIComponent(cw.exp)}&strike=${cw.strike}&tf=${m}&days=${days}`)).json();if(my!==cw.my)return;
-   if(h.error){$("cwMsg").textContent=h.error;cwClear();return}
-   const rows=h[cw.side.toLowerCase()]||[];if(!rows.length){$("cwMsg").textContent="No price history for this contract yet.";cwClear();return}
+   if(h.error){if(silent)return;$("cwMsg").textContent=h.error;cwClear();return}
+   const rows=h[cw.side.toLowerCase()]||[];if(!rows.length){if(silent)return;$("cwMsg").textContent="No price history for this contract yet.";cwClear();return}
    if(h.daily){   // Daily: the option's days are built from hourly candles (today's is still forming); the stock's own Daily chart gives the base chart and the signals
     candles=rows.map(r=>({time:r.t,open:r.o,high:r.h,low:r.l,close:r.c}));const t0=candles[0].time;
     try{const bd=await (await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=1d&inst=stock`)).json();if(my!==cw.my)return;
@@ -9071,7 +9084,7 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
    if(cw.tf==="1d")legend.push("<span>Daily candles are built from hourly option prices (about a month); today's candle is still forming.</span>")
   }else{
    const r=await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${cw.tf}&inst=${cw.inst}`);const d=await r.json();if(my!==cw.my)return;
-   if(d.error){$("cwMsg").textContent=d.error;cwClear();return}
+   if(d.error){if(silent)return;$("cwMsg").textContent=d.error;cwClear();return}
    candles=d.candles;lines=d.lines;intraday=d.intraday;
    if(cw.inst==="fut"){try{const bd=await (await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${cw.tf}&inst=stock`)).json();if(my!==cw.my)return;
      if(bd.error||!bd.candles||!bd.candles.length)undErr=bd.error||"";else{und=bd.candles;if(bd.lines&&bd.lines.stop)undLines={stop:bd.lines.stop,ema:bd.lines.ema||[]};undMarks=mkOf(bd.marks,0)}}catch(e){}}
@@ -9079,27 +9092,49 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
    const row=cwRows().find(x=>x.symbol===sym)||{},c=row.ltp_chg!=null?row.ltp_chg:row.chg,last=candles[candles.length-1].close;
    legend.push(`<b>${esc(sym)}</b> <span>${last.toFixed(2)}${c!=null?` (${c>0?"+":""}${c.toFixed(2)}% today)`:""}${row.sector?" · "+esc(row.sector):""}</span>`);
    if(d.signal){levels=d.signal;legend.push(`<b class="${d.signal.side==="BUY"?"up":"dn"}">${esc(d.signal.state)}</b> <span>signal candle ${esc(d.signal.time)}, ${esc(d.signal.status)}</span>`)}else legend.push("<span>No signal on this timeframe.</span>")}
- }catch(e){if(my===cw.my)$("cwMsg").textContent="The server did not return chart data. Try again in a moment.";return}
- $("cwMsg").textContent="";cwClear();
+ }catch(e){if(my===cw.my&&!silent)$("cwMsg").textContent="The server did not return chart data. Try again in a moment.";return}
+ const ckey=[sym,cw.tf,cw.inst,cw.side,cw.strike,cw.exp].join("|"),keep=silent&&cw.obj&&cw.ckey===ckey?{r:cw.obj.timeScale().getVisibleLogicalRange(),n:cw.n}:null;   // a refresh keeps the zoom and the scroll position
+ $("cwMsg").textContent="";cwClear();cw.ckey=ckey;cw.n=candles.length;
  const css=getComputedStyle(document.documentElement),col=(n,f)=>css.getPropertyValue(n).trim()||f;
  const ink=col("--ink","#222"),line=col("--line","#ddd"),up=col("--buy","#0a7d5a"),dn=col("--sell","#c0392b");
  const ch=LightweightCharts.createChart($("cwChart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{rightOffset:7,borderColor:line,timeVisible:intraday,secondsVisible:false},crosshair:{mode:0}});
  cw.obj=ch;
  if(lines){const sp=ch.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp.setData(lines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
   if(lines.ema&&lines.ema.length){const ep=ch.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ep.setData(lines.ema.map(([t,v])=>({time:t,value:v})))}}
- const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(candles);if(markers.length)cs.setMarkers(markers);
+ const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(candles);cw.cs=cs;cw.k2=null;cw.bar=Object.assign({},candles[candles.length-1]);cw.bar2=null;if(markers.length)cs.setMarkers(markers);
  if(levels){const lastT=candles[candles.length-1].time,lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title,autoscaleInfoProvider:()=>null});s.setData([{time:levels.from,value:price},{time:lastT,value:price}])};
   lv(levels.entry,ink,"Entry",0);lv(levels.sl,dn,"SL"+(levels.sl_hit?" ✖":""),0);levels.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(levels.hits>i?" ✓":""),2))}
- $("cwLeg").innerHTML=legend.join("");ch.timeScale().setVisibleLogicalRange({from:Math.max(-1,candles.length-120),to:candles.length+7})   /* the latest candles sit clear of the price scale */
+ $("cwLeg").innerHTML=legend.join("")+'<span class="cwlive" id="cwLive"></span>';ch.timeScale().setVisibleLogicalRange({from:Math.max(-1,candles.length-120),to:candles.length+7})   /* the latest candles sit clear of the price scale */
+ if(keep&&keep.r){const d=candles.length-keep.n;try{ch.timeScale().setVisibleLogicalRange({from:keep.r.from+d,to:keep.r.to+d})}catch(e){}}
  $("cwBaseW").hidden=cw.inst==="stock";document.querySelector(".cwm").classList.toggle("cwopt",cw.inst!=="stock");
  if(cw.inst!=="stock"){$("cwBaseT").innerHTML=und&&und.length?`<b>${esc(sym)}</b> stock chart, same candles${cw.inst==="opt"?" and days as the option":" as the futures"} above`:esc(undErr||"The stock chart is not available for this symbol right now.");
   if(und&&und.length){const c2=LightweightCharts.createChart($("cwChart2"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{rightOffset:7,borderColor:line,timeVisible:true,secondsVisible:false},crosshair:{mode:0}});cw.obj2=c2;
    if(undLines){const sp2=c2.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp2.setData(undLines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
     if(undLines.ema&&undLines.ema.length){const e2=c2.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});e2.setData(undLines.ema.map(([t,v])=>({time:t,value:v})))}}
-   const k2=c2.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});k2.setData(und);if(undMarks.length)k2.setMarkers(undMarks);
+   const k2=c2.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});k2.setData(und);cw.k2=k2;cw.bar2=Object.assign({},und[und.length-1]);if(undMarks.length)k2.setMarkers(undMarks);
    let lock=false;const same=und.length===candles.length;   // the same candles: follow each other by position, which keeps the empty space at the right edge; otherwise by time
    const link=(a,b)=>same?a.timeScale().subscribeVisibleLogicalRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleLogicalRange(r)}catch(e){}lock=false}):a.timeScale().subscribeVisibleTimeRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleRange(r)}catch(e){}lock=false});link(ch,c2);link(c2,ch);
    try{if(same){const r=ch.timeScale().getVisibleLogicalRange();if(r)c2.timeScale().setVisibleLogicalRange(r)}else{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}}catch(e){}}}}
+const cw_REFRESH_MS=20000;
+const cwOpenNow=()=>{const n=new Date(Date.now()+19800000),d=n.getUTCDay(),m=n.getUTCHours()*60+n.getUTCMinutes();return d>0&&d<6&&m>=555&&m<930};   // 09:15 to 15:30 India time, Monday to Friday
+function cwTick(ser,bar,p){   // the live price moves the forming candle; a new candle starts when its time comes
+ if(!ser||!bar||!(p>0))return null;let t;
+ if(cw.tf==="1d")t=new Date(Date.now()+19800000).toISOString().slice(0,10);else{const st=cw.tf==="5m"?300:900;t=Math.floor((Date.now()/1000+19800)/st)*st}
+ if(bar.time===t){bar.high=Math.max(bar.high,p);bar.low=Math.min(bar.low,p);bar.close=p}
+ else if(t>bar.time){const nb={time:t,open:bar.close,high:Math.max(bar.close,p),low:Math.min(bar.close,p),close:p};Object.keys(nb).forEach(k=>bar[k]=nb[k])}
+ else return null;
+ try{ser.update(bar)}catch(e){return null}return bar}
+let cwTickBusy=false;
+async function cwLiveTick(){if(cwTickBusy||document.hidden||mode!=="charts"||!cw.sym||!cw.obj)return;
+ const main=cw.inst==="stock",ser=main?cw.cs:cw.k2,bar=main?cw.bar:cw.bar2;if(!ser||!bar)return;
+ cwTickBusy=true;const sym=cw.sym,my=cw.my;
+ try{const o=cwOpenNow();const el=$("cwLive");
+  if(!o){if(el)el.textContent="market closed";return}
+  const d=await (await api("/api/ltp?symbol="+encodeURIComponent(sym))).json();if(my!==cw.my||sym!==cw.sym)return;
+  if(d.p&&cwTick(ser,bar,d.p)&&el)el.textContent="● live "+new Date(Date.now()+19800000).toISOString().slice(11,19)+" · "+d.p.toFixed(2)}
+ catch(e){}finally{cwTickBusy=false}}
+setInterval(cwLiveTick,3000);
+setInterval(()=>{if(mode==="charts"&&cw.ready&&!document.hidden&&cw.sym&&cwOpenNow())cwLoad(true)},cw_REFRESH_MS);
 function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
 function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
  const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
