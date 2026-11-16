@@ -1701,7 +1701,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-13m"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16b"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8421,7 +8421,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .cwbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}.cwbar b{font-size:18px}.cwbar .seg{margin:0}
 #cwOpt{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 #cwChart{height:min(64vh,620px);min-height:340px;width:100%}
-#cwChart2{height:260px;width:100%}.cwopt #cwChart{height:min(46vh,420px);min-height:300px}
+#cwChart2{height:300px;width:100%}.cwopt #cwChart{height:min(50vh,460px);min-height:320px}
 @media(max-width:820px){.cwrap{grid-template-columns:1fr}#cwList{height:200px}}
 td.act{white-space:nowrap}
 .tk{padding:20px}.tk h2{margin:0 0 4px;font-size:20px}
@@ -8580,7 +8580,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <aside class="cwl" aria-label="Watchlist">
   <input id="cwQ" placeholder="Search symbol" aria-label="Search symbol" autocomplete="off">
   <select id="cwSec" aria-label="Sector"><option value="ALL">All sectors</option></select>
-  <select id="cwShow" aria-label="Show"><option value="all">All symbols</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option></select>
+  <select id="cwShow" aria-label="Show"><option value="all">All symbols</option><option value="sig">With a signal</option><option value="BUY">Buy signals</option><option value="SELL">Sell signals</option><option value="fl">Flashing (5 and 15 min agree)</option><option value="flg">Flashing green</option><option value="flr">Flashing red</option></select>
   <select id="cwSort" aria-label="Sort"><option value="az">A to Z</option><option value="chg">% change, highest first</option><option value="chgd">% change, lowest first</option><option value="sig">Signals first</option><option value="move">Biggest move, up or down</option></select>
   <div id="cwList" role="listbox" aria-label="Symbols" tabindex="0"></div>
  </aside>
@@ -8915,9 +8915,14 @@ async function cwDirs(){try{const d=await (await api("/api/dirs")).json();const 
 setInterval(()=>{if(cw.ready&&!document.hidden&&$("cwList")&&$("cwList").offsetParent)cwDirs()},20000);
 function cwRows(){return data?data.rows:[]}
 function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec=$("cwSec").value,so=$("cwSort").value;
- const secs=[...new Set(rows.map(r=>r.type==="index"?"Indices":(r.sector||"Others")))].sort();
- if($("cwSec").options.length!==secs.length+1){$("cwSec").innerHTML='<option value="ALL">All sectors</option>'+secs.map(x=>`<option>${esc(x)}</option>`).join("");$("cwSec").value=secs.includes(sec)?sec:"ALL"}
- let v=rows.filter(r=>{const g=r.signal||"–",f=$("cwShow").value;return f==="all"||(f==="sig"?g!=="–":g.includes(f))}).filter(r=>(!q||r.symbol.includes(q))&&($("cwSec").value==="ALL"||(r.type==="index"?"Indices":(r.sector||"Others"))===$("cwSec").value));
+ const secOf=r=>r.type==="index"?"Indices":(r.sector||"Others"),chgOf=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?null:c},sa={};
+ rows.forEach(r=>{const c=chgOf(r);if(c==null)return;const k=secOf(r);(sa[k]=sa[k]||[]).push(c)});
+ const avg=k=>sa[k]&&k!=="Others"&&k!=="Indices"?sa[k].reduce((x,y)=>x+y,0)/sa[k].length:null;   // a sector's average move today, from the stocks in it
+ const secs=[...new Set(rows.map(secOf))].sort((a,b)=>{const x=avg(a),y=avg(b);return x==null&&y==null?a.localeCompare(b):x==null?1:y==null?-1:y-x});
+ const lab=k=>{const a=avg(k);return a==null?k:`${k}  ${a>0?"+":""}${a.toFixed(2)}%`},sel=$("cwSec"),sig=secs.join("|");
+ if(sel.dataset.sig!==sig&&document.activeElement!==sel){sel.dataset.sig=sig;sel.innerHTML='<option value="ALL">All sectors (best to worst)</option>'+secs.map(x=>`<option value="${esc(x)}">${esc(lab(x))}</option>`).join("");sel.value=secs.includes(sec)?sec:"ALL"}
+ else[...sel.options].forEach(o=>{if(o.value!=="ALL")o.textContent=lab(o.value)})
+ let v=rows.filter(r=>{const g=r.signal||"–",f=$("cwShow").value;const fd=cw.dirs[r.symbol]||"";return f==="all"||(f==="fl"?!!fd:f==="flg"?fd==="BUY":f==="flr"?fd==="SELL":f==="sig"?g!=="–":g.includes(f))}).filter(r=>(!q||r.symbol.includes(q))&&($("cwSec").value==="ALL"||(r.type==="index"?"Indices":(r.sector||"Others"))===$("cwSec").value));
  const ch=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?-999:c},sg=r=>(r.signal&&r.signal!=="–")?0:1;
  v.sort((a,b)=>(a.type==="index"?0:1)-(b.type==="index"?0:1)||(so==="chg"?ch(b)-ch(a):so==="chgd"?ch(a)-ch(b):so==="move"?Math.abs(ch(b)===-999?0:ch(b))-Math.abs(ch(a)===-999?0:ch(a)):so==="sig"?sg(a)-sg(b)||a.symbol.localeCompare(b.symbol):a.symbol.localeCompare(b.symbol)));
  cw.view=v.map(r=>r.symbol);const keepTop=$("cwList").scrollTop;
@@ -9013,22 +9018,23 @@ async function cwLoad(){const my=++cw.my,sym=cw.sym;if(!sym)return;cwPaintCtl();
  $("cwMsg").textContent="";cwClear();
  const css=getComputedStyle(document.documentElement),col=(n,f)=>css.getPropertyValue(n).trim()||f;
  const ink=col("--ink","#222"),line=col("--line","#ddd"),up=col("--buy","#0a7d5a"),dn=col("--sell","#c0392b");
- const ch=LightweightCharts.createChart($("cwChart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:intraday,secondsVisible:false},crosshair:{mode:0}});
+ const ch=LightweightCharts.createChart($("cwChart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{rightOffset:7,borderColor:line,timeVisible:intraday,secondsVisible:false},crosshair:{mode:0}});
  cw.obj=ch;
  if(lines){const sp=ch.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp.setData(lines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
   if(lines.ema&&lines.ema.length){const ep=ch.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ep.setData(lines.ema.map(([t,v])=>({time:t,value:v})))}}
  const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(candles);if(markers.length)cs.setMarkers(markers);
- if(levels){const lastT=candles[candles.length-1].time,lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title});s.setData([{time:levels.from,value:price},{time:lastT,value:price}])};
+ if(levels){const lastT=candles[candles.length-1].time,lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title,autoscaleInfoProvider:()=>null});s.setData([{time:levels.from,value:price},{time:lastT,value:price}])};
   lv(levels.entry,ink,"Entry",0);lv(levels.sl,dn,"SL"+(levels.sl_hit?" ✖":""),0);levels.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(levels.hits>i?" ✓":""),2))}
- $("cwLeg").innerHTML=legend.join("");ch.timeScale().fitContent();if(candles.length>120)ch.timeScale().setVisibleLogicalRange({from:candles.length-120,to:candles.length+4})
+ $("cwLeg").innerHTML=legend.join("");ch.timeScale().setVisibleLogicalRange({from:Math.max(-1,candles.length-120),to:candles.length+7})   /* the latest candles sit clear of the price scale */
  $("cwBaseW").hidden=cw.inst==="stock";document.querySelector(".cwm").classList.toggle("cwopt",cw.inst!=="stock");
  if(cw.inst!=="stock"){$("cwBaseT").innerHTML=und&&und.length?`<b>${esc(sym)}</b> stock chart, same candles${cw.inst==="opt"?" and days as the option":" as the futures"} above`:esc(undErr||"The stock chart is not available for this symbol right now.");
-  if(und&&und.length){const c2=LightweightCharts.createChart($("cwChart2"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:true,secondsVisible:false},crosshair:{mode:0}});cw.obj2=c2;
+  if(und&&und.length){const c2=LightweightCharts.createChart($("cwChart2"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{rightOffset:7,borderColor:line,timeVisible:true,secondsVisible:false},crosshair:{mode:0}});cw.obj2=c2;
    if(undLines){const sp2=c2.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp2.setData(undLines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
     if(undLines.ema&&undLines.ema.length){const e2=c2.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});e2.setData(undLines.ema.map(([t,v])=>({time:t,value:v})))}}
    const k2=c2.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});k2.setData(und);if(undMarks.length)k2.setMarkers(undMarks);
-   let lock=false;const link=(a,b)=>a.timeScale().subscribeVisibleTimeRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleRange(r)}catch(e){}lock=false});link(ch,c2);link(c2,ch);
-   try{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}catch(e){}}}}
+   let lock=false;const same=und.length===candles.length;   // the same candles: follow each other by position, which keeps the empty space at the right edge; otherwise by time
+   const link=(a,b)=>same?a.timeScale().subscribeVisibleLogicalRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleLogicalRange(r)}catch(e){}lock=false}):a.timeScale().subscribeVisibleTimeRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleRange(r)}catch(e){}lock=false});link(ch,c2);link(c2,ch);
+   try{if(same){const r=ch.timeScale().getVisibleLogicalRange();if(r)c2.timeScale().setVisibleLogicalRange(r)}else{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}}catch(e){}}}}
 function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
 function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
  const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
@@ -9344,7 +9350,7 @@ async function drawChart(){
  $("chMsg").textContent="";
  const css=getComputedStyle(document.documentElement),col=(n,f)=>css.getPropertyValue(n).trim()||f;
  const ink=col("--ink","#222"),line=col("--line","#ddd"),up=col("--buy","#0a7d5a"),dn=col("--sell","#c0392b");
- const ch=LightweightCharts.createChart($("chart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{borderColor:line,timeVisible:d.intraday,secondsVisible:false},crosshair:{mode:0}});
+ const ch=LightweightCharts.createChart($("chart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{rightOffset:7,borderColor:line,timeVisible:d.intraday,secondsVisible:false},crosshair:{mode:0}});
  chObj=ch;
  if(d.lines){const sp=ch.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp.setData(d.lines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
   const ep=ch.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ep.setData(d.lines.ema.map(([t,v])=>({time:t,value:v})))}
