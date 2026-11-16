@@ -1737,7 +1737,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16k"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16l"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -1844,6 +1844,7 @@ ALERT_DDL = [
     "tfs TEXT NOT NULL DEFAULT '15m', sides TEXT NOT NULL DEFAULT 'BUY,SELL', sectors TEXT NOT NULL DEFAULT '', updated TEXT)",
     "CREATE TABLE IF NOT EXISTS alert_seen(k TEXT PRIMARY KEY, ts TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS manual_sig(k TEXT PRIMARY KEY, day TEXT NOT NULL, data TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS watchlist(user_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(user_id, symbol))",
 ]
 
 
@@ -4893,6 +4894,138 @@ def start_alerts():
         threading.Thread(target=telegram_poll, daemon=True).start()
 
 
+# ── Event warnings: results, board meetings and ex-dates from NSE's public calendar (unofficial), plus EVENTS_EXTRA ──
+EVENT_DAYS = int(os.getenv("EVENT_DAYS", "10"))        # how far ahead to look
+EVENT_TTL = 6 * 3600
+EVENTS = {"by": {}, "ts": 0.0, "ok": False, "busy": False}
+EVENTS_EXTRA = os.getenv("EVENTS_EXTRA", "")   # fallback when NSE blocks the server: "RELIANCE,2026-11-20,Results;TCS,2026-11-21,Ex-dividend"
+
+
+def _ev_date(v):
+    for f in ("%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y", "%d-%b-%y"):
+        try:
+            return datetime.strptime(str(v).strip()[:11], f).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _ev_rows(raw):
+    if isinstance(raw, dict):
+        raw = raw.get("data") or raw.get("rows") or []
+    return [r for r in (raw or []) if isinstance(r, dict)]
+
+
+def parse_events(cal, acts, today, days, universe, extra=""):
+    """symbol -> [{"d": date, "kind": ..., "note": ...}] for events from today to `days` ahead."""
+    end = today + timedelta(days=days)
+    out, seen = {}, set()
+
+    def add(sym, d, kind, note=""):
+        sym = str(sym or "").strip().upper()
+        if sym not in universe or d is None or d < today or d > end or (sym, d, kind) in seen:
+            return
+        seen.add((sym, d, kind))
+        out.setdefault(sym, []).append({"d": d, "kind": kind, "note": str(note or "")[:90]})
+
+    for r in _ev_rows(cal):
+        pur = str(r.get("purpose") or r.get("bm_purpose") or "")
+        desc = str(r.get("bm_desc") or r.get("description") or "")
+        low = (pur + " " + desc).lower()
+        kind = "Results" if ("result" in low or "financial" in low) else "Dividend meeting" if "dividend" in low else "Board meeting"
+        add(r.get("symbol"), _ev_date(r.get("date") or r.get("bm_date")), kind, desc or pur)
+    for r in _ev_rows(acts):
+        sub = str(r.get("subject") or r.get("purpose") or "")
+        low = sub.lower()
+        kind = ("Ex-dividend" if "dividend" in low else "Ex-split" if ("split" in low or "sub-division" in low or "face value" in low)
+                else "Ex-bonus" if "bonus" in low else "Ex-rights" if "rights" in low
+                else "Merger or demerger" if any(w in low for w in ("merger", "demerger", "amalgamation", "arrangement")) else None)
+        if kind:
+            add(r.get("symbol"), _ev_date(r.get("exDate") or r.get("ex_date")), kind, sub)
+    for part in (extra or "").split(";"):
+        bits = [b.strip() for b in part.split(",")]
+        if len(bits) >= 3:
+            add(bits[0], _ev_date(bits[1]), bits[2], bits[3] if len(bits) > 3 else "")
+    for v in out.values():
+        v.sort(key=lambda e: e["d"])
+    return out
+
+
+def next_trading_day(d):
+    d += timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def events_view(by, today):
+    """What the page gets: each event with days to go and `soon` (today, or the next trading day)."""
+    nt = next_trading_day(today)
+    out = {}
+    for sym, evs in by.items():
+        keep = [{"date": e["d"].isoformat(), "days": (e["d"] - today).days, "kind": e["kind"], "note": e["note"],
+                 "soon": e["d"] <= nt} for e in evs if e["d"] >= today]
+        if keep:
+            out[sym] = keep
+    return out
+
+
+def _events_job():
+    try:
+        today = ist_now().date()
+        f, t = today.strftime("%d-%m-%Y"), (today + timedelta(days=EVENT_DAYS)).strftime("%d-%m-%Y")
+        prm = {"index": "equities", "from_date": f, "to_date": t}
+        cal = nse.get_json("/api/event-calendar", prm)
+        acts = nse.get_json("/api/corporates-corporateActions", prm)
+        ok = cal is not None or acts is not None
+        by = parse_events(cal, acts, today, EVENT_DAYS, set(UNIVERSE), EVENTS_EXTRA)
+        if ok or EVENTS_EXTRA:
+            EVENTS["by"] = by
+        EVENTS["ok"] = ok
+        EVENTS["ts"] = time.time() if ok else time.time() - EVENT_TTL + 300   # on a failure try again in 5 minutes
+    except Exception as e:
+        print("event calendar failed:", type(e).__name__, flush=True)
+        EVENTS["ts"] = time.time() - EVENT_TTL + 300
+    finally:
+        EVENTS["busy"] = False
+
+
+def ensure_events():
+    if EVENTS["busy"] or time.time() - EVENTS["ts"] < EVENT_TTL:
+        return
+    EVENTS["busy"] = True
+    threading.Thread(target=_events_job, daemon=True).start()
+
+
+@app.get("/api/events")
+def api_events(request: Request):
+    ensure_events()
+    return {"events": events_view(EVENTS["by"], ist_now().date()), "ok": EVENTS["ok"], "checked": EVENTS["ts"] > 0}
+
+
+# ── Personal watchlist (kept per user on the server) ──
+@app.get("/api/watchlist")
+def api_watchlist(request: Request):
+    return {"symbols": sorted(r["symbol"] for r in q("SELECT symbol FROM watchlist WHERE user_id=?", (request.state.user["id"],)))}
+
+
+@app.put("/api/watchlist")
+def api_watchlist_save(request: Request, payload: dict = Body(...)):
+    uid = request.state.user["id"]
+    ok = set(UNIVERSE)
+    syms = []
+    for s_ in payload.get("symbols") or []:
+        s_ = str(s_).strip().upper()
+        if s_ in ok and s_ not in syms:
+            syms.append(s_)
+    if len(syms) > 200:
+        return {"error": "The watchlist can hold up to 200 symbols."}
+    x("DELETE FROM watchlist WHERE user_id=?", (uid,))
+    for s_ in syms:
+        x("INSERT INTO watchlist(user_id, symbol) VALUES(?, ?)", (uid, s_))
+    return {"symbols": sorted(syms)}
+
+
 @app.get("/api/alerts")
 def api_alerts(request: Request):
     u = request.state.user
@@ -5082,6 +5215,7 @@ def start_worker():
     start_alerts()
     start_engine()
     threading.Thread(target=warm_scans, daemon=True).start()
+    ensure_events()
 
 
 def warm_scans():
@@ -8498,6 +8632,11 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .cwl input,.cwl select{width:100%;box-sizing:border-box}.cwl input,.cwl select{font:inherit;font-size:13px;color:var(--ink);background-color:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;outline:none}
 .cwl select{-webkit-appearance:none;appearance:none;padding-right:28px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239a98c0' stroke-width='1.6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;cursor:pointer}
 .cwl input:focus,.cwl select:focus{border-color:var(--acc,var(--ink))}
+.cwstar{background:none;border:0;font-size:20px;line-height:1;cursor:pointer;color:var(--mute);padding:0 6px}.cwstar[aria-pressed=true]{color:#f5b301}
+#cwList .st{display:inline-block;width:16px;margin-right:4px;font-size:14px;color:var(--mute);opacity:0;cursor:pointer}#cwList button:hover .st,#cwList .st.on{opacity:1}#cwList .st.on{color:#f5b301}
+@media(hover:none){#cwList .st{opacity:.5}#cwList .st.on{opacity:1}}
+#cwList .st.sp{opacity:0!important;cursor:default}#cwList .evb{color:#f59e0b;font-size:13px;margin-right:4px}
+.cwev{margin:6px 0;padding:6px 10px;border-radius:8px;font-size:13px;border:1px solid var(--line);color:var(--mute)}.cwev.soon{color:#f59e0b;border-color:#f59e0b;background:rgba(245,158,11,.08)}
 .cwtr{display:flex;gap:8px;align-items:center;margin:8px 0 2px}.cwtr button{border:0;border-radius:8px;padding:7px 16px;font:inherit;font-size:13px;font-weight:600;color:#fff;cursor:pointer}.cwtr .b{background:#0a7d5a}.cwtr .s{background:#c0392b}.cwtr button:disabled{opacity:.4;cursor:not-allowed}
 #cwSec option,#cwShow option{font-size:13px;font-family:inherit;background:var(--panel);color:var(--ink);font-weight:400}
 #cwReco{border:2px solid transparent;border-radius:14px;background:linear-gradient(var(--panel),var(--panel)) padding-box,linear-gradient(135deg,#f97316,#dc2626,#7c3aed) border-box}
@@ -8684,13 +8823,14 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <aside class="cwl" aria-label="Watchlist">
   <input id="cwQ" placeholder="Search symbol" aria-label="Search symbol" autocomplete="off">
   <select id="cwSec" aria-label="Sector"><option value="ALL">All sectors</option></select>
-  <select id="cwShow" aria-label="Show"><option value="all">All symbols</option><option value="sig">With a signal</option><option value="fl">Flashing (5 and 15 min agree)</option></select>
+  <select id="cwShow" aria-label="Show"><option value="all">All symbols</option><option value="wl">My watchlist</option><option value="sig">With a signal</option><option value="fl">Flashing (5 and 15 min agree)</option></select>
   <div class="cwsb" id="cwSortBar" role="group" aria-label="Sort the list"><span class="sub">Sort</span><button data-k="az">A–Z</button><button data-k="grade">Grade</button><button data-k="chg">% change</button></div>
   <div id="cwList" role="listbox" aria-label="Symbols" tabindex="0"></div>
  </aside>
  <div class="cwm">
-  <div class="cwbar"><b id="cwTitle">Charts</b><div class="seg" id="cwInst" role="group" aria-label="Instrument"><button data-i="stock">Stock</button><button data-i="fut">Futures</button><button data-i="opt">Option</button></div>
+  <div class="cwbar"><b id="cwTitle">Charts</b><button id="cwStar" class="cwstar" aria-pressed="false" title="Add to my watchlist" aria-label="Add to my watchlist">☆</button><div class="seg" id="cwInst" role="group" aria-label="Instrument"><button data-i="stock">Stock</button><button data-i="fut">Futures</button><button data-i="opt">Option</button></div>
    <div class="seg" id="cwTf" role="group" aria-label="Timeframe" style="margin-left:auto"></div></div>
+  <div class="cwev" id="cwEv" hidden role="status"></div>
   <div class="cwtr" id="cwTr"><button class="b" data-sd="BUY" id="cwBuy">Buy</button><button class="s" data-sd="SELL" id="cwSell">Sell</button><span class="sub" id="cwTrN"></span></div>
   <div id="cwOpt" hidden><label class="sub">Expiry <select id="cwExp"></select></label><label class="sub">Strike <select id="cwStrike"></select></label>
    <div class="seg" id="cwSide" role="group" aria-label="Call or put"><button data-r="CE">Call (CE)</button><button data-r="PE">Put (PE)</button></div>
@@ -8911,6 +9051,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div class="tkgrid" id="tkConfirm" hidden>
   <label id="tkPinL" hidden>Order PIN<input id="tkPin" type="password" autocomplete="off"></label>
  </div>
+ <div class="tkmsg cwev" id="tkEv" hidden role="status"></div>
  <div class="tkmsg" id="tkMsg" role="status"></div>
  <div class="tkbtns"><button class="btn ghost" id="tkClose">Close</button><button class="btn" id="tkReviewBtn">Review order</button><button class="btn go" id="tkPlace" hidden>Place order</button></div>
 </div></dialog>
@@ -9018,6 +9159,17 @@ const sgn=n=>n==null?"–":`<span class="${n>=0?"up":"dn"}">${n>0?"+":""}${fk(n)
 // ── Charts workspace: a watchlist and one big chart; the arrow keys move through the list ──
 const cw={sym:null,inst:"stock",tf:"15m",side:"CE",days:1,exp:"",strike:null,chain:{},obj:null,my:0,t:null,ready:false,view:[],dirs:{}};
 try{const j=JSON.parse(localStorage.getItem("cw")||"{}");for(const k of ["sym","inst","tf","side","days"])if(j[k]!=null)cw[k]=j[k]}catch(e){}
+cw.wl=new Set();cw.ev={};
+const evWhen=e=>e.days===0?"today":e.days===1?"tomorrow":"in "+e.days+" days ("+new Date(e.date+"T00:00:00").toLocaleDateString("en-IN",{weekday:"short",day:"numeric",month:"short"})+")";
+const evSoon=sym=>(cw.ev[sym]||[]).filter(e=>e.soon);
+async function cwWlLoad(){try{const d=await (await api("/api/watchlist")).json();cw.wl=new Set(d.symbols||[]);cwBuild();cwStarPaint()}catch(e){}}
+async function cwEvLoad(){try{const d=await (await api("/api/events")).json();cw.ev=d.events||{};cwBuild();cwEvPaint()}catch(e){}}
+function cwStarPaint(){const b=$("cwStar");if(!b)return;const on=cw.wl.has(cw.sym);b.textContent=on?"★":"☆";b.setAttribute("aria-pressed",on);const t=on?"Remove from my watchlist":"Add to my watchlist";b.title=t;b.setAttribute("aria-label",t)}
+async function cwWlToggle(sym){if(!sym)return;const was=cw.wl.has(sym);was?cw.wl.delete(sym):cw.wl.add(sym);cwBuild();cwStarPaint();
+ try{const d=await send("PUT","/api/watchlist",{symbols:[...cw.wl]});if(d.error)throw new Error(d.error);cw.wl=new Set(d.symbols)}catch(e){was?cw.wl.add(sym):cw.wl.delete(sym);cwBuild();cwStarPaint();$("cwMsg").textContent="Could not save your watchlist. Try again."}}
+function cwEvPaint(){const b=$("cwEv");if(!b)return;const ev=cw.ev[cw.sym]||[];if(!ev.length){b.hidden=true;return}
+ const soon=ev.some(e=>e.soon);b.hidden=false;b.className="cwev"+(soon?" soon":"");
+ b.textContent=(soon?"⚠ ":"Coming up: ")+ev.map(e=>e.kind+" "+evWhen(e)).join(" · ")+(soon?". Signals around results and ex-dates can be unreliable, so size down or wait for the move to settle.":"")}
 function cwSave(){try{localStorage.setItem("cw",JSON.stringify({sym:cw.sym,inst:cw.inst,tf:cw.tf,side:cw.side,days:cw.days}))}catch(e){}}
 async function cwDirs(){try{const d=await (await api("/api/dirs")).json();const n=JSON.stringify(d.d||{});if(n!==JSON.stringify(cw.dirs)){cw.dirs=d.d||{};cwBuild()}}catch(e){}}
 setInterval(()=>{if(cw.ready&&!document.hidden&&$("cwList")&&$("cwList").offsetParent)cwDirs()},20000);
@@ -9032,7 +9184,7 @@ function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec
  else[...sel.options].forEach(o=>{if(o.value!=="ALL"){o.textContent=lab(o.value);o.className=scls(o.value)}});
  sel.className=sel.value==="ALL"?"":scls(sel.value)   // green for a sector that is up today, red for one that is down
  let v=rows.filter(r=>{if(q&&!r.symbol.includes(q))return false;if(r.type==="index")return true;   // the indices stay on top whatever the sector and Show filters say; only a typed search narrows them
-  const g=r.signal||"–",f=$("cwShow").value;return(f==="all"||(f==="fl"?!!cw.dirs[r.symbol]:g!=="–"))&&($("cwSec").value==="ALL"||(r.sector||"Others")===$("cwSec").value)});
+  const g=r.signal||"–",f=$("cwShow").value;return(f==="all"||(f==="wl"?cw.wl.has(r.symbol):f==="fl"?!!cw.dirs[r.symbol]:g!=="–"))&&($("cwSec").value==="ALL"||(r.sector||"Others")===$("cwSec").value)});
  const ch=r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg;return c==null?-999:c},sg=r=>(r.signal&&r.signal!=="–")?0:1;
  const gv=r=>({A:3,B:2,C:1})[(r.conf&&r.conf.g)||""]||0,sc=r=>(r.conf&&r.conf.s)||0,nm=(a,b)=>a.symbol.localeCompare(b.symbol);
  // dr 1 = the first click's order: A to Z, best grade first, highest % change first; a second click on the same button reverses it. Stocks without a grade or a price always go last.
@@ -9040,11 +9192,11 @@ function cwBuild(){const rows=cwRows(),q=$("cwQ").value.trim().toUpperCase(),sec
  [...document.querySelectorAll("#cwSortBar button")].forEach(x=>{const on=x.dataset.k===so;x.setAttribute("aria-pressed",on);x.textContent=({az:"A–Z",grade:"Grade",chg:"% change"})[x.dataset.k]+(on?(dr===1?" ↓":" ↑"):"")});
  cw.view=v.map(r=>r.symbol);const keepTop=$("cwList").scrollTop;
  $("cwList").innerHTML=v.map(r=>{const c=r.ltp_chg!=null?r.ltp_chg:r.chg,sg=r.signal&&r.signal!=="–"?(r.side==="BUY"?"BUY":"SELL"):"";
-  return `<button role="option" data-s="${esc(r.symbol)}" class="${cw.dirs[r.symbol]==="BUY"?"fg":cw.dirs[r.symbol]==="SELL"?"fr":""}" title="${cw.dirs[r.symbol]?"5 min and 15 min both "+(cw.dirs[r.symbol]==="BUY"?"green":"red"):""}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${esc(r.symbol)}</span><span>${r.conf&&r.conf.g?`<span class="gd g${r.conf.g}" title="Grade ${r.conf.g}, score ${r.conf.s} of 100">${r.conf.g}</span> `:""}${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
+  return `<button role="option" data-s="${esc(r.symbol)}" class="${cw.dirs[r.symbol]==="BUY"?"fg":cw.dirs[r.symbol]==="SELL"?"fr":""}" title="${cw.dirs[r.symbol]?"5 min and 15 min both "+(cw.dirs[r.symbol]==="BUY"?"green":"red"):""}" aria-selected="${r.symbol===cw.sym}"><span class="nm">${r.type==="index"?'<span class="st sp"></span>':`<span class="st${cw.wl.has(r.symbol)?" on":""}" data-star="${esc(r.symbol)}" title="${cw.wl.has(r.symbol)?"Remove from my watchlist":"Add to my watchlist"}" aria-hidden="true">${cw.wl.has(r.symbol)?"★":"☆"}</span>`}${esc(r.symbol)}</span><span>${evSoon(r.symbol).length?`<span class="evb" title="${esc(evSoon(r.symbol).map(e=>e.kind+" "+evWhen(e)).join(", "))}" aria-label="Event soon">⚠</span>`:""}${r.conf&&r.conf.g?`<span class="gd g${r.conf.g}" title="Grade ${r.conf.g}, score ${r.conf.s} of 100">${r.conf.g}</span> `:""}${sg?`<span class="sg">${sg}</span> `:""}<span class="pc ${c==null?"":c>=0?"up":"dn"}">${c==null?"":(c>0?"+":"")+c.toFixed(2)+"%"}</span></span></button>`}).join("")||'<div class="sub">No symbol matches.</div>';$("cwList").scrollTop=keepTop}
 function cwMark(){document.querySelectorAll("#cwList button").forEach(b=>{const on=b.dataset.s===cw.sym;b.setAttribute("aria-selected",on);if(on)b.scrollIntoView({block:"nearest"})})}
 function cwShow(){cwDirs();if(!cw.ready){cw.ready=true;
   $("cwQ").oninput=()=>cwBuild();$("cwSec").onchange=()=>cwBuild();$("cwSortBar").onclick=e=>{const b=e.target.closest("button");if(!b)return;if(cw.sk===b.dataset.k)cw.sd=-(cw.sd||1);else{cw.sk=b.dataset.k;cw.sd=1}cwBuild()};$("cwShow").onchange=()=>cwBuild();
-  $("cwList").onclick=e=>{const b=e.target.closest("button[data-s]");if(b)cwPick(b.dataset.s)};
+  $("cwList").onclick=e=>{const st=e.target.closest(".st[data-star]");if(st){e.stopPropagation();cwWlToggle(st.dataset.star);return}const b=e.target.closest("button[data-s]");if(b)cwPick(b.dataset.s)};$("cwStar").onclick=()=>cwWlToggle(cw.sym);cwWlLoad();cwEvLoad();setInterval(cwEvLoad,1800000);
   $("cwTr").onclick=e=>{const b=e.target.closest("button[data-sd]");if(!b||b.disabled||!cw.sym||!cw.bar)return;const side=b.dataset.sd,sym=cw.sym,px=cw.bar.close;
    if(cw.inst==="opt"){if(cw.strike==null||!cw.exp)return;openTicket({kind:"option",symbol:sym,expiry:cw.exp,strike:cw.strike,right:cw.side,side,price:px,label:`${sym} ${cw.strike} ${cw.side} ${cw.exp}`})}
    else if(cw.inst==="fut")openTicket({kind:"future",symbol:sym,label:sym+" futures, nearest month",side,price:px,tf:cw.tf});
@@ -9101,7 +9253,7 @@ document.addEventListener("click",e=>{const b=e.target.closest("[data-rc]");if(!
 async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!silent)cwPaintCtl();
  if(!silent){const k=sym+"|"+cw.tf,same=(cw.optKey||"").split("|")[0]===sym;if(cw.optKey!==k){cw.optKey=k;osym=sym;if(!same)oexp="";loadChain(same)}
   if(cwRecSym!==sym){cwRecSym=sym;cwRecLoad(sym)}}
- if(!silent){$("cwTitle").textContent=sym+(cw.inst==="fut"?" futures (nearest month)":"");$("cwMsg").textContent="Loading chart…";$("cwLeg").innerHTML=""}
+ if(!silent){$("cwTitle").textContent=sym+(cw.inst==="fut"?" futures (nearest month)":"");cwStarPaint();cwEvPaint();$("cwMsg").textContent="Loading chart…";$("cwLeg").innerHTML=""}
  try{await loadLW()}catch(e){if(!silent)$("cwMsg").textContent="The chart library did not load. Reload the page and try again.";return}
  let candles,lines=null,legend=[],markers=[],levels=null,intraday=true,und=null,undLines=null,undErr="",undMarks=[];
  const mkOf=(a,sh)=>(a||[]).slice().sort((x,y)=>x[0]<y[0]?-1:x[0]>y[0]?1:0).map(([t,sd])=>sd==="BUY"?{time:sh?t+sh:t,position:"belowBar",color:"#0a7d5a",shape:"arrowUp",text:"BUY"}:{time:sh?t+sh:t,position:"aboveBar",color:"#c0392b",shape:"arrowDown",text:"SELL"});
@@ -9685,6 +9837,7 @@ function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
  $("tkType").innerHTML=opt?'<option value="LIMIT">Limit</option><option value="MARKET">Market</option>':'<option value="MARKET">Market</option><option value="LIMIT">Limit</option>';
  $("tkPrice").value=s.price??"";$("tkPrice").disabled=$("tkType").value!=="LIMIT";
  $("tkProd").innerHTML=opt||fut?'<option value="INTRADAY">Intraday</option><option value="CARRYFORWARD">Carry forward</option>':'<option value="INTRADAY">Intraday</option><option value="DELIVERY">Delivery</option>';
+ {const es=evSoon(s.symbol),b=$("tkEv");b.hidden=!es.length;b.className="tkmsg cwev"+(es.length?" soon":"");b.textContent=es.length?"⚠ "+s.symbol+": "+es.map(e=>e.kind+" "+evWhen(e)).join(", ")+". Prices can jump around this."  :""}
  $("tkMode").textContent=tradeInfo.mode==="live"?"LIVE: this sends a real order to your broker.":"Paper mode: this order is only simulated.";
  const bl=tradeInfo.brokers||[];$("tkBroker").innerHTML=bl.map(x=>`<option value="${x}">${tradeInfo.broker_names[x]}</option>`).join("");
  $("tkBrokerL").hidden=bl.length<2;if(tradeInfo.default_broker&&bl.length)$("tkBroker").value=tradeInfo.default_broker;
