@@ -1864,7 +1864,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16q"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-16r"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2453,13 +2453,20 @@ class DhanAccount:
             by.setdefault(seg, []).append(int(sid))
         if not by:
             return {}
-        res = self.request("POST", "/marketfeed/ltp", by, extra={"client-id": str(self.c["client_id"])})
+        flat = [(seg, sid) for seg, ids in by.items() for sid in ids]
         out = {}
-        for seg, d in ((res or {}).get("data") or {}).items():
-            for sid, v in (d or {}).items():
-                price = _num((v or {}).get("last_price"))
-                if price:
-                    out[(seg, str(sid))] = price
+        for k in range(0, len(flat), 900):   # Dhan accepts up to 1000 instruments per call, about one call a second
+            part = {}
+            for seg, sid in flat[k:k + 900]:
+                part.setdefault(seg, []).append(sid)
+            res = self.request("POST", "/marketfeed/ltp", part, extra={"client-id": str(self.c["client_id"])})
+            for seg, d in ((res or {}).get("data") or {}).items():
+                for sid, v in (d or {}).items():
+                    price = _num((v or {}).get("last_price"))
+                    if price:
+                        out[(seg, str(sid))] = price
+            if k + 900 < len(flat):
+                time.sleep(1.1)
         return out
 
     def funds(self):
@@ -5529,7 +5536,8 @@ def api_signals(tf: str = DEFAULT_INTERVAL):
     snap["rows"] = add_conf(snap["rows"], tf)
     return JSONResponse({
         **snap,
-        "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"]},
+        "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"],
+                 "market": market_window(), "ws": DHAN_STAT.get("ws") if DATA_BROKER == "dhan" else None, "ws_error": DHAN_STAT.get("error") if DATA_BROKER == "dhan" else None},
         "interval": tf,
         "live": {"on": bool(live_active() and tf in LIVE_TFS), "at": LIVEC.get(tf, {}).get("at"), "source": data_source() if DATA_BROKER == "dhan" else "yahoo",
                  "stream": dhan_ws_healthy() if DATA_BROKER == "dhan" else False},
@@ -5561,7 +5569,8 @@ def api_ticks(tf: str = DEFAULT_INTERVAL):
     with LOCK:
         rows = list(STATES[tf]["rows"]) + (list(CASH_STATES[tf]["rows"]) if tf in CASH_STATES else [])
     out = {r["symbol"]: [r["ltp"], r.get("ltp_chg")] for r in apply_live(rows) if r.get("ltp")}
-    return {"p": out, "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "source": FEED["source"]}
+    return {"p": out, "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "source": FEED["source"], "market": market_window(), "error": FEED["error"],
+            "ws": DHAN_STAT.get("ws") if DATA_BROKER == "dhan" else None, "ws_error": DHAN_STAT.get("error") if DATA_BROKER == "dhan" else None, "n": len(out)}
 
 
 # ── Market mood strip: advances and declines, India VIX, strongest and weakest sector ──
@@ -8398,7 +8407,8 @@ def api_admin_overview(request: Request):
             "live_enabled": sum(1 for r in users if r["live_allowed"]), "orders": orders,
             "live_server": LIVE_REQUESTED, "signup": ALLOW_SIGNUP, "invite": bool(SIGNUP_CODE),
             "storage": "postgres" if USE_PG else DB_PATH, "signals": sig,
-            "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"]},
+            "feed": {"source": FEED["source"], "age": None if not FEED["t"] else int(time.time() - FEED["t"]), "count": FEED["count"], "error": FEED["error"],
+                 "market": market_window(), "ws": DHAN_STAT.get("ws") if DATA_BROKER == "dhan" else None, "ws_error": DHAN_STAT.get("error") if DATA_BROKER == "dhan" else None},
             "auto": {"last_age": None if not AUTO["last"] else int(time.time() - AUTO["last"]), "error": AUTO["error"]}}
 
 
@@ -8858,6 +8868,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .chbox{padding:14px 16px}.chhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}.chhead b{font-size:18px}
 .chtfs{display:flex;gap:4px;margin-left:auto}.chtfs button{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:4px 12px;cursor:pointer;font:inherit}
 .chtfs button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
+.fdb{font-weight:600}.fdb.on{color:var(--buy)}.fdb.off{color:#f59e0b}
 .chnav{display:inline-flex;align-items:center;gap:6px}.chnav .btn{padding:4px 10px}
 .chleg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--mute);margin-bottom:6px}.chleg i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
 #chart{height:min(62vh,560px);width:100%}
@@ -9317,12 +9328,12 @@ function paintTfs(){document.getElementById("tfs").innerHTML=tfAllowed().map(x=>
 function ensureTf(){if(!tfAllowed().includes(tf)){tf=mode==="stocks"?"1d":"15m";try{localStorage.setItem("tf",tf)}catch(x){}data=null;optOverride="";if(mode==="stocks")document.getElementById("body").innerHTML=`<tr><td colspan="14" class="empty">Scanning ${tfName[tf]} candles…</td></tr>`;load()}paintTfs()}
 let tickT=null,tickBusy=false;
 async function tick(){clearTimeout(tickT);
- try{if(mode==="stocks"&&data&&data.feed&&data.feed.source&&!document.hidden&&!tickBusy){tickBusy=true;const asked=tf;const d=await (await api("/api/ticks?tf="+asked)).json();tickBusy=false;
+ try{if(mode==="stocks"&&data&&data.feed&&data.feed.source&&!document.hidden&&!tickBusy){tickBusy=true;const asked=tf;const d=await (await api("/api/ticks?tf="+asked)).json();tickBusy=false;feedInfo={...(feedInfo||{}),source:d.source||(feedInfo&&feedInfo.source),age:d.age,market:d.market,error:d.error,ws_error:d.ws_error,n:d.n};{const el=document.querySelector("#meta .fdb");if(el){const t=document.createElement("span");t.innerHTML=feedBadge().replace(/^ · /,"");el.replaceWith(t.firstChild)}}
   if(asked===tf&&data&&d.p&&d.age!=null&&d.age<30){let ch=false;for(const r of data.rows.concat(cash&&cash.interval===tf?cash.rows:[])){const x=d.p[r.symbol];if(x&&(r.ltp!==x[0]||r.ltp_chg!==x[1])){r.ltp=x[0];if(x[1]!=null)r.ltp_chg=x[1];ch=true}}if(ch)render()}}}
  catch(e){tickBusy=false}
  tickT=setTimeout(tick,2000)}
 async function load(){clearTimeout(timer);const asked=tf;
- try{const d=await (await api("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;tf=d.interval;detectNew(d);render();if(!cashT||cash.interval!==tf)loadCash();
+ try{const d=await (await api("/api/signals"+(asked?"?tf="+asked:""))).json();if(asked!==tf)return;data=d;feedInfo=d.feed||feedInfo;tf=d.interval;detectNew(d);render();if(!cashT||cash.interval!==tf)loadCash();
   timer=setTimeout(load,(d.refreshing||!d.updated)?3000:20000);if(!tickT)tick()}
  catch(e){document.getElementById("meta").textContent="Cannot reach the server.";timer=setTimeout(load,10000)}}
 async function loadFutInfo(){if(futLoaded)return;futLoaded=true;
@@ -9375,7 +9386,7 @@ function render(){
  const t=document.getElementById("tally");
  t.innerHTML=tabs.map(x=>`<button class="${x[3]}" data-f="${x[0]}" aria-pressed="${filter===x[0]}"><b>${x[2]}</b><span>${x[1]}</span></button>`).join("");
  t.onclick=e=>{const b=e.target.closest("button");if(b){filter=b.dataset.f;render()}};
- document.getElementById("meta").innerHTML=`<span class="ai">✦ AI-Powered Trade Scanner</span> · `+(data.live&&data.live.on?`<b title="Candles are completed from the live feed the moment they close">Live candles${data.live.at?" "+esc(data.live.at):""}</b> · `:(data.updated?`Updated ${esc(data.updated)} · `:""))+`${tfName[data.interval]} candles`+(data.live?` · <span title="Where candles and prices come from">${data.live.source==="dhan"?(data.live.stream?"Dhan live stream":"Dhan"):"Yahoo"}</span>`:"")+(data.refreshing?(data.progress?` · scanning ${data.progress[0]} of ${data.progress[1]}…`:" · scanning…"):"");
+ document.getElementById("meta").innerHTML=`<span class="ai">✦ AI-Powered Trade Scanner</span> · `+(data.live&&data.live.on?`<b title="Candles are completed from the live feed the moment they close">Live candles${data.live.at?" "+esc(data.live.at):""}</b> · `:(data.updated?`Updated ${esc(data.updated)} · `:""))+`${tfName[data.interval]} candles`+(data.live?` · <span title="Where candles and prices come from">${data.live.source==="dhan"?(data.live.stream?"Dhan live stream":"Dhan"):"Yahoo"}</span>`:"")+feedBadge()+(data.refreshing?(data.progress?` · scanning ${data.progress[0]} of ${data.progress[1]}…`:" · scanning…"):"");
  let v=rows.filter(r=>(filter==="ALL"||(filter==="OPEN"?isOpen(r):r.signal===filter))&&(!q||r.symbol.includes(q))&&(!$("confOnly").checked||(r.conf&&r.conf.g==="A"))&&(sector==="ALL"||(r.sector||"Others")===sector));
  v.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(sortKey==="signal"){x=rank[x];y=rank[y];if(x===y){x=a.bars_ago??999;y=b.bars_ago??999}}
   if(x==null)x=1e9;if(y==null)y=1e9;return (x>y?1:x<y?-1:0)*sortDir});
@@ -9879,6 +9890,12 @@ function initScanner(){
   else{cw.sym=sy;cw.tf=scTf;cw.inst="opt";cw.exp="";cw.strike=null;cwSave();setMode("charts")}}}
 // ── chart popup (TradingView's open-source Lightweight Charts) ──
 let lwPromise=null,chSym="",chTf="",chAt=0,chObj=null;
+let feedInfo=null;
+function feedBadge(){const f=feedInfo;if(!f||!f.source)return ' · <span class="fdb off" title="No live price source is configured, so prices are the last candle close">○ Prices not live (no live feed set up)</span>';
+ if(f.market===false)return ' · <span class="fdb" title="The market is closed">Market closed · last prices</span>';
+ if(f.age!=null&&f.age<30)return ` · <span class="fdb on" title="${f.n!=null?f.n+' prices in the last update. ':''}Prices come from the live broker feed">● Live prices · ${f.age}s ago</span>`;
+ const why=f.ws_error||f.error||(f.age==null?"no price has arrived since the server started":"the last price was "+f.age+"s ago");
+ return ` · <span class="fdb off" title="Prices shown are the last candle close until the feed returns. Check Admin, Data source.">○ Prices NOT live: ${esc(String(why).slice(0,110))}</span>`}
 let chList=[],swView=[],cashSet=new Set();const chMem=new Map();
 function chFetch(sym,t,at){const k=sym+"|"+t+"|"+(at||0),h=chMem.get(k);if(h&&Date.now()-h.at<90000)return h.p;
  const p=api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${t}${at?'&at='+at:''}`).then(r=>r.json());chMem.set(k,{at:Date.now(),p});p.catch(()=>chMem.delete(k));
