@@ -1864,7 +1864,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-16t"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-17a"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5636,13 +5636,35 @@ def mood_summary(rows, vix=None, vix_chg=None):
             "vix": vix, "vix_chg": vix_chg}
 
 
+MOOD_INDICES = ("NIFTY", "SENSEX", "BANKNIFTY")
+
+
+def index_summary(rows, lean=None):
+    """The headline indices with price and day change, and a one-word market sentiment: Bullish when at least two are up and none is down (by `lean` %), Bearish the other way, Mixed otherwise."""
+    lean = AUTO_SENT_MIN if lean is None else lean
+    by = {r["symbol"]: r for r in rows if r.get("symbol") in MOOD_INDICES}
+    out, score = [], 0
+    for name in MOOD_INDICES:
+        r = by.get(name)
+        if not r:
+            continue
+        chg = r.get("ltp_chg") if r.get("ltp_chg") is not None else r.get("chg")
+        price = r.get("ltp") if r.get("ltp") else r.get("close")
+        out.append({"symbol": name, "price": price, "chg": None if chg is None else round(float(chg), 2), "live": bool(r.get("ltp"))})
+        if chg is not None:
+            score += 1 if chg >= lean else -1 if chg <= -lean else 0
+    sentiment = None if not out else "Bullish" if score >= 2 else "Bearish" if score <= -2 else "Mixed"
+    return {"items": out, "sentiment": sentiment}
+
+
 @app.get("/api/mood")
 def api_mood():
     ensure_vix()
     with LOCK:
         pick = max(BASE_TFS, key=lambda t: (len(STATES[t]["rows"]), str(STATES[t]["updated"])))
         rows = list(STATES[pick]["rows"])
-    return mood_summary(apply_live(rows), VIX["v"], VIX["chg"])
+    live = apply_live(rows)
+    return {**mood_summary(live, VIX["v"], VIX["chg"]), "idx": index_summary(live)}
 
 
 @app.get("/api/dirs")
@@ -8759,6 +8781,9 @@ main{max-width:1180px;margin:0 auto;padding:28px 20px 60px}
 #mood{display:flex;flex-wrap:wrap;align-items:center;gap:6px 18px;margin:-8px 0 14px;padding:8px 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);font-size:13px}
 #mood .mi{display:flex;align-items:baseline;gap:6px;white-space:nowrap}#mood .l{color:var(--mute)}#mood b{font-weight:600}
 #mood .bar{display:inline-flex;width:90px;height:8px;border-radius:4px;overflow:hidden;background:var(--line);align-self:center}#mood .bar i{display:block;height:100%}#mood .bar .a{background:var(--buy)}#mood .bar .d{background:var(--sell)}
+#mood .ixg{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;flex:1 1 100%;padding-bottom:6px;border-bottom:1px solid var(--line)}
+#mood .ix{display:inline-flex;align-items:baseline;gap:8px;padding:4px 12px;border-radius:10px;background:var(--flat);white-space:nowrap}#mood .ix b{font-weight:700}#mood .ix .px{font-variant-numeric:tabular-nums;font-size:15px;font-weight:600;color:var(--ink)}#mood .ix .pc{font-weight:700}
+#mood .ix.up{box-shadow:inset 3px 0 0 var(--buy)}#mood .ix.dn{box-shadow:inset 3px 0 0 var(--sell)}
 #mood .pill2{padding:1px 9px;border-radius:999px;font-weight:600;border:1px solid currentColor}
 header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:20px}
 h1{margin:0;font-size:26px;font-weight:700;letter-spacing:-.01em}
@@ -9410,17 +9435,19 @@ const chainMem={};
 function chainFetch(sym,exp,tfv){const u=`/api/options/chain?symbol=${encodeURIComponent(sym)}&tf=${tfv}`+(exp?`&expiry=${encodeURIComponent(exp)}`:"");const h=chainMem[u];
  if(h&&Date.now()-h.at<15000)return h.p;const p=api(u).then(r=>r.json());chainMem[u]={at:Date.now(),p};p.catch(()=>{delete chainMem[u]});return p}
 try{mode=localStorage.getItem("mode")||"stocks"}catch(e){}
-function moodPaint(d){const b=$("mood");if(!b)return;if(!d||!d.n){b.hidden=true;return}
+function moodPaint(d){const b=$("mood");if(!b)return;const ix=d&&d.idx&&d.idx.items&&d.idx.items.length;if(!d||(!d.n&&!ix)){b.hidden=true;return}
  const sg=n=>(n>0?"+":"")+n.toFixed(2)+"%",cl=n=>n>=0?"up":"dn",tot=d.adv+d.dec||1,pa=d.adv/tot*100;
  const mc=d.mood==="Bullish"?"up":d.mood==="Bearish"?"dn":"";
- b.hidden=false;
- b.innerHTML=`<span class="mi" title="Stocks up versus down today, out of ${d.n} tracked"><span class="l">Advances / declines</span><b class="up">${d.adv}</b><span class="bar" aria-hidden="true"><i class="a" style="width:${pa}%"></i><i class="d" style="width:${100-pa}%"></i></span><b class="dn">${d.dec}</b>${d.flat?`<span class="l">(${d.flat} flat)</span>`:""}</span>`
+b.hidden=false;
+ const nf=n=>n==null?"–":Number(n).toLocaleString("en-IN",{maximumFractionDigits:2,minimumFractionDigits:2}),sm=d.idx&&d.idx.sentiment,sc=sm==="Bullish"?"up":sm==="Bearish"?"dn":"";
+ const ixh=ix?`<span class="ixg" aria-label="Headline indices">`+d.idx.items.map(i=>`<span class="ix ${i.chg==null?"":i.chg>=0?"up":"dn"}" title="${esc(i.symbol)} ${i.live?"live":"last close"}"><b>${esc(i.symbol)}</b><span class="px">${nf(i.price)}</span><span class="pc">${i.chg==null?"":(i.chg>=0?"▲ ":"▼ ")+(i.chg>0?"+":"")+i.chg.toFixed(2)+"%"}</span></span>`).join("")+(sm?`<span class="mi" title="Based on NIFTY, SENSEX and BANKNIFTY: at least two up and none down is Bullish, the reverse is Bearish"><span class="l">Sentiment</span><span class="pill2 ${sc}">${sm}</span></span>`:"")+`</span>`:"";
+ b.innerHTML=ixh+(d.n?`<span class="mi" title="Stocks up versus down today, out of ${d.n} tracked"><span class="l">Advances / declines</span><b class="up">${d.adv}</b><span class="bar" aria-hidden="true"><i class="a" style="width:${pa}%"></i><i class="d" style="width:${100-pa}%"></i></span><b class="dn">${d.dec}</b>${d.flat?`<span class="l">(${d.flat} flat)</span>`:""}</span>`:"")
   +(d.mood?`<span class="mi"><span class="l">Breadth</span><span class="pill2 ${mc}">${d.mood}</span></span>`:"")
   +(d.vix!=null?`<span class="mi" title="India VIX: how much movement the options market expects. Rising means more fear, so expect bigger swings."><span class="l">India VIX</span><b>${d.vix.toFixed(2)}</b>${d.vix_chg!=null?`<span class="${d.vix_chg>0?"dn":"up"}">${sg(d.vix_chg)}</span>`:""}</span>`:"")
   +(d.best?`<span class="mi" title="Average move of the stocks in the sector today"><span class="l">Strongest</span><b>${esc(d.best.name)}</b><span class="${cl(d.best.chg)}">${sg(d.best.chg)}</span></span>`:"")
   +(d.worst&&d.worst.name!==(d.best&&d.best.name)?`<span class="mi"><span class="l">Weakest</span><b>${esc(d.worst.name)}</b><span class="${cl(d.worst.chg)}">${sg(d.worst.chg)}</span></span>`:"")}
 async function moodLoad(){try{if(document.hidden)return;moodPaint(await (await api("/api/mood")).json())}catch(e){}}
-setTimeout(moodLoad,1500);setInterval(moodLoad,30000);
+setTimeout(moodLoad,1500);setInterval(moodLoad,5000);
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const fk=n=>{if(n==null)return "–";const a=Math.abs(n),g=n<0?"-":"";return g+(a>=1e7?(a/1e7).toFixed(2)+" Cr":a>=1e5?(a/1e5).toFixed(2)+" L":a>=1e3?(a/1e3).toFixed(1)+" K":String(Math.round(a)))};
 const f2=n=>n==null?"–":n.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
