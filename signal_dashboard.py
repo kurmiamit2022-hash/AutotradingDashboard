@@ -1864,7 +1864,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-17a"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-17c"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5640,20 +5640,29 @@ MOOD_INDICES = ("NIFTY", "SENSEX", "BANKNIFTY")
 
 
 def index_summary(rows, lean=None):
-    """The headline indices with price and day change, and a one-word market sentiment: Bullish when at least two are up and none is down (by `lean` %), Bearish the other way, Mixed otherwise."""
+    """The headline indices with price and day change, and a one-word market sentiment: Bullish when at least two are up and none is down (by `lean` %), Bearish the other way, Mixed otherwise.
+    The live feed is read directly, so it works even before the scan has produced rows; the scan rows are the fallback."""
     lean = AUTO_SENT_MIN if lean is None else lean
     by = {r["symbol"]: r for r in rows if r.get("symbol") in MOOD_INDICES}
-    out, score = [], 0
+    out, score, have = [], 0, 0
+    today = ist_now().strftime("%Y-%m-%d")
     for name in MOOD_INDICES:
-        r = by.get(name)
-        if not r:
-            continue
-        chg = r.get("ltp_chg") if r.get("ltp_chg") is not None else r.get("chg")
-        price = r.get("ltp") if r.get("ltp") else r.get("close")
-        out.append({"symbol": name, "price": price, "chg": None if chg is None else round(float(chg), 2), "live": bool(r.get("ltp"))})
+        r = by.get(name) or {}
+        live = fresh_ltp(name)
+        price, chg = (round(live, 2) if live else (r.get("ltp") or r.get("close"))), None
+        if live:
+            ex = PREV_CLOSE.get(name)
+            pc = ex["p"] if ex and ex["d"] == today else r.get("prev_close")
+            if pc:
+                chg = round((live / pc - 1) * 100, 2)
+        if chg is None:
+            chg = r.get("ltp_chg") if r.get("ltp_chg") is not None else r.get("chg")
+        out.append({"symbol": name, "price": price, "chg": None if chg is None else round(float(chg), 2), "live": bool(live)})
+        if price:
+            have += 1
         if chg is not None:
             score += 1 if chg >= lean else -1 if chg <= -lean else 0
-    sentiment = None if not out else "Bullish" if score >= 2 else "Bearish" if score <= -2 else "Mixed"
+    sentiment = None if not have else "Bullish" if score >= 2 else "Bearish" if score <= -2 else "Mixed"
     return {"items": out, "sentiment": sentiment}
 
 
@@ -5664,7 +5673,12 @@ def api_mood():
         pick = max(BASE_TFS, key=lambda t: (len(STATES[t]["rows"]), str(STATES[t]["updated"])))
         rows = list(STATES[pick]["rows"])
     live = apply_live(rows)
-    return {**mood_summary(live, VIX["v"], VIX["chg"]), "idx": index_summary(live)}
+    try:
+        out = mood_summary(live, VIX["v"], VIX["chg"])
+    except Exception as e:   # the index cards must still show if the breadth sums fail
+        print("mood summary failed:", type(e).__name__, e, flush=True)
+        out = {"adv": 0, "dec": 0, "flat": 0, "n": 0, "mood": None, "best": None, "worst": None, "vix": VIX["v"], "vix_chg": VIX["chg"]}
+    return {**out, "idx": index_summary(live)}
 
 
 @app.get("/api/dirs")
@@ -9440,7 +9454,7 @@ function moodPaint(d){const b=$("mood");if(!b)return;const ix=d&&d.idx&&d.idx.it
  const mc=d.mood==="Bullish"?"up":d.mood==="Bearish"?"dn":"";
 b.hidden=false;
  const nf=n=>n==null?"–":Number(n).toLocaleString("en-IN",{maximumFractionDigits:2,minimumFractionDigits:2}),sm=d.idx&&d.idx.sentiment,sc=sm==="Bullish"?"up":sm==="Bearish"?"dn":"";
- const ixh=ix?`<span class="ixg" aria-label="Headline indices">`+d.idx.items.map(i=>`<span class="ix ${i.chg==null?"":i.chg>=0?"up":"dn"}" title="${esc(i.symbol)} ${i.live?"live":"last close"}"><b>${esc(i.symbol)}</b><span class="px">${nf(i.price)}</span><span class="pc">${i.chg==null?"":(i.chg>=0?"▲ ":"▼ ")+(i.chg>0?"+":"")+i.chg.toFixed(2)+"%"}</span></span>`).join("")+(sm?`<span class="mi" title="Based on NIFTY, SENSEX and BANKNIFTY: at least two up and none down is Bullish, the reverse is Bearish"><span class="l">Sentiment</span><span class="pill2 ${sc}">${sm}</span></span>`:"")+`</span>`:"";
+ const ixh=ix?`<span class="ixg" aria-label="Headline indices">`+d.idx.items.map(i=>`<span class="ix ${i.chg==null?"":i.chg>=0?"up":"dn"}" title="${esc(i.symbol)}: ${i.price?(i.live?"live price":"last close, no live price right now"):"no price yet: waiting for the first scan or the live feed"}"><b>${esc(i.symbol)}</b><span class="px">${i.price?nf(i.price):"–"}</span><span class="pc">${i.chg==null?"":(i.chg>=0?"▲ ":"▼ ")+(i.chg>0?"+":"")+i.chg.toFixed(2)+"%"}</span></span>`).join("")+(sm?`<span class="mi" title="Based on NIFTY, SENSEX and BANKNIFTY: at least two up and none down is Bullish, the reverse is Bearish"><span class="l">Sentiment</span><span class="pill2 ${sc}">${sm}</span></span>`:"")+`</span>`:"";
  b.innerHTML=ixh+(d.n?`<span class="mi" title="Stocks up versus down today, out of ${d.n} tracked"><span class="l">Advances / declines</span><b class="up">${d.adv}</b><span class="bar" aria-hidden="true"><i class="a" style="width:${pa}%"></i><i class="d" style="width:${100-pa}%"></i></span><b class="dn">${d.dec}</b>${d.flat?`<span class="l">(${d.flat} flat)</span>`:""}</span>`:"")
   +(d.mood?`<span class="mi"><span class="l">Breadth</span><span class="pill2 ${mc}">${d.mood}</span></span>`:"")
   +(d.vix!=null?`<span class="mi" title="India VIX: how much movement the options market expects. Rising means more fear, so expect bigger swings."><span class="l">India VIX</span><b>${d.vix.toFixed(2)}</b>${d.vix_chg!=null?`<span class="${d.vix_chg>0?"dn":"up"}">${sg(d.vix_chg)}</span>`:""}</span>`:"")
@@ -9592,26 +9606,29 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
    legend.push(`<b>${esc(sym)}</b> <span>${last.toFixed(2)}${c!=null?` (${c>0?"+":""}${c.toFixed(2)}% today)`:""}${row.sector?" · "+esc(row.sector):""}</span>`);
    if(d.signal){levels=d.signal;legend.push(`<b class="${d.signal.side==="BUY"?"up":"dn"}">${esc(d.signal.state)}</b> <span>signal candle ${esc(d.signal.time)}, ${esc(d.signal.status)}</span>`)}else legend.push("<span>No signal on this timeframe.</span>")}
  }catch(e){if(my===cw.my&&!silent)$("cwMsg").textContent="The server did not return chart data. Try again in a moment.";return}
+ let TL=null;   // one shared timeline: an option misses the minutes it did not trade, so each chart gets empty slots for the other's candles and both line up bar for bar
+ if(und&&und.length&&cw.inst!=="stock"){const st=new Set();candles.forEach(c=>st.add(c.time));und.forEach(c=>st.add(c.time));TL=[...st].sort((a,b)=>a<b?-1:a>b?1:0)}
+ const NB=TL?TL.length:candles.length,padTo=arr=>{if(!TL||TL.length===arr.length)return arr;const m=new Map(arr.map(c=>[c.time,c]));return TL.map(t=>m.get(t)||{time:t})};
  const ckey=[sym,cw.tf,cw.inst,cw.side,cw.strike,cw.exp].join("|"),keep=silent&&cw.obj&&cw.ckey===ckey?{r:cw.obj.timeScale().getVisibleLogicalRange(),n:cw.n}:null;   // a refresh keeps the zoom and the scroll position
- $("cwMsg").textContent="";cwClear();cw.ckey=ckey;cw.n=candles.length;
+ $("cwMsg").textContent="";cwClear();cw.ckey=ckey;cw.n=NB;
  const css=getComputedStyle(document.documentElement),col=(n,f)=>css.getPropertyValue(n).trim()||f;
  const ink=col("--ink","#222"),line=col("--line","#ddd"),up=col("--buy","#0a7d5a"),dn=col("--sell","#c0392b");
  const ch=LightweightCharts.createChart($("cwChart"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{rightOffset:7,borderColor:line,timeVisible:intraday,secondsVisible:false},crosshair:{mode:0}});
  cw.obj=ch;
  if(lines){const sp=ch.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp.setData(lines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
   if(lines.ema&&lines.ema.length){const ep=ch.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ep.setData(lines.ema.map(([t,v])=>({time:t,value:v})))}}
- const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(candles);cw.cs=cs;cw.k2=null;cw.bar=Object.assign({},candles[candles.length-1]);cw.bar2=null;if(markers.length)cs.setMarkers(markers);
+ const cs=ch.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});cs.setData(padTo(candles));cw.cs=cs;cw.k2=null;cw.bar=Object.assign({},candles[candles.length-1]);cw.bar2=null;if(markers.length)cs.setMarkers(markers);
  if(levels){const lastT=candles[candles.length-1].time,lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title,autoscaleInfoProvider:()=>null});s.setData([{time:levels.from,value:price},{time:lastT,value:price}])};
   lv(levels.entry,ink,"Entry",0);lv(levels.sl,dn,"SL"+(levels.sl_hit?" ✖":""),0);levels.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(levels.hits>i?" ✓":""),2))}
- $("cwLeg").innerHTML=legend.join("")+'<span class="cwlive" id="cwLive"></span>';ch.timeScale().setVisibleLogicalRange({from:Math.max(-1,candles.length-120),to:candles.length+7})   /* the latest candles sit clear of the price scale */
- if(keep&&keep.r){const d=candles.length-keep.n;try{ch.timeScale().setVisibleLogicalRange({from:keep.r.from+d,to:keep.r.to+d})}catch(e){}}
+ $("cwLeg").innerHTML=legend.join("")+'<span class="cwlive" id="cwLive"></span>';ch.timeScale().setVisibleLogicalRange({from:Math.max(-1,NB-120),to:NB+7})   /* the latest candles sit clear of the price scale */
+ if(keep&&keep.r){const d=NB-keep.n;try{ch.timeScale().setVisibleLogicalRange({from:keep.r.from+d,to:keep.r.to+d})}catch(e){}}
  $("cwBaseW").hidden=cw.inst==="stock";document.querySelector(".cwm").classList.toggle("cwopt",cw.inst!=="stock");
  if(cw.inst!=="stock"){$("cwBaseT").innerHTML=und&&und.length?`<b>${esc(sym)}</b> stock chart, same candles${cw.inst==="opt"?" and days as the option":" as the futures"} above`:esc(undErr||"The stock chart is not available for this symbol right now.");
   if(und&&und.length){const c2=LightweightCharts.createChart($("cwChart2"),{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},timeScale:{rightOffset:7,borderColor:line,timeVisible:true,secondsVisible:false},crosshair:{mode:0}});cw.obj2=c2;
    if(undLines){const sp2=c2.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});sp2.setData(undLines.stop.map(([t,v,dr])=>({time:t,value:v,color:dr===1?up:dn})));
     if(undLines.ema&&undLines.ema.length){const e2=c2.addLineSeries({color:ink,lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});e2.setData(undLines.ema.map(([t,v])=>({time:t,value:v})))}}
-   const k2=c2.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});k2.setData(und);cw.k2=k2;cw.bar2=Object.assign({},und[und.length-1]);if(undMarks.length)k2.setMarkers(undMarks);
-   let lock=false;const same=und.length===candles.length;   // the same candles: follow each other by position, which keeps the empty space at the right edge; otherwise by time
+   const k2=c2.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});k2.setData(padTo(und));cw.k2=k2;cw.bar2=Object.assign({},und[und.length-1]);if(undMarks.length)k2.setMarkers(undMarks);
+   let lock=false;const same=!!TL||und.length===candles.length;   // the same candles: follow each other by position, which keeps the empty space at the right edge; otherwise by time
    const link=(a,b)=>same?a.timeScale().subscribeVisibleLogicalRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleLogicalRange(r)}catch(e){}lock=false}):a.timeScale().subscribeVisibleTimeRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleRange(r)}catch(e){}lock=false});link(ch,c2);link(c2,ch);
    try{if(same){const r=ch.timeScale().getVisibleLogicalRange();if(r)c2.timeScale().setVisibleLogicalRange(r)}else{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}}catch(e){}}}}
 const cw_REFRESH_MS=20000;
