@@ -381,7 +381,60 @@ INTRA_CHG = {}   # symbol -> today's change from the latest 5 or 15 minute candl
 INTERNAL = {}   # (symbol, timeframe) -> values the options autopilot needs; never sent to the browser
 
 
+# ── BTST (buy today, sell tomorrow) ──
+BTST_POS = float(os.getenv("BTST_POS", "0.8"))          # the close sits in the top 20% of the day's range
+BTST_CHG_MIN = float(os.getenv("BTST_CHG_MIN", "1.0"))  # day change, in per cent
+BTST_CHG_MAX = float(os.getenv("BTST_CHG_MAX", "6.0"))  # not chasing a stock that already ran further
+BTST_VOL = float(os.getenv("BTST_VOL", "1.5"))          # volume against its 20 day average
+BTST_COST = float(os.getenv("BTST_COST", "0.25"))       # round trip charges in per cent, taken off every backtest trade
+BTST_TR = {}                                            # symbol -> past trades from the daily history
+
+
+def btst_pack(df):
+    """From a stock's daily candles: the figures the live scan compares today with, and every past day that met the rule with what the next day did.
+    Today's candle is left out (it is not finished), so every figure here is from completed days."""
+    d = df.dropna(subset=["Close", "High", "Low"]).copy()
+    if d.empty or "Volume" not in d:
+        return None, []
+    d.index = d.index.tz_localize("UTC").tz_convert(IST) if d.index.tz is None else d.index.tz_convert(IST)
+    today = ist_now().date()
+    d = d[[t.date() < today for t in d.index]]
+    n = len(d)
+    if n < 45:
+        return None, []
+    O, H, L, C, V = (d[k].to_numpy(float) for k in ("Open", "High", "Low", "Close", "Volume"))
+    stats = {"avg_vol": float(np.nanmean(V[-20:])), "hi20": float(np.nanmax(H[-20:])), "last": d.index[-1].strftime("%Y-%m-%d")}
+    trades = []
+    for i in range(21, n - 1):
+        rng = H[i] - L[i]
+        if not (rng > 0 and C[i - 1] > 0 and C[i] > 0):
+            continue
+        va = float(np.nanmean(V[i - 20:i]))
+        if not va > 0:
+            continue
+        pos, chg, vr = (C[i] - L[i]) / rng, (C[i] / C[i - 1] - 1) * 100, V[i] / va
+        if not (pos >= BTST_POS and BTST_CHG_MIN <= chg <= BTST_CHG_MAX and vr >= BTST_VOL and C[i] >= np.nanmax(H[i - 20:i])):
+            continue
+        o1, l1, c1, stop = O[i + 1], L[i + 1], C[i + 1], L[i]
+        out_stop = o1 if o1 <= stop else stop if l1 < stop else c1   # a gap below the day's low is sold at the open, otherwise the stop is the day's low
+        r = lambda x: (x / C[i] - 1) * 100 - BTST_COST
+        trades.append((d.index[i].strftime("%Y-%m-%d"), float(round(r(o1), 3)), float(round(r(c1), 3)), float(round(r(out_stop), 3))))
+    return stats, trades
+
+
 def analyse(symbol, df, interval):
+    row = _analyse(symbol, df, interval)
+    if interval == "1d" and row is not None and symbol not in INDEX_YF:
+        try:
+            st, tr = btst_pack(df)
+            row["bt"] = st
+            BTST_TR[symbol] = tr
+        except Exception as e:
+            print("btst pack:", symbol, type(e).__name__, flush=True)
+    return row
+
+
+def _analyse(symbol, df, interval):
     df = df.dropna(subset=["Close", "High", "Low"]).copy()
     if df.empty:
         return None
@@ -390,12 +443,17 @@ def analyse(symbol, df, interval):
     prev_close = None
     stale_day = False
     vol = val_cr = None
+    dhi = dlo = dop = None   # today's high, low and open, for the BTST scan
     try:
         if interval not in DAYLIKE and "Volume" in df:
             day = np.array([t.date() for t in df.index]) == df.index[-1].date()
             v = df["Volume"].to_numpy(float)[day]
             vol = int(np.nansum(v))
             val_cr = round(float(np.nansum(v * df["Close"].to_numpy(float)[day])) / 1e7, 2)
+            try:
+                dhi, dlo, dop = float(np.nanmax(df["High"].to_numpy(float)[day])), float(np.nanmin(df["Low"].to_numpy(float)[day])), float(df["Open"].to_numpy(float)[day][0])
+            except Exception:
+                dhi = dlo = dop = None
     except Exception:
         vol = val_cr = None
     try:
@@ -448,6 +506,7 @@ def analyse(symbol, df, interval):
     base = {"symbol": symbol, "hist": hist, "type": "index" if symbol in INDEX_YF else "stock", "close": round(float(c[-1]), 2), "signal": "–", "entry": None, "sl": None,
             "sector": sector_of(symbol), "chg": None if chg is None else round(float(chg), 2),
             "prev_close": None if prev_close is None else round(prev_close, 2), "stale_day": stale_day, "vol": vol, "val_cr": val_cr,
+            "d_hi": None if dhi is None else round(dhi, 2), "d_lo": None if dlo is None else round(dlo, 2), "d_open": None if dop is None else round(dop, 2),
             "tp1": None, "tp2": None, "tp3": None, "tp4": None, "hits": 0, "sl_hit": False,
             "status": "No signal yet", "bars_ago": None, "signal_time": "–"}
     if len(sig_idx) == 0:
@@ -1897,7 +1956,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-18d"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-19a"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5194,6 +5253,87 @@ def ensure_events():
 def api_events(request: Request):
     ensure_events()
     return {"events": events_view(EVENTS["by"], ist_now().date()), "ok": EVENTS["ok"], "checked": EVENTS["ts"] > 0}
+
+
+# ── BTST scan and its backtest ──
+def btst_scan():
+    ensure_fresh("15m")
+    ensure_fresh("1d")
+    ensure_events()
+    now, today = ist_now(), ist_now().date()
+    with LOCK:
+        rows15 = apply_live(list(STATES["15m"]["rows"]))
+        d1 = {r["symbol"]: r for r in STATES["1d"]["rows"]}
+        upd, busy = STATES["15m"]["updated"], STATES["15m"]["refreshing"] or not STATES["15m"]["updated"]
+    rows15 = [r for r in rows15 if r.get("type") != "index"]
+    sec = {}
+    for r in rows15:
+        c_ = r.get("ltp_chg", r.get("chg"))
+        if c_ is not None:
+            sec.setdefault(r.get("sector"), []).append(c_)
+    sec_chg = {k: round(sum(v) / len(v), 2) for k, v in sec.items() if v}
+    ev = events_view(EVENTS["by"], today)
+    out, nodata = [], 0
+    for r in rows15:
+        sym = r["symbol"]
+        price = r.get("ltp", r["close"])
+        st = (d1.get(sym) or {}).get("bt")
+        if not (price and r.get("d_hi") and r.get("d_lo") and st):
+            nodata += 1
+            continue
+        hi, lo = max(r["d_hi"], price), min(r["d_lo"], price)
+        pos = (price - lo) / (hi - lo) if hi > lo else None
+        chg = r.get("ltp_chg", r.get("chg"))
+        vr = (r["vol"] / st["avg_vol"]) if r.get("vol") and st["avg_vol"] > 0 else None
+        brk = price >= st["hi20"]
+        ok = [pos is not None and pos >= BTST_POS, chg is not None and BTST_CHG_MIN <= chg <= BTST_CHG_MAX, vr is not None and vr >= BTST_VOL, brk]
+        score = sum(ok)
+        if score < 3:
+            continue
+        soon = [e for e in ev.get(sym, []) if e["soon"]]
+        d1r = d1.get(sym) or {}
+        out.append({"symbol": sym, "price": round(price, 2), "chg": None if chg is None else round(chg, 2), "pos": None if pos is None else round(pos, 2),
+                    "vol_x": None if vr is None else round(vr, 2), "brk": brk, "score": score, "ok": ok, "stop": round(lo, 2), "risk": round((price - lo) / price * 100, 2),
+                    "sector": r.get("sector"), "sector_chg": sec_chg.get(r.get("sector")), "signal": d1r.get("signal", "–"), "status": d1r.get("status"),
+                    "val_cr": r.get("val_cr"), "event": ("; ".join(f"{e['kind']} {e['note']}".strip() for e in soon))[:120] if soon else None})
+    out.sort(key=lambda x: (x["event"] is not None, -x["score"], -(x["val_cr"] or 0)))
+    wd = now.weekday()
+    mins = now.hour * 60 + now.minute
+    warn = []
+    if not EVENTS["ok"]:
+        warn.append("The company event calendar has not loaded, so a result or board meeting tomorrow would not be flagged. Check the company's own announcements before buying.")
+    if wd == 4 or (wd < 5 and next_trading_day(today) > today + timedelta(days=1)):
+        warn.append("The next trading day is not tomorrow, so this trade is held over more than one night.")
+    return {"rows": out, "nodata": nodata, "warn": warn, "updated": upd, "scanning": bool(busy), "next_day": next_trading_day(today).isoformat(),
+            "best_time": wd < 5 and 15 * 60 <= mins <= 15 * 60 + 25, "open": wd < 5 and 555 <= mins < 930, "events_ok": EVENTS["ok"],
+            "rules": {"pos": BTST_POS, "chg": [BTST_CHG_MIN, BTST_CHG_MAX], "vol": BTST_VOL}}
+
+
+@app.get("/api/btst")
+def api_btst(request: Request):
+    return btst_scan()
+
+
+def btst_summary():
+    names = [s_ for s_ in UNIVERSE if s_ not in INDEX_YF and BTST_TR.get(s_) is not None]
+    allt = [(t[0], s_, t[1], t[2], t[3]) for s_ in names for t in BTST_TR[s_]]
+    allt.sort()
+    modes = {}
+    for k, lab, ix in (("open", "Sell at the next open", 2), ("close", "Sell at the next close", 3), ("stop", "Stop at today's low, else the next close", 4)):
+        v = [t[ix] for t in allt]
+        w, l_ = [x for x in v if x > 0], [x for x in v if x <= 0]
+        modes[k] = {"label": lab, "n": len(v), "win": round(len(w) / len(v) * 100, 1) if v else None, "avg": round(sum(v) / len(v), 2) if v else None,
+                    "avg_win": round(sum(w) / len(w), 2) if w else None, "avg_loss": round(sum(l_) / len(l_), 2) if l_ else None,
+                    "pf": round(sum(w) / -sum(l_), 2) if l_ and sum(l_) < 0 else None, "worst": round(min(v), 2) if v else None}
+    return {"symbols": len(names), "n": len(allt), "from": allt[0][0] if allt else None, "to": allt[-1][0] if allt else None, "modes": modes,
+            "last": [{"d": t[0], "s": t[1], "open": t[2], "close": t[3], "stop": t[4]} for t in allt[-12:]][::-1], "cost": BTST_COST,
+            "rules": {"pos": BTST_POS, "chg": [BTST_CHG_MIN, BTST_CHG_MAX], "vol": BTST_VOL}}
+
+
+@app.get("/api/btst/backtest")
+def api_btst_backtest(request: Request):
+    ensure_fresh("1d")
+    return btst_summary()
 
 
 # ── Personal watchlist (kept per user on the server) ──
@@ -9160,7 +9300,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">SWING</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">SWING</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="btst">BTST</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -9285,6 +9425,15 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <h3 style="margin:14px 0 6px">Trades <span class="sub" id="btListNote"></span></h3>
  <div class="wrap"><table id="btTrades"></table></div>
 </div>
+</section>
+<section id="view-btst" hidden>
+<div class="note" id="bsNote" style="margin:0 0 10px">Stocks that closed strong today and may carry into tomorrow. Buy near the close, sell in the first hour of the next session.</div>
+<div id="bsWarn"></div>
+<div class="wrap"><table id="bsTable"><thead><tr><th>Symbol</th><th>Rules met</th><th>Price</th><th>Day %</th><th>Close in range</th><th>Volume ×</th><th>Breakout</th><th>Stop (risk)</th><th></th></tr></thead><tbody id="bsBody"></tbody></table></div>
+<div class="sub" id="bsEmpty"></div>
+<h3 style="margin:18px 0 6px">Backtest of the same rules <span class="sub" id="bsBtNote"></span></h3>
+<div class="wrap"><table id="bsBt"></table></div>
+<div class="sub" id="bsBtFoot" style="margin-top:8px"></div>
 </section>
 <section id="view-orders" hidden>
 <div class="hkpi" id="pfKpi"></div>
@@ -9720,8 +9869,9 @@ setInterval(()=>{if(mode==="charts"&&cw.ready&&!document.hidden&&cw.sym&&cwOpenN
 function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
 function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
  ensureTf();
- const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
- ["stocks","charts","commodities","autopilot","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",btst:"btst",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","charts","commodities","autopilot","btst","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ if(m==="btst")btstLoad();else clearTimeout(btstTimer);
  if(m==="charts")cwShow();
  if(m==="commodities"){cmPaint();cmLoad()}else clearTimeout(cmTimer);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
@@ -10339,6 +10489,24 @@ async function loadSource(){try{const d=await (await api("/api/admin/source")).j
 function tokTxt(t){if(!t||!t.enabled)return "";const h=s=>s==null?"":s>=3600?Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m":Math.max(0,Math.floor(s/60))+"m";
  return `. Dhan token: ${t.expires_in==null?"expiry unknown":t.expires_in>0?"valid for "+h(t.expires_in):'<span style="color:var(--sell)">expired</span>'}, ${t.auto?"signs in by itself every day at "+esc(t.at)+" IST":"extended automatically (add DHAN_PIN and DHAN_TOTP_SECRET to sign in by itself)"}${t.how&&t.last_ok_age!=null?`, last ${esc(t.how)} ${h(t.last_ok_age)} ago`:""}${t.error?`. <span style="color:var(--sell)">${esc(t.error)}</span>`:""} <button class="btn" onclick="tokNow(this)">Renew now</button>`}
 async function tokNow(b){b.disabled=true;b.textContent="Renewing…";const d=await post("/api/admin/dhan-token",{});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
+let btstTimer=null,btstBtDone=false;
+const pct1=x=>x==null?"–":(x>0?"+":"")+x.toFixed(2)+"%";
+async function btstLoad(){clearTimeout(btstTimer);
+ try{const d=await (await api("/api/btst")).json();btstPaint(d)}catch(e){$("bsNote").textContent="Cannot reach the server."}
+ if(mode==="btst")btstTimer=setTimeout(btstLoad,15000);
+ if(!btstBtDone){btstBtDone=true;try{btstBt(await (await api("/api/btst/backtest")).json())}catch(e){btstBtDone=false}}}
+function btstPaint(d){const r=d.rules||{};
+ $("bsNote").innerHTML=`Rules: the close sits in the top ${Math.round((1-r.pos)*100)}% of today's range, the day is up ${r.chg[0]}% to ${r.chg[1]}%, volume is at least ${r.vol}× its 20 day average, and the price is at a 20 day high. A stock needs 3 or 4 of the 4 to be listed. `+(d.best_time?"<b>This is the best checking window (3:00 to 3:25 pm).</b>":d.open?"Check again between 3:00 and 3:25 pm, when the day's close is nearly settled.":"The market is closed, so this shows the last session. Check again from 3:00 pm on a trading day.")+` Next trading day: ${esc(d.next_day)}. Sell in your broker app the next morning: this dashboard cannot sell delivery shares.`;
+ $("bsWarn").innerHTML=(d.warn||[]).map(w=>`<div class="note" style="margin:0 0 8px;border-color:var(--sell)">${esc(w)}</div>`).join("");
+ $("bsBody").innerHTML=(d.rows||[]).map(x=>`<tr${x.event?' style="opacity:.55"':""}><td><b>${esc(x.symbol)}</b>${x.signal==="BUY"?' <span class="up">BUY</span>':""}<br><span class="sub">${esc(x.sector||"")}${x.sector_chg==null?"":" "+pct1(x.sector_chg)}</span>${x.event?`<br><span class="dn">${esc(x.event)}</span>`:""}</td><td>${x.score===4?"<b class=up>4 of 4</b>":"3 of 4"}</td><td>${x.price.toFixed(2)}</td><td class="${x.ok[1]?"up":""}">${pct1(x.chg)}</td><td class="${x.ok[0]?"up":""}">${x.pos==null?"–":Math.round(x.pos*100)+"%"}</td><td class="${x.ok[2]?"up":""}">${x.vol_x==null?"–":x.vol_x.toFixed(1)+"×"}</td><td class="${x.brk?"up":""}">${x.brk?"yes":"no"}</td><td>${x.stop.toFixed(2)}<br><span class="${x.risk>4?"dn":"sub"}">${x.risk.toFixed(1)}% risk</span></td><td style="white-space:nowrap"><button class="btn" data-bsc="${esc(x.symbol)}">Chart</button> <button class="btn go" data-bsb="${esc(x.symbol)}" data-p="${x.price}">Buy</button></td></tr>`).join("");
+ $("bsEmpty").textContent=(d.rows||[]).length?(d.nodata?`${d.nodata} stocks have no volume or daily history yet and are left out. `:"")+"A red event line means a result, dividend or similar event is due today or the next trading day: avoid holding through it.":d.scanning?"Scanning…":"No stock meets 3 or more of the rules right now."}
+function btstBt(b){const m=b.modes||{},rows=Object.values(m);
+ $("bsBtNote").textContent=b.n?`${b.n} past trades in ${b.symbols} stocks, ${b.from} to ${b.to}`:"";
+ $("bsBt").innerHTML=b.n?"<thead><tr><th>Exit</th><th>Trades</th><th>Win %</th><th>Avg per trade</th><th>Avg win</th><th>Avg loss</th><th>Profit factor</th><th>Worst</th></tr></thead><tbody>"+rows.map(x=>`<tr><td>${esc(x.label)}</td><td>${x.n}</td><td>${x.win}%</td><td class="${x.avg>=0?"up":"dn"}">${pct1(x.avg)}</td><td>${pct1(x.avg_win)}</td><td>${pct1(x.avg_loss)}</td><td>${x.pf==null?"–":x.pf}</td><td class="dn">${pct1(x.worst)}</td></tr>`).join("")+"</tbody>":"";
+ $("bsBtFoot").textContent=b.n?`Every trade buys at the day's close and has ${b.cost}% for charges taken off. It does not know about market mood or events, and a real fill near 3:20 pm differs from the close. With ${b.n<30?"so few trades the numbers mean little":"this many trades the figures are an indication, not a promise"}. Past results do not predict future ones.`:"Not enough daily history yet. Open this page again after the daily scan has finished."}
+$("bsBody").onclick=e=>{const c=e.target.closest("[data-bsc]"),b=e.target.closest("[data-bsb]");
+ if(c)openChart(c.dataset.bsc,"1d");
+ else if(b){openTicket({kind:"equity",symbol:b.dataset.bsb,label:b.dataset.bsb+" shares",side:"BUY",price:+b.dataset.p,tf:"1d"});const pr=$("tkProd");if(pr)pr.value="DELIVERY"}};
 async function oipCheck(){const n=$("oipNote");n.textContent="Checking…";try{const d=await (await api("/api/admin/orderip")).json();if(d.error){n.textContent=d.error;return}
  n.innerHTML=(d.proxy_on?`Orders go out from <b>${esc(d.via_proxy||"?")}</b>`+(d.via_proxy_error?` (could not reach the proxy: ${esc(d.via_proxy_error)})`:"")+`. Save this address, and its pair, in Dhan.`:"<b>No proxy is set</b>, so orders go out from the server's own address.")+` Everything else goes out from ${esc(d.direct||"?")}.`}catch(e){n.textContent="Could not check. Try again."}}
 async function srcSet(w){const d=await post("/api/admin/source",{source:w});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
