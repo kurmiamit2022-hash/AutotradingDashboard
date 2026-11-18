@@ -1829,6 +1829,16 @@ USE_PG = bool(DATABASE_URL)
 MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 DHAN_BASE = "https://api.dhan.co/v2"
+# Dhan only accepts order calls from the IPs saved in its Static IP Setting. A fixed-IP proxy (QuotaGuard Static) gives two such IPs:
+# order calls that place, change or cancel an order go through it; prices, candles and reads go straight out.
+ORDER_PROXY = (os.environ.get("ORDER_PROXY") or os.environ.get("QUOTAGUARDSTATIC_URL") or "").strip()
+ORDER_PATHS = ("/orders", "/super/orders", "/forever/orders")
+
+
+def order_proxies(method, path):
+    if not ORDER_PROXY or method.upper() == "GET" or not path.startswith(ORDER_PATHS):
+        return None
+    return {"http": ORDER_PROXY, "https": ORDER_PROXY}
 DEFAULT_CAPS = {                                                    # an admin can override these for each person
     "max_order_value": float(os.getenv("MAX_ORDER_VALUE", "50000")),       # rupees per stock or option-buy order
     "max_qty": int(os.getenv("MAX_QTY", "500")),                           # shares per order, or lots for option buys
@@ -1864,7 +1874,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-17c"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-18a"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2401,8 +2411,11 @@ class DhanAccount:
 
     def request(self, method, path, body=None, extra=None):
         for attempt in range(2):
-            r = requests.request(method, DHAN_BASE + path, json=body, timeout=15,
-                                 headers={"access-token": self.c["access_token"], "Content-Type": "application/json", "Accept": "application/json", **(extra or {})})
+            try:
+                r = requests.request(method, DHAN_BASE + path, json=body, timeout=15, proxies=order_proxies(method, path),
+                                     headers={"access-token": self.c["access_token"], "Content-Type": "application/json", "Accept": "application/json", **(extra or {})})
+            except requests.exceptions.ProxyError:
+                raise OrderRejected("The order proxy refused the connection or could not be reached. Nothing was placed. Check ORDER_PROXY on the server.")
             if r.status_code == 401 and attempt == 0 and self.c.get("_feed") and dhan_token_refresh("an order request was refused"):
                 continue    # the token had expired: nothing was placed, so it is safe to ask again with the new one
             break
@@ -8415,6 +8428,23 @@ def need_admin(request):
     return None if request.state.user["role"] == "admin" else JSONResponse({"error": "Admins only."}, status_code=403)
 
 
+@app.get("/api/admin/orderip")
+def api_admin_orderip(request: Request):
+    """The address Dhan sees on order calls (through the proxy) and on everything else (straight out)."""
+    denied = need_admin(request)
+    if denied:
+        return denied
+    out = {"proxy_on": bool(ORDER_PROXY)}
+    for k, px in (("direct", None), ("via_proxy", {"http": ORDER_PROXY, "https": ORDER_PROXY} if ORDER_PROXY else None)):
+        if k == "via_proxy" and not ORDER_PROXY:
+            continue
+        try:
+            out[k] = requests.get("http://ip.quotaguard.com", timeout=12, proxies=px).text.strip()[:60]
+        except Exception as e:
+            out[k + "_error"] = type(e).__name__
+    return out
+
+
 CAP_TYPES = {"max_order_value": float, "max_qty": int, "max_orders": int, "max_fut_lots": int, "max_fut_value": float,
              "allow_option_selling": bool}
 
@@ -9284,6 +9314,10 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="sub">Where candles and live prices come from. With Dhan, prices stream over Dhan's WebSocket and the candles come from Dhan's historical data, so there is a single source. Yahoo is slower and can lag, so it is only a fallback.</div>
   <div class="botrow"><button class="btn go" id="srcDhan">Use Dhan</button><button class="btn" id="srcYahoo">Use Yahoo</button></div>
   <div class="sub" id="srcNote"></div></div>
+ <div class="card"><h3>Order IP</h3>
+  <div class="sub">Dhan accepts order calls only from the addresses saved in its Static IP Setting. With ORDER_PROXY (or QUOTAGUARDSTATIC_URL) set, orders go out through the proxy; everything else goes out directly.</div>
+  <div class="botrow"><button class="btn go" id="oipGo">Check order IP</button></div>
+  <div class="sub" id="oipNote"></div></div>
  <div class="card"><h3>Everyone's orders today</h3><div class="wrap"><table id="admOrd"></table></div></div>
  <div class="card"><h3>Add a user</h3>
   <div class="grid2" style="margin-bottom:0"><label>Username<input id="nuName" autocomplete="off"></label><label>Temporary password (at least 10 characters)<input id="nuPw" type="password" autocomplete="new-password"></label></div>
@@ -10274,6 +10308,8 @@ async function loadSource(){try{const d=await (await api("/api/admin/source")).j
 function tokTxt(t){if(!t||!t.enabled)return "";const h=s=>s==null?"":s>=3600?Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m":Math.max(0,Math.floor(s/60))+"m";
  return `. Dhan token: ${t.expires_in==null?"expiry unknown":t.expires_in>0?"valid for "+h(t.expires_in):'<span style="color:var(--sell)">expired</span>'}, ${t.auto?"signs in by itself every day at "+esc(t.at)+" IST":"extended automatically (add DHAN_PIN and DHAN_TOTP_SECRET to sign in by itself)"}${t.how&&t.last_ok_age!=null?`, last ${esc(t.how)} ${h(t.last_ok_age)} ago`:""}${t.error?`. <span style="color:var(--sell)">${esc(t.error)}</span>`:""} <button class="btn" onclick="tokNow(this)">Renew now</button>`}
 async function tokNow(b){b.disabled=true;b.textContent="Renewing…";const d=await post("/api/admin/dhan-token",{});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
+async function oipCheck(){const n=$("oipNote");n.textContent="Checking…";try{const d=await (await api("/api/admin/orderip")).json();if(d.error){n.textContent=d.error;return}
+ n.innerHTML=(d.proxy_on?`Orders go out from <b>${esc(d.via_proxy||"?")}</b>`+(d.via_proxy_error?` (could not reach the proxy: ${esc(d.via_proxy_error)})`:"")+`. Save this address, and its pair, in Dhan.`:"<b>No proxy is set</b>, so orders go out from the server's own address.")+` Everything else goes out from ${esc(d.direct||"?")}.`}catch(e){n.textContent="Could not check. Try again."}}
 async function srcSet(w){const d=await post("/api/admin/source",{source:w});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
 async function ssSet(b){const d=await post("/api/admin/session",b);if(d.error)$("ssNote").textContent=d.error;else loadSession()}
 async function loadUsers(){loadSession();loadSource();loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
@@ -10289,7 +10325,7 @@ $("usrTable").onclick=async e=>{const b=e.target.closest("button[data-act]");if(
  else if(b.dataset.act==="limits"){limUser=u;const c=u.caps;$("limTitle").textContent="Limits for "+u.username;$("limValue").value=c.max_order_value;$("limQty").value=c.max_qty;$("limOrders").value=c.max_orders;$("limLots").value=c.max_fut_lots;$("limFut").value=c.max_fut_value;$("limSell").value=c.allow_option_selling?"1":"0";$("limMsg").textContent="";$("limDlg").showModal();return}
  if(d)$("admNote").textContent=d.error||"Saved.";loadUsers()};
 $("limClose").onclick=()=>$("limDlg").close();
-$("ssOpen").onclick=()=>ssSet({start:$("ssFrom").value,end:$("ssTo").value});$("ssClear").onclick=()=>ssSet({clear:true});$("srcDhan").onclick=()=>srcSet("dhan");$("srcYahoo").onclick=()=>srcSet("yahoo");
+$("ssOpen").onclick=()=>ssSet({start:$("ssFrom").value,end:$("ssTo").value});$("ssClear").onclick=()=>ssSet({clear:true});$("oipGo").onclick=oipCheck;$("srcDhan").onclick=()=>srcSet("dhan");$("srcYahoo").onclick=()=>srcSet("yahoo");
 $("limSave").onclick=async()=>{const d=await send("PATCH","/api/admin/users/"+limUser.id,{caps:{max_order_value:$("limValue").value,max_qty:$("limQty").value,max_orders:$("limOrders").value,max_fut_lots:$("limLots").value,max_fut_value:$("limFut").value,allow_option_selling:$("limSell").value==="1"}});
  if(d.error){$("limMsg").textContent=d.error;return}$("limDlg").close();loadUsers()};
 $("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{username:$("nuName").value,password:$("nuPw").value,role:$("nuRole").value});$("admNote").textContent=d.error||"User added. Live trading is off for them until you enable it.";if(!d.error){$("nuName").value="";$("nuPw").value=""}loadUsers()};
