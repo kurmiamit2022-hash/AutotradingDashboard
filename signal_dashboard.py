@@ -1835,20 +1835,26 @@ ORDER_PROXY = (os.environ.get("ORDER_PROXY") or os.environ.get("QUOTAGUARDSTATIC
 ORDER_PATHS = ("/orders", "/super/orders", "/forever/orders")
 
 
-_PIP = {"ip": None, "at": 0.0}
+_PIP = {"ip": None, "at": 0.0, "err": ""}
 
 
 def proxy_public_ip():
-    """The address the proxy shows to the outside, kept for ten minutes."""
+    """The address the proxy shows to the outside, kept for ten minutes. The reason for a failure is kept in _PIP["err"]."""
     if _PIP["ip"] and time.time() - _PIP["at"] < 600:
         return _PIP["ip"]
     try:
-        ip = requests.get("http://ip.quotaguard.com", timeout=12, proxies={"http": ORDER_PROXY, "https": ORDER_PROXY}).text.strip()
-        if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", ip):
-            _PIP["ip"], _PIP["at"] = ip, time.time()
-            return ip
-    except Exception:
-        pass
+        r = requests.get("http://ip.quotaguard.com", timeout=15, proxies={"http": ORDER_PROXY, "https": ORDER_PROXY})
+        m_ = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", r.text or "")
+        if r.status_code == 200 and m_:
+            _PIP["ip"], _PIP["at"], _PIP["err"] = m_.group(0), time.time(), ""
+            return m_.group(0)
+        _PIP["err"] = f"the proxy answered HTTP {r.status_code} without an address" + (" (check the username and password in the URL)" if r.status_code in (401, 407) else "")
+    except requests.exceptions.InvalidURL:
+        _PIP["err"] = "the proxy URL is not valid (it should look like http://user:password@host:port)"
+    except requests.exceptions.ProxyError as e:
+        _PIP["err"] = "the proxy refused the connection (wrong username, password or port in the URL?)"
+    except Exception as e:
+        _PIP["err"] = type(e).__name__
     return None
 
 
@@ -1891,7 +1897,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-18c"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-18d"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2322,7 +2328,7 @@ class AngelAccount:
         if ORDER_PROXY:   # Angel One also checks the address orders come from: send everything through the fixed-IP proxy and name that address, so the library does not announce the server's own
             kw = {"proxies": {"http": ORDER_PROXY, "https": ORDER_PROXY}, "clientPublicIP": proxy_public_ip()}
             if not kw["clientPublicIP"]:
-                raise RuntimeError("The order proxy could not be reached, so nothing was sent to Angel One. Check ORDER_PROXY on the server.")
+                raise RuntimeError("The order proxy could not be reached, so nothing was sent to Angel One" + (": " + _PIP["err"] if _PIP["err"] else "") + ". Check the proxy URL in Render (QUOTAGUARDSTATIC_URL).")
         obj = SmartConnect(api_key=self.c["api_key"], **kw)
         res = obj.generateSession(self.c["client_id"], self.c["pin"], code)
         if not res or not res.get("status"):
