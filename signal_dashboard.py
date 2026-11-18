@@ -466,7 +466,7 @@ def _analyse(symbol, df, interval):
     prev_close = None
     stale_day = False
     vol = val_cr = None
-    dhi = dlo = dop = orh = orl = None   # today's high, low and open, and the first 15 minutes' high and low, for the scanners
+    dhi = dlo = dop = None   # today's high, low and open, for the BTST scan
     try:
         if interval not in DAYLIKE and "Volume" in df:
             day = np.array([t.date() for t in df.index]) == df.index[-1].date()
@@ -475,10 +475,6 @@ def _analyse(symbol, df, interval):
             val_cr = round(float(np.nansum(v * df["Close"].to_numpy(float)[day])) / 1e7, 2)
             try:
                 dhi, dlo, dop = float(np.nanmax(df["High"].to_numpy(float)[day])), float(np.nanmin(df["Low"].to_numpy(float)[day])), float(df["Open"].to_numpy(float)[day][0])
-                if interval == "15m":
-                    t0 = df.index[day][0]
-                    if t0.hour * 60 + t0.minute <= 9 * 60 + 20:   # the candle that opens at 09:15
-                        orh, orl = float(df["High"].to_numpy(float)[day][0]), float(df["Low"].to_numpy(float)[day][0])
             except Exception:
                 dhi = dlo = dop = None
     except Exception:
@@ -534,7 +530,6 @@ def _analyse(symbol, df, interval):
             "sector": sector_of(symbol), "chg": None if chg is None else round(float(chg), 2),
             "prev_close": None if prev_close is None else round(prev_close, 2), "stale_day": stale_day, "vol": vol, "val_cr": val_cr,
             "d_hi": None if dhi is None else round(dhi, 2), "d_lo": None if dlo is None else round(dlo, 2), "d_open": None if dop is None else round(dop, 2),
-            "or_hi": None if orh is None else round(orh, 2), "or_lo": None if orl is None else round(orl, 2),
             "tp1": None, "tp2": None, "tp3": None, "tp4": None, "hits": 0, "sl_hit": False,
             "status": "No signal yet", "bars_ago": None, "signal_time": "–"}
     if len(sig_idx) == 0:
@@ -1984,7 +1979,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-19c"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-19d"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5284,7 +5279,6 @@ def api_events(request: Request):
 
 
 # ── Scanner: near 52 week high or low, previous month high broken or low broken ──
-SCAN_SURGE_X = float(os.getenv("SCAN_SURGE_X", "2.0"))   # volume surge: today's volume against the 20 day average
 SCAN_SIG_BARS = int(os.getenv("SCAN_SIG_BARS", "5"))     # signal plus level: how many daily candles old a signal may be
 
 
@@ -5300,7 +5294,7 @@ def levels_scan(near=3.0):
         if r["symbol"] not in seen and r.get("type") != "index":
             seen.add(r["symbol"])
             rows2.append(r)
-    lists = {"hi": [], "lo": [], "up": [], "dn": [], "sl": [], "vs": [], "orb": []}
+    lists = {"hi": [], "lo": [], "up": [], "dn": [], "sl": []}
     for r in apply_live(rows2):
         lv = r.get("lv")
         price = r.get("ltp", r["close"])
@@ -5335,34 +5329,10 @@ def levels_scan(near=3.0):
                     why.append("Below last month's low")
             if why:
                 lists["sl"].append({**base, "why": why, "side": sig, "age": ba, "status": r.get("status"), "dist": ba})
-    # volume surge and opening range breakout come from today's 15 minute candles (F&O stocks)
-    ensure_fresh("15m")
-    with LOCK:
-        r15 = apply_live(list(STATES["15m"]["rows"]))
-        d1 = {r["symbol"]: r for r in STATES["1d"]["rows"]}
-    for r in r15:
-        if r.get("type") == "index":
-            continue
-        price = r.get("ltp", r["close"])
-        if not price:
-            continue
-        chg = r.get("ltp_chg", r.get("chg"))
-        base = {"symbol": r["symbol"], "price": round(price, 2), "chg": None if chg is None else round(chg, 2), "sector": r.get("sector"), "cash": False, "signal": (d1.get(r["symbol"]) or {}).get("signal", "–")}
-        avg = (((d1.get(r["symbol"]) or {}).get("bt")) or {}).get("avg_vol")
-        vr = r["vol"] / avg if r.get("vol") and avg and avg > 0 else None
-        if vr is not None and vr >= SCAN_SURGE_X:
-            lists["vs"].append({**base, "vol_x": round(vr, 2), "val_cr": r.get("val_cr"), "dist": -round(vr, 2)})
-        oh, ol = r.get("or_hi"), r.get("or_lo")
-        if oh and ol and oh > ol:
-            width = (oh - ol) / price * 100
-            if price > oh:
-                lists["orb"].append({**base, "side": "UP", "level": oh, "other": ol, "width": round(width, 2), "dist": round((price / oh - 1) * 100, 2), "vol_x": None if vr is None else round(vr, 2)})
-            elif price < ol:
-                lists["orb"].append({**base, "side": "DOWN", "level": ol, "other": oh, "width": round(width, 2), "dist": round((ol / price - 1) * 100, 2), "vol_x": None if vr is None else round(vr, 2)})
     for k in lists:
-        lists[k].sort(key=lambda x: (x["dist"], x["symbol"]))   # closest to the level first: the freshest breakouts come before the ones that already ran (volume surge: biggest first; signal: newest first)
+        lists[k].sort(key=lambda x: (x["dist"], x["symbol"]))   # closest to the level first: the freshest breakouts come before the ones that already ran (signal: newest first)
     return {"lists": {k: v[:150] for k, v in lists.items()}, "counts": {k: len(v) for k, v in lists.items()}, "near": near, "updated": upd, "scanning": bool(busy),
-            "surge_x": SCAN_SURGE_X, "sig_bars": SCAN_SIG_BARS,
+            "sig_bars": SCAN_SIG_BARS,
             "stocks": len(rows2), "cash_loaded": bool(cash)}
 
 
@@ -9543,7 +9513,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </div>
 </section>
 <section id="view-levels" hidden>
-<div class="note" id="lvNote" style="margin:0 0 10px">Stocks at a turning point or on the move: near a 52 week high or low, through last month's high or low, a signal with a level behind it, a volume surge, or a break of the opening range.</div>
+<div class="note" id="lvNote" style="margin:0 0 10px">Stocks at a turning point: near a 52 week high or low, through last month's high or low, or a recent signal with one of those levels behind it.</div>
 <div class="botrow" style="margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;gap:8px"><span id="lvTabs" style="flex:1 1 640px"></span><label style="flex:none;white-space:nowrap;display:flex;align-items:center;gap:6px;margin:6px 0 0">Near means within <select id="lvNear" style="width:auto;min-width:56px"><option>1</option><option>2</option><option selected>3</option><option>5</option></select> %</label></div>
 <div class="wrap"><table id="lvTable"><thead><tr><th>Symbol</th><th>Price</th><th>Day %</th><th id="lvLvl">Level</th><th id="lvDist">Distance</th><th></th></tr></thead><tbody id="lvBody"></tbody></table></div>
 <div class="sub" id="lvEmpty" style="margin-top:8px"></div>
@@ -10613,13 +10583,11 @@ function tokTxt(t){if(!t||!t.enabled)return "";const h=s=>s==null?"":s>=3600?Mat
  return `. Dhan token: ${t.expires_in==null?"expiry unknown":t.expires_in>0?"valid for "+h(t.expires_in):'<span style="color:var(--sell)">expired</span>'}, ${t.auto?"signs in by itself every day at "+esc(t.at)+" IST":"extended automatically (add DHAN_PIN and DHAN_TOTP_SECRET to sign in by itself)"}${t.how&&t.last_ok_age!=null?`, last ${esc(t.how)} ${h(t.last_ok_age)} ago`:""}${t.error?`. <span style="color:var(--sell)">${esc(t.error)}</span>`:""} <button class="btn" onclick="tokNow(this)">Renew now</button>`}
 async function tokNow(b){b.disabled=true;b.textContent="Renewing…";const d=await post("/api/admin/dhan-token",{});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
 let lvTimer=null,lvTab="hi",lvData=null;
-const LV_TABS=[["hi","Near 52 week high"],["lo","Near 52 week low"],["up","Monthly breakout"],["dn","Monthly breakdown"],["sl","Signal + level"],["vs","Volume surge"],["orb","Opening range breakout"]];
-const LV_TXT={hi:["52 week high","Below the high"],lo:["52 week low","Above the low"],up:["Last month's high","Above it"],dn:["Last month's low","Below it"],sl:["Why it is listed","Signal"],vs:["Volume vs 20 day average","Traded value"],orb:["First 15 minute range","Beyond the range"]};
+const LV_TABS=[["hi","Near 52 week high"],["lo","Near 52 week low"],["up","Monthly breakout"],["dn","Monthly breakdown"],["sl","Signal + level"]];
+const LV_TXT={hi:["52 week high","Below the high"],lo:["52 week low","Above the low"],up:["Last month's high","Above it"],dn:["Last month's low","Below it"],sl:["Why it is listed","Signal"]};
 const LV_HELP={hi:"Within the chosen distance of the highest price in the last 52 weeks. A stock at the high shows 0%.",lo:"Within the chosen distance of the lowest price in the last 52 weeks. A stock at the low shows 0%.",
  up:"Trading above the highest price of the previous calendar month. The smaller the distance, the fresher the breakout.",dn:"Trading below the lowest price of the previous calendar month. The smaller the distance, the fresher the breakdown.",
- sl:"A recent daily BUY with a high nearby, or a recent daily SELL with a low nearby: two reasons that agree. Signals up to a few days old and still running are listed, newest first.",
- vs:"Today's volume is at least twice the 20 day average. It shows where money is moving, up or down. Early in the day the volume is still building, so the list grows through the session. F&O stocks only.",
- orb:"Price is through the high or low of the first 15 minutes of today, 9:15 to 9:30. A narrow opening range that breaks with high volume is the stronger case. F&O stocks only; read it after 9:30."};
+ sl:"A recent daily BUY with a high nearby, or a recent daily SELL with a low nearby: two reasons that agree. Signals up to a few days old and still running are listed, newest first."};
 async function lvLoad(){clearTimeout(lvTimer);
  try{lvData=await (await api("/api/levels?near="+$("lvNear").value)).json();lvPaint()}catch(e){$("lvNote").textContent="Cannot reach the server."}
  if(mode==="levels")lvTimer=setTimeout(lvLoad,20000)}
@@ -10627,8 +10595,8 @@ function lvPaint(){const d=lvData;if(!d)return;
  $("lvTabs").innerHTML=LV_TABS.map(([k,t])=>`<button class="btn${k===lvTab?" go":""}" data-lv="${k}">${t} <b>${d.counts[k]}</b></button>`).join(" ");
  $("lvLvl").textContent=LV_TXT[lvTab][0];$("lvDist").textContent=LV_TXT[lvTab][1];
  const rows=d.lists[lvTab]||[];
- const c1=x=>lvTab==="sl"?x.why.map(esc).join("<br>"):lvTab==="vs"?`<b>${x.vol_x.toFixed(1)}×</b>`:lvTab==="orb"?`${x.side==="UP"?"High":"Low"} ${x.level.toFixed(2)}<br><span class="sub">range ${x.width}% wide${x.vol_x==null?"":" · volume "+x.vol_x.toFixed(1)+"×"}</span>`:`${x.level.toFixed(2)}<br><span class="sub">${esc(x.when)}</span>`;
- const c2=x=>lvTab==="sl"?`<b class="${x.side==="BUY"?"up":"dn"}">${x.side}</b><br><span class="sub">${x.age===0?"this candle":x.age+" candle"+(x.age>1?"s":"")+" ago"} · ${esc(x.status)}</span>`:lvTab==="vs"?(x.val_cr==null?"–":"₹ "+x.val_cr.toLocaleString("en-IN")+" Cr"):lvTab==="orb"?`<b class="${x.side==="UP"?"up":"dn"}">${x.dist.toFixed(2)}% ${x.side==="UP"?"above":"below"}</b>`:`<span class="${lvTab==="hi"||lvTab==="up"?"up":"dn"}">${x.dist.toFixed(2)}%${x.new?' <b>new</b>':""}</span>`;
+ const c1=x=>lvTab==="sl"?x.why.map(esc).join("<br>"):`${x.level.toFixed(2)}<br><span class="sub">${esc(x.when)}</span>`;
+ const c2=x=>lvTab==="sl"?`<b class="${x.side==="BUY"?"up":"dn"}">${x.side}</b><br><span class="sub">${x.age===0?"this candle":x.age+" candle"+(x.age>1?"s":"")+" ago"} · ${esc(x.status)}</span>`:`<span class="${lvTab==="hi"||lvTab==="up"?"up":"dn"}">${x.dist.toFixed(2)}%${x.new?' <b>new</b>':""}</span>`;
  $("lvBody").innerHTML=rows.map(x=>`<tr><td><b>${esc(x.symbol)}</b>${x.cash?' <span class="sub">Cash</span>':""}${lvTab!=="sl"&&(x.signal==="BUY"||x.signal==="SELL")?` <span class="${x.signal==="BUY"?"up":"dn"}">${esc(x.signal)}</span>`:""}<br><span class="sub">${esc(x.sector||"")}</span></td><td>${x.price.toFixed(2)}</td><td class="${x.chg>=0?"up":"dn"}">${pct1(x.chg)}</td><td>${c1(x)}</td><td>${c2(x)}</td><td><button class="btn" data-lvc="${esc(x.symbol)}">Chart</button></td></tr>`).join("");
  $("lvEmpty").textContent=(rows.length?"":d.scanning?"Scanning…":"No stock matches right now. ")+LV_HELP[lvTab]+` Covers ${d.stocks} stocks`+(d.cash_loaded?" (F&O and cash).":" (F&O; open SWING once to add the cash stocks).")+(d.counts[lvTab]>rows.length?` Showing the closest ${rows.length} of ${d.counts[lvTab]}.`:"")}
 $("lvTabs").onclick=e=>{const b=e.target.closest("[data-lv]");if(b){lvTab=b.dataset.lv;lvPaint()}};
