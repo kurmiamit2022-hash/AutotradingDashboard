@@ -1835,6 +1835,23 @@ ORDER_PROXY = (os.environ.get("ORDER_PROXY") or os.environ.get("QUOTAGUARDSTATIC
 ORDER_PATHS = ("/orders", "/super/orders", "/forever/orders")
 
 
+_PIP = {"ip": None, "at": 0.0}
+
+
+def proxy_public_ip():
+    """The address the proxy shows to the outside, kept for ten minutes."""
+    if _PIP["ip"] and time.time() - _PIP["at"] < 600:
+        return _PIP["ip"]
+    try:
+        ip = requests.get("http://ip.quotaguard.com", timeout=12, proxies={"http": ORDER_PROXY, "https": ORDER_PROXY}).text.strip()
+        if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", ip):
+            _PIP["ip"], _PIP["at"] = ip, time.time()
+            return ip
+    except Exception:
+        pass
+    return None
+
+
 def order_proxies(method, path):
     if not ORDER_PROXY or method.upper() == "GET" or not path.startswith(ORDER_PATHS):
         return None
@@ -1874,7 +1891,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-18a"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-18c"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2297,9 +2314,17 @@ class AngelAccount:
 
     def _login(self):
         from SmartApi import SmartConnect  # pip install smartapi-python pyotp
-        import pyotp
-        obj = SmartConnect(api_key=self.c["api_key"])
-        res = obj.generateSession(self.c["client_id"], self.c["pin"], pyotp.TOTP(self.c["totp_secret"]).now())
+        try:
+            code = totp_code(self.c["totp_secret"])
+        except Exception:
+            raise RuntimeError("The Angel One TOTP secret saved for this account is not valid. It is the long key of letters and digits 2 to 7 that Angel One shows next to the QR code when you enable TOTP, not the 6 digit code. Save it again in Account.")
+        kw = {}
+        if ORDER_PROXY:   # Angel One also checks the address orders come from: send everything through the fixed-IP proxy and name that address, so the library does not announce the server's own
+            kw = {"proxies": {"http": ORDER_PROXY, "https": ORDER_PROXY}, "clientPublicIP": proxy_public_ip()}
+            if not kw["clientPublicIP"]:
+                raise RuntimeError("The order proxy could not be reached, so nothing was sent to Angel One. Check ORDER_PROXY on the server.")
+        obj = SmartConnect(api_key=self.c["api_key"], **kw)
+        res = obj.generateSession(self.c["client_id"], self.c["pin"], code)
         if not res or not res.get("status"):
             raise RuntimeError("Angel One login failed: " + str((res or {}).get("message", "no response")))
         self.obj = obj
