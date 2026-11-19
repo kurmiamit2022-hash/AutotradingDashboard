@@ -2026,7 +2026,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20e"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20f"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -10024,10 +10024,13 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .chtfs button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
 .fdb{font-weight:600}.fdb.on{color:var(--buy)}.fdb.off{color:#f59e0b}
 .chnav{display:inline-flex;align-items:center;gap:6px}.chnav .btn{padding:4px 10px}
-.dpt{margin:6px 0 10px;font-size:12px}.dpt table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}.dpt td{padding:2px 6px;text-align:right}
-.dpt td.o{color:var(--mute);width:9%}.dpt td.q{width:21%;background:linear-gradient(to left,var(--bq,rgba(10,125,90,.28)) var(--w,0%),transparent var(--w,0%))}.dpt td.q.r{background:linear-gradient(to right,rgba(192,57,43,.28) var(--w,0%),transparent var(--w,0%));text-align:left}
-.dpt td.bp{color:var(--buy,#0a7d5a);font-weight:600}.dpt td.ap{color:var(--sell,#c0392b);font-weight:600;text-align:left}.dpt td.ap~td.o{text-align:left}.dpt th{font-weight:500;color:var(--mute);padding:2px 6px;text-align:right}
-.dpt .st{display:flex;flex-wrap:wrap;gap:4px 14px;color:var(--mute);margin:4px 0}.dpt .st b{color:var(--ink)}.dpt .bar{height:6px;border-radius:3px;background:rgba(192,57,43,.45);overflow:hidden;margin:4px 0}.dpt .bar i{display:block;height:100%;background:rgba(10,125,90,.6)}
+.dpt{margin:6px 0 10px;font-size:12px;max-width:100%;overflow:hidden}.dpt table{width:100%;table-layout:fixed;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.dpt th,.dpt td{padding:3px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dpt th{font-weight:500;color:var(--mute);font-size:11px;text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid var(--line,#ddd)}
+.dpt .bl{text-align:right}.dpt .al{text-align:left}.dpt td.o{color:var(--mute)}
+.dpt td.q.bl{background:linear-gradient(to left,rgba(10,125,90,.30) var(--w,0%),transparent var(--w,0%))}.dpt td.q.al{background:linear-gradient(to right,rgba(192,57,43,.30) var(--w,0%),transparent var(--w,0%))}
+.dpt td.bp{color:var(--buy,#0a7d5a);font-weight:600}.dpt td.ap{color:var(--sell,#c0392b);font-weight:600}.dpt td.sep,.dpt th.sep{border-left:1px solid var(--line,#ddd)}
+.dpt tfoot td{border-top:1px solid var(--line,#ddd);font-weight:600;color:var(--ink)}.dpt tfoot td.lab{color:var(--mute);font-weight:500}
+.dpt .st{display:flex;flex-wrap:wrap;gap:4px 14px;color:var(--mute);margin:4px 0}.dpt .st b{color:var(--ink)}.dpt .bar{height:6px;border-radius:3px;background:rgba(192,57,43,.55);overflow:hidden;margin:4px 0}.dpt .bar i{display:block;height:100%;background:rgba(10,125,90,.7)}
 .chleg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--mute);margin-bottom:6px}.chleg i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
 #chart{height:min(62vh,560px);width:100%}
 .cwrap{display:grid;grid-template-columns:316px minmax(0,1fr);gap:12px;align-items:start}
@@ -10805,14 +10808,17 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
  cwDrawLevels();cwDepthPoll()}
 const cw_REFRESH_MS=12000;
 const dpn=n=>Number(n).toLocaleString("en-IN");
-function dpHtml(d){   // best 5 bids and offers, with totals and the day's numbers
+function dpHtml(d){   // best 5 bids and offers side by side, with the buyer and seller totals in the table itself
  if(!d)return "";if(d.error)return `<div class="sub">${esc(d.error)}</div>`;if(d.nodepth)return "";
  const b=d.bids||[],a=d.asks||[],mx=Math.max(1,...b.map(x=>x.q),...a.map(x=>x.q)),n=Math.max(b.length,a.length,1);let rows="";
- for(let i=0;i<n;i++){const x=b[i],y=a[i];rows+=`<tr><td class="o">${x?x.o:""}</td><td class="q" style="--w:${x?(x.q/mx*100).toFixed(0):0}%">${x?dpn(x.q):""}</td><td class="bp">${x?x.p.toFixed(2):"–"}</td><td class="ap">${y?y.p.toFixed(2):"–"}</td><td class="q r" style="--w:${y?(y.q/mx*100).toFixed(0):0}%">${y?dpn(y.q):""}</td><td class="o">${y?y.o:""}</td></tr>`}
- const tot=(d.tb||0)+(d.ts||0),pct=tot?d.tb/tot*100:50,sp=b[0]&&a[0]?a[0].p-b[0].p:null,oh=d.ohlc||{};
- return `<table><thead><tr><th>Orders</th><th>Bid qty</th><th>Bid</th><th style="text-align:left">Ask</th><th style="text-align:left">Ask qty</th><th style="text-align:left">Orders</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="sub">No orders in the book right now.</td></tr>'}</tbody></table>`
-  +`<div class="bar" title="Total waiting to buy vs to sell"><i style="width:${pct.toFixed(0)}%"></i></div>`
-  +`<div class="st"><span>Buyers <b>${dpn(d.tb||0)}</b></span><span>Sellers <b>${dpn(d.ts||0)}</b></span>${sp!=null?`<span>Spread <b>${sp.toFixed(2)}</b></span>`:""}${d.ltp?`<span>LTP <b>${d.ltp.toFixed(2)}</b></span>`:""}${d.avg?`<span>Avg <b>${d.avg.toFixed(2)}</b></span>`:""}<span>Volume <b>${dpn(d.vol||0)}</b></span>${d.oi?`<span>OI <b>${dpn(d.oi)}</b></span>`:""}${oh.high?`<span>High <b>${(+oh.high).toFixed(2)}</b></span><span>Low <b>${(+oh.low).toFixed(2)}</b></span>`:""}${d.lc&&d.uc?`<span>Circuit <b>${d.lc}–${d.uc}</b></span>`:""}</div>`}
+ for(let i=0;i<n;i++){const x=b[i],y=a[i];rows+=`<tr><td class="o bl">${x?x.o:""}</td><td class="q bl" style="--w:${x?(x.q/mx*100).toFixed(0):0}%">${x?dpn(x.q):""}</td><td class="bp bl">${x?x.p.toFixed(2):"–"}</td><td class="ap al sep">${y?y.p.toFixed(2):"–"}</td><td class="q al" style="--w:${y?(y.q/mx*100).toFixed(0):0}%">${y?dpn(y.q):""}</td><td class="o al">${y?y.o:""}</td></tr>`}
+ const sq=l=>l.reduce((t,x)=>t+x.q,0),so=l=>l.reduce((t,x)=>t+x.o,0),tb=d.tb||0,ts=d.ts||0,tot=tb+ts,pct=tot?tb/tot*100:50,sp=b[0]&&a[0]?a[0].p-b[0].p:null,oh=d.ohlc||{};
+ return `<table><colgroup><col style="width:10%"><col style="width:23%"><col style="width:17%"><col style="width:17%"><col style="width:23%"><col style="width:10%"></colgroup>`
+  +`<thead><tr><th class="bl">Orders</th><th class="bl">Buy qty</th><th class="bl">Bid</th><th class="al sep">Ask</th><th class="al">Sell qty</th><th class="al">Orders</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="sub">No orders in the book right now.</td></tr>'}</tbody>`
+  +`<tfoot><tr><td class="bl">${dpn(so(b))}</td><td class="bl">${dpn(sq(b))}</td><td class="lab bl">Top 5</td><td class="lab al sep">Top 5</td><td class="al">${dpn(sq(a))}</td><td class="al">${dpn(so(a))}</td></tr>`
+  +`<tr><td></td><td class="bl" style="color:var(--buy,#0a7d5a)">${dpn(tb)}</td><td class="lab bl">All buyers</td><td class="lab al sep">All sellers</td><td class="al" style="color:var(--sell,#c0392b)">${dpn(ts)}</td><td></td></tr></tfoot></table>`
+  +`<div class="bar" title="All waiting to buy vs to sell"><i style="width:${pct.toFixed(0)}%"></i></div>`
+  +`<div class="st"><span>Buy ${pct.toFixed(0)}% · Sell ${(100-pct).toFixed(0)}%</span>${sp!=null?`<span>Spread <b>${sp.toFixed(2)}</b></span>`:""}${d.ltp?`<span>LTP <b>${d.ltp.toFixed(2)}</b></span>`:""}${d.avg?`<span>Avg <b>${d.avg.toFixed(2)}</b></span>`:""}<span>Volume <b>${dpn(d.vol||0)}</b></span>${d.oi?`<span>OI <b>${dpn(d.oi)}</b></span>`:""}${oh.high?`<span>High <b>${(+oh.high).toFixed(2)}</b></span><span>Low <b>${(+oh.low).toFixed(2)}</b></span>`:""}${d.lc&&d.uc?`<span>Circuit <b>${d.lc}–${d.uc}</b></span>`:""}</div>`}
 function cwDrawLevels(){   // the latest signal's entry, stop and targets: on the stock chart as they are, on the option chart as an estimated premium (delta x the stock's move)
  for(const [ser,l] of (cw.pl||[])){try{ser.removePriceLine(l)}catch(e){}}cw.pl=[];
  const sg=cw.sig;if(!sg||cw.inst!=="opt"||!cw.obj)return;
