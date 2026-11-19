@@ -1979,7 +1979,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-19d"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20c"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2087,6 +2087,10 @@ ALERT_DDL = [
     "CREATE TABLE IF NOT EXISTS alert_seen(k TEXT PRIMARY KEY, ts TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS manual_sig(k TEXT PRIMARY KEY, day TEXT NOT NULL, data TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS watchlist(user_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(user_id, symbol))",
+    "CREATE TABLE IF NOT EXISTS kill(scope TEXT PRIMARY KEY, day TEXT NOT NULL, reason TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, ts TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS kill_cfg(user_id INTEGER PRIMARY KEY, daily_loss REAL NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS journal(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, data TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', tag TEXT NOT NULL DEFAULT '')",
+    "CREATE INDEX IF NOT EXISTS journal_user_day ON journal(user_id, day)",
 ]
 
 
@@ -2984,6 +2988,9 @@ def make_order(p, u, dry=False, force=None):
         lines.append(["Exposure (strike x units)", inr(exposure)])
     if kind == "future" and risk:
         lines.append(["Stop-loss distance", f"{risk:.2f} points from your fill price" + ("" if auto_sl else " (placed from the Portfolio tab)")])
+    kb = kill_block(u["id"], mode, label, side, units)
+    if kb:
+        return fail(kb)
     order = {"kind": kind, "symbol": symbol, "label": label, "tradingsymbol": tsym, "token": token, "exchange": exch,
              "side": side, "qty": units, "lots": qty, "order_type": otype, "price": price, "ref": ref, "product": product,
              "expiry": expiry, "strike": strike, "right": right, "sl": sl, "risk": risk, "key": key, "broker": broker_id, "mode": mode, "user": u["id"],
@@ -3352,6 +3359,8 @@ def autopilot_loop():
 
 def start_engine():
     threading.Thread(target=autopilot_loop, daemon=True).start()
+    threading.Thread(target=kill_loop, daemon=True).start()
+    threading.Thread(target=journal_loop, daemon=True).start()
     if DATA_BROKER in ("angel", "dhan"):
         FEED["source"] = DATA_BROKER
         threading.Thread(target=feed_loop, daemon=True).start()
@@ -3500,7 +3509,7 @@ def bot_kind(v):
 
 def bot_cfg(uid, kind="scanner"):
     kind = bot_kind(kind)
-    return OPTBOT.setdefault((uid, kind), dict(OPTBOT_DEFAULTS, strategy=kind, **({"max_trades": 2} if kind == "nifty" else {})))
+    return OPTBOT.setdefault((uid, kind), dict(OPTBOT_DEFAULTS, strategy=kind, **({"max_trades": 3} if kind == "nifty" else {})))
 
 
 def bot_log(uid, text, bot=None):
@@ -3626,7 +3635,7 @@ def auto_rows(kind, tf):
 def bot_rules(kind):
     """The rules text shown on the Autopilot page."""
     if kind == "nifty":
-        return AUTO_RULES + " Trades NIFTY only." + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
+        return NC_RULES + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
     tail = f" Everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
     sent = " The trades that go with NIFTY are taken first. If NIFTY is flat, nothing is bought." if AUTO_SENT else ""
     mom = (f"Before {AUTO_MOM_END}, by the NIFTY trend. While NIFTY is down: a PE on stocks in the {AUTO_MOM_TOP} worst sectors of the day and a CE on stocks in the {AUTO_MOM_COUNTER} best sector. "
@@ -3761,7 +3770,7 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False, old_view=Fa
     AUTO_MOVES[kind] = {r["symbol"]: (r.get("ltp_chg", r.get("chg")), r.get("sector")) for r in (tfrows.get("5m") or [])}
     zones = {tf: {r["symbol"]: r.get("side") for r in (tfrows[tf] or []) if (r.get("signal") or "–") != "–" and not r.get("sl_hit")} for tf in AUTO_TFS}   # who is in a BUY or SELL zone on each chart
     for tf in AUTO_TFS:
-        if tf not in AUTO_ENTRY_TFS or (kind == "scanner" and AUTO_MOM and not AUTO_OLD_RULES and not old_view):   # the stock autopilot trades early movers only
+        if tf not in AUTO_ENTRY_TFS or (kind == "scanner" and AUTO_MOM and not AUTO_OLD_RULES and not old_view) or kind == "nifty":   # the stock autopilot trades early movers only; the Nifty one its confluence setups
             continue
         rows = tfrows[tf]
         other = "15m" if tf == "5m" else "5m"
@@ -3844,6 +3853,15 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False, old_view=Fa
                         "note": (f"fresh {tf} {side} signal at {r.get('signal_time')}" if fresh else f"{side} signal from {sdate} still open, back near its trend line on {tf}")
                                 + (f", grade {g} ({cf.get('s')})" if g else "")})
     out.sort(key=lambda c: (c["etype"] != "fresh", -(c["score"] or 0), c["dist"]))
+    if kind == "nifty":
+        r5 = next(iter(tfrows.get("5m") or []), None)
+        if r5:
+            try:
+                out += nc_live_candidates(u, kind, float(r5.get("ltp") or r5["close"]), today, no, manual, day)
+            except Exception as e:
+                no("NIFTY", f"confluence setups could not be checked ({type(e).__name__})")
+        else:
+            no("NIFTY", "no live price yet")
     try:
         have = {(c["symbol"], c["side"]) for c in out}
         extra = [c for c in mom_candidates(u, cfg, kind, tfrows.get("5m"), today, no, manual, day) if (c["symbol"], c["side"]) not in have]
@@ -3924,7 +3942,7 @@ def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False, etype="f
     rec.update(bot_p0=p0, bot_delta=delta, bot_p_sl=p_sl, bot_p_t1=p_t1, bot_p_t2=p_t2, bot_strategy=strategy, bot_etype=etype, bot_grade=c.get("grade"), bot_chg=c.get("chg"), bot_sector=c.get("sector"))
     rec.update(bot=True, bot_right=right, bot_strike=row["strike"], bot_expiry=ch["expiry"], bot_state="open", bot_dir=c["side"], bot_sl=lv["sl"], bot_t1=lv["tp1"], bot_t2=lv["tp2"],
                bot_t3=lv.get("tp3"), bot_t4=lv.get("tp4"), bot_step=0, bot_stop=lv["sl"], bot_tf=c.get("tf", "5m"), bot_sigkey=c.get("sigkey"), bot_entry_under=c["px"],
-               bot_t1_done=False, bot_exit_px=None, bot_reason=None)
+               bot_t1_done=False, bot_exit_px=None, bot_reason=None, bot_tstop_min=c.get("tstop"), bot_t_in=time.time())
     append_log(rec)
     bot_log(u["id"], f"{'LIVE' if mode == 'live' else 'Paper'} BUY {rec['label']} at about {limit:.2f}: {c['symbol']} {c['px']:.2f}, {c['note']}. "
                      f"{c['symbol']} stop {lv['sl']:.2f}, T1 {lv['tp1']:.2f}, T2 {lv['tp2']:.2f}, T3 {lv['tp3']:.2f}, T4 {lv['tp4']:.2f}; option safety stop {p_sl:.2f} (delta {delta:.2f}).", bot=strategy)
@@ -3932,77 +3950,263 @@ def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False, etype="f
     return "done"
 
 
-# ── NIFTY gap continuation: when yesterday's 5 min signal is still open and NIFTY opens the same way, buy a CE or PE at 9:20 ──
-# Entry: yesterday's last 5 min signal is still open (BUY or SELL), NIFTY gaps the same way, and the first 5 min candle closes in that direction.
-# Target: the next classic pivot (from yesterday's high, low and close). Stop: today's open or the nearest pivot behind price, whichever is closer.
-NIFTY_GAP_MIN = float(os.getenv("NIFTY_GAP_MIN", "0.05"))          # percent, the smallest gap that counts
-NIFTY_GAP_MAX = float(os.getenv("NIFTY_GAP_MAX", "1.5"))           # percent, bigger gaps are skipped (often exhausted)
-NIFTY_MIN_TARGET_PCT = float(os.getenv("NIFTY_MIN_TARGET_PCT", "0.15"))
-NIFTY_MIN_SL_PCT = float(os.getenv("NIFTY_MIN_SL_PCT", "0.12"))
-NIFTY_MIN_RR = float(os.getenv("NIFTY_MIN_RR", "1.0"))             # reward must be at least this many times the risk
-NIFTY_LAST_ENTRY = dtime(9, 45)
-
-
 def classic_pivots(h, l, c):
     pp = (h + l + c) / 3
     return {"S3": l - 2 * (h - pp), "S2": pp - (h - l), "S1": 2 * pp - h, "PP": pp, "R1": 2 * pp - l, "R2": pp + (h - l), "R3": h + 2 * (pp - l)}
 
 
-def nifty_plan(prev_side, prev, first, params=None):
-    """prev = (high, low, close) of yesterday. first = (open, high, low, close) of today's first 5 min candle.
-    Returns (plan, None), or (None, why not)."""
-    P = {"gap_min": NIFTY_GAP_MIN, "gap_max": NIFTY_GAP_MAX, "min_tgt": NIFTY_MIN_TARGET_PCT, "min_sl": NIFTY_MIN_SL_PCT, "min_rr": NIFTY_MIN_RR, **(params or {})}
-    if prev_side not in ("BUY", "SELL"):
-        return None, "yesterday's 5 min signal is not open"
-    up = prev_side == "BUY"
-    ph, pl, pc = prev
-    o, h, l, c = first
-    gap = (o / pc - 1) * 100
-    if (up and gap < P["gap_min"]) or (not up and gap > -P["gap_min"]):
-        return None, f"gap {gap:+.2f}% is not in the direction of yesterday's {prev_side} signal"
-    if abs(gap) > P["gap_max"]:
-        return None, f"gap {gap:+.2f}% is bigger than {P['gap_max']:g}%"
-    if (up and not (c > o and c > pc)) or (not up and not (c < o and c < pc)):
-        return None, "the first 5 min candle did not confirm the gap"
-    piv = classic_pivots(ph, pl, pc)
-    entry = c
-    ahead = sorted((v, k) for k, v in piv.items() if (v > entry * (1 + P["min_tgt"] / 100) if up else v < entry * (1 - P["min_tgt"] / 100)))
-    if not ahead:
-        return None, "no pivot level ahead to aim for"
-    tgt, tname = ahead[0] if up else ahead[-1]
-    behind = [("today's open", o)] + [(k, v) for k, v in piv.items() if (v < entry if up else v > entry)]
-    behind = [(k, v) for k, v in behind if abs(entry - v) / entry * 100 >= P["min_sl"] and (v < entry if up else v > entry)]
-    if behind:
-        sname, sl = max(behind, key=lambda kv: kv[1]) if up else min(behind, key=lambda kv: kv[1])
-    else:
-        sname, sl = "a small fixed buffer", entry * (1 - 0.002) if up else entry * (1 + 0.002)
-    risk, reward = abs(entry - sl), abs(tgt - entry)
-    rr = reward / risk if risk else 0
-    if rr < P["min_rr"]:
-        return None, f"reward/risk {rr:.2f} is below {P['min_rr']:g}"
-    tp1 = entry + (tgt - entry) / 2
-    return {"side": prev_side, "entry": round(entry, 2), "sl": round(sl, 2), "tp1": round(tp1, 2), "tp2": round(tgt, 2), "gap": round(gap, 2), "rr": round(rr, 2),
-            "sl_name": sname, "target_name": tname, "pivots": {k: round(v, 2) for k, v in piv.items()}}, None
+# ── NIFTY confluence strategy (the Nifty autopilot's rules): pivot break + trend line + VWAP + RSI, merged with the 15 minute opening-range break ──
+# Both triggers share one direction filter. CE: close above the trend line and above VWAP, RSI 55 to 75. PE: the mirror, RSI 25 to 45. RSI 45 to 55 is chop: no trade.
+# A (pivot): a strong candle closes through the central pivot or R1 (S1 for a PE); entry on a break of its high (low); stop at its low (high).
+# B (opening range): the first 15 minutes (9:15 to 9:30) set the range; a strong 5 min close beyond it between 9:30 and 10:30 is the entry; stop at the middle of the range, or the far end when the range is narrow.
+# Targets: T1 = 1R, T2 = the next pivot if that gives at least 1.5R (otherwise 2R), T3 and T4 trail further. No progress after the time stop: out.
+NC_TSTOP_MIN = int(os.getenv("NIFTY_TSTOP_MIN", "20"))
+NC_RSI_UP, NC_RSI_DN, NC_RSI_HI, NC_RSI_LO = 55.0, 45.0, 75.0, 25.0
+NC_BODY = float(os.getenv("NIFTY_BODY", "0.5"))            # a "strong" candle: body at least this share of its range
+NC_MIN_RISK_PCT = float(os.getenv("NIFTY_MIN_RISK_PCT", "0.08"))
+NC_MAX_RISK_PCT = float(os.getenv("NIFTY_MAX_RISK_PCT", "0.45"))
+NC_NARROW_PCT = float(os.getenv("NIFTY_NARROW_PCT", "0.25"))   # an opening range narrower than this (percent of price) uses its far end as the stop
+NC_ORB_END = "10:30"
+NC_LAST = "14:30"
+NC_CACHE = {}
+NC_RULES = ("Trades NIFTY only, with an at-the-money option. Two entries share one direction filter. A CE needs the NIFTY 5 minute candle to close above its trend line and above VWAP with RSI between 55 and 75; a PE is the mirror, "
+            "RSI between 25 and 45. RSI between 45 and 55 is chop and is skipped. (1) Pivot break: a strong candle closes through the central pivot or R1 (S1 for a PE), the entry is a break of that candle's high (low), "
+            "the stop is its low (high). (2) Opening range: the first 15 minutes set a range; a strong 5 minute close beyond it from 9:30 to 10:30 is the entry, with the stop at the middle of the range "
+            f"(the far end when the range is narrow). T1 is 1 times the risk, T2 the next pivot if that is at least 1.5 times the risk (otherwise 2 times); the stop moves up behind each target. "
+            f"If the trade has not moved in your favour in {NC_TSTOP_MIN} minutes it is closed. Up to 3 trades a day, none on expiry day.")
 
 
-def nifty_inputs(df, today, sym="NIFTY"):
-    """From 5 min candles (IST index): yesterday's signal state and range, and today's first candle. Returns (prev_side, prev, first, None) or (..., why not)."""
-    days = sorted(set(df.index.date))
-    if today not in days:
-        return None, None, None, "today's candles are not available yet"
-    before = [d for d in days if d < today]
+def nc_rsi(c, n=14):
+    d = c.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    r = 100 - 100 / (1 + up / dn.replace(0, np.nan))
+    return r.where(dn > 0, pd.Series(np.where(up > 0, 100.0, 50.0), index=c.index))
+
+
+def nc_vwap_of(d):
+    """Day-anchored VWAP of a candle frame; with no volume (an index) it is the running average of the typical price."""
+    tp = (d["High"] + d["Low"] + d["Close"]) / 3
+    v = d["Volume"].fillna(0) if "Volume" in d.columns else pd.Series(0.0, index=d.index)
+    day = d.index.strftime("%Y-%m-%d")
+    vs = v.groupby(day).cumsum()
+    mean = tp.groupby(day).cumsum() / (tp.groupby(day).cumcount() + 1)
+    return ((tp * v).groupby(day).cumsum() / vs.replace(0, np.nan)).where(vs > 0, mean)
+
+
+def nc_frame(df, vw=None):
+    """Candles with the trend line, RSI and VWAP. VWAP comes from the futures candles when given (and they cover the index candles), else it is approximated from the index itself."""
+    d = bt_norm(df) if df.index.tz is None else df.dropna(subset=["Close", "High", "Low", "Open"]).copy()
+    d["ema"] = d["Close"].ewm(span=20, adjust=False).mean()
+    d["rsi"] = nc_rsi(d["Close"])
+    proxy = True
+    d["vwap"] = nc_vwap_of(d)
+    if vw is not None and len(vw):
+        try:
+            f = bt_norm(vw) if vw.index.tz is None else vw
+            fv = nc_vwap_of(f).reindex(d.index)
+            if fv.notna().mean() >= 0.8:
+                d["vwap"] = fv.ffill().fillna(d["vwap"])
+                proxy = False
+        except Exception:
+            pass
+    d.attrs["vwap_proxy"] = proxy
+    return d
+
+
+def nc_signals(df, day, vw=None, last=NC_LAST):
+    """Every setup of one day from closed 5 minute candles. Returns (setups, why-not counts, frame). A setup: side, trigger name, k (the signal candle), j (the candle that entered, None while a break of the
+    signal candle is still awaited), entry, sl, tps[4], risk. Stops are never wider than NC_MAX_RISK_PCT of the price."""
+    d = nc_frame(df, vw)
+    dates = d.index.strftime("%Y-%m-%d")
+    pos = np.nonzero(dates == day)[0]
+    why = {}
+    if not len(pos):
+        return [], {"no candles for the day": 1}, d
+    before = sorted(set(dates[:pos[0]]))
     if not before:
-        return None, None, None, "no earlier day to compare with"
-    y = before[-1]
-    dy = df[df.index.date == y]
-    prev = (float(dy["High"].max()), float(dy["Low"].min()), float(dy["Close"].iloc[-1]))
-    row = analyse(sym, df[df.index.date <= y].copy(), "5m")
-    side = row["side"] if row and row["signal"] != "–" else None
-    dt = df[df.index.date == today]
-    f = dt.iloc[0]
-    if dt.index[0].time() != dtime(9, 15):
-        return side, prev, None, "the 9:15 candle is missing"
-    return side, prev, (float(f["Open"]), float(f["High"]), float(f["Low"]), float(f["Close"])), None
+        return [], {"no earlier day for the pivots": 1}, d
+    py = d[dates == before[-1]]
+    piv = classic_pivots(float(py["High"].max()), float(py["Low"].min()), float(py["Close"].iloc[-1]))
+    o, h, l, c = (d[x].to_numpy(float) for x in ("Open", "High", "Low", "Close"))
+    ema, rsi, vwp = d["ema"].to_numpy(float), d["rsi"].to_numpy(float), d["vwap"].to_numpy(float)
+    tm = [t.strftime("%H:%M") for t in d.index]
+    end = lambda k: (d.index[k] + pd.Timedelta(minutes=5)).strftime("%H:%M")
+    orb = [k for k in pos if "09:15" <= tm[k] <= "09:25"]
+    orh = max(h[k] for k in orb) if len(orb) == 3 else None
+    orl = min(l[k] for k in orb) if len(orb) == 3 else None
+    used, out = set(), []
+
+    def bump(t):
+        why[t] = why.get(t, 0) + 1
+
+    def risk_ok(side, entry, sl):
+        mn, mx = entry * NC_MIN_RISK_PCT / 100, entry * NC_MAX_RISK_PCT / 100
+        risk = abs(entry - sl)
+        if risk < mn:
+            risk, sl = mn, entry - side * mn
+        if risk > mx:
+            return None
+        return sl, risk
+
+    for k in pos[1:]:
+        if end(k) > last:
+            break
+        rng = h[k] - l[k]
+        if rng <= 0 or abs(c[k] - o[k]) / rng < NC_BODY:
+            continue
+        side = 1 if c[k] > o[k] else -1
+        up = side == 1
+        lv_ok = c[k] > ema[k] and c[k] > vwp[k] if up else c[k] < ema[k] and c[k] < vwp[k]
+        r = rsi[k]
+        rsi_ok = NC_RSI_UP <= r <= NC_RSI_HI if up else NC_RSI_LO <= r <= NC_RSI_DN
+        trig, level = None, None
+        for nm in (("PP", "R1") if up else ("PP", "S1")):   # A: a close through a pivot
+            L = piv[nm]
+            if (c[k - 1] <= L < c[k]) if up else (c[k - 1] >= L > c[k]):
+                if trig is None or (up and L > level) or (not up and L < level):
+                    trig, level, lname = "A", L, nm
+        if trig is None and orh is not None and "09:30" <= tm[k] <= "10:25":   # B: the opening range
+            Lb = orh if up else orl
+            if (c[k - 1] <= Lb < c[k]) if up else (c[k - 1] >= Lb > c[k]):
+                trig, level, lname = "B", Lb, "opening range"
+        if trig is None:
+            continue
+        if not lv_ok:
+            bump("a break with price on the wrong side of the trend line or VWAP")
+            continue
+        if not rsi_ok:
+            bump("a break in the RSI chop zone (45 to 55) or past an extreme" if NC_RSI_DN < r < NC_RSI_UP else "a break with RSI too weak or already stretched (above 75 or below 25)")
+            continue
+        key = (trig, side, lname)
+        if key in used:
+            continue
+        used.add(key)
+        if trig == "A":
+            tg = h[k] if up else l[k]
+            j, entry = None, tg
+            for m in range(k + 1, min(k + 3, pos[-1] + 1)):
+                if (h[m] >= tg) if up else (l[m] <= tg):
+                    j, entry = m, (max(tg, o[m]) if up else min(tg, o[m]))
+                    break
+            sl0 = l[k] if up else h[k]
+            name = f"{'above' if up else 'below'} {lname} ({level:.0f})"
+        else:
+            j, entry = k, c[k]
+            mid = (orh + orl) / 2
+            narrow = (orh - orl) / entry * 100 < NC_NARROW_PCT
+            sl0 = (orl if up else orh) if narrow else mid
+            name = f"opening range {'high' if up else 'low'} ({level:.0f})"
+        rk = risk_ok(side, entry, sl0)
+        if not rk:
+            bump("a stop wider than the allowed size")
+            continue
+        sl, risk = rk
+        if trig == "A":
+            ahead = [v for v in piv.values() if (v - entry) * side / risk >= 1.5]
+            t2 = (min(ahead) if up else max(ahead)) if ahead else entry + side * 2 * risk
+        else:
+            t2 = entry + side * 2 * risk
+        tps = [entry + side * risk, t2, t2 + side * risk, t2 + side * 2 * risk]
+        out.append({"side": "BUY" if up else "SELL", "dir": side, "trigger": "pivot break" if trig == "A" else "opening range break", "name": name, "k": int(k), "j": None if j is None else int(j),
+                    "entry": float(entry), "sl": float(sl), "tps": [float(x) for x in tps], "risk": float(risk), "time": end(k), "date": day,
+                    "rsi": round(float(r), 1)})
+    out.sort(key=lambda s: (s["j"] if s["j"] is not None else 10 ** 9, s["k"]))
+    return out, why, d
+
+
+def nc_walk(o, h, l, c, idx, j, side, entry, sl, tps, tstop_bars, sq):
+    """From the entry candle on: stop first, then T1 to T4 with the stop moving up behind them, a time stop when it has gone nowhere, and the square-off. Returns (exit index, exit price, reason)."""
+    n, risk, step, stop, day = len(c), abs(entry - sl), 0, sl, idx[j].date()
+    for k in range(j + 1, n):
+        if idx[k].date() != day:
+            return k - 1, float(c[k - 1]), "square-off"
+        if idx[k].time() >= sq:
+            return k, float(o[k]), "square-off"
+        if (side == 1 and l[k] <= stop) or (side == -1 and h[k] >= stop):
+            px = min(stop, o[k]) if side == 1 else max(stop, o[k])
+            return k, float(px), "stop-loss" if step == 0 else ("back to the entry after T1" if step == 1 else f"back to the stop after T{step}")
+        while step < 4 and ((h[k] >= tps[step]) if side == 1 else (l[k] <= tps[step])):
+            step += 1
+            stop = entry if step == 1 else tps[step - 2]
+        if step >= 4:
+            return k, float(tps[3]), "T4 reached"
+        if step == 0 and tstop_bars and k - j >= tstop_bars and (c[k] - entry) * side < 0.25 * risk:
+            return k, float(c[k]), f"time stop ({tstop_bars * 5} minutes without progress)"
+    return n - 1, float(c[n - 1]), "end of data"
+
+
+def nc_live_data():
+    """NIFTY 5 minute candles (closed ones) and the futures candles for VWAP, cached for 40 seconds."""
+    hit = NC_CACHE.get("d")
+    if hit and time.time() - hit[0] < 40:
+        return hit[1], hit[2]
+    df, vw = None, None
+    if use_dhan():
+        frames, _ = dhan_frames(["NIFTY"], "5m", 7)
+        df = frames.get("NIFTY")
+        try:
+            vw = dhan_candles("NIFTY", "5m", 7, fut=True)
+        except Exception:
+            vw = None
+    else:
+        df = yahoo_frames(["NIFTY"], "5m", 7).get("NIFTY")
+    if df is not None and not df.empty:
+        df = drop_forming(bt_norm(df), "5m")
+        if vw is not None and len(vw):
+            vw = bt_norm(vw)
+    NC_CACHE["d"] = (time.time(), df, vw)
+    return df, vw
+
+
+def nc_live_candidates(u, kind, px, today, no, manual=False, day=False):
+    """The confluence setups that can be bought right now. px = NIFTY's live price."""
+    try:
+        df, vw = nc_live_data()
+    except Exception as e:
+        no("NIFTY", f"candles could not be read ({type(e).__name__})")
+        return []
+    if df is None or df.empty:
+        no("NIFTY", "no 5 minute candles yet")
+        return []
+    setups, whys, d = nc_signals(df, today, vw)
+    if d.attrs.get("vwap_proxy"):
+        no("VWAP", "using an approximation from the index itself (no futures candles)")
+    for t, n in whys.items():
+        no("filter", f"{n} x {t}")
+    lastk = len(d) - 1
+    out = []
+    for s in setups:
+        ago = lastk - s["k"]
+        passed = None
+        if ago > (2 if s["j"] is None else 1) and not day:
+            continue
+        up = s["dir"] == 1
+        if s["j"] is None and ago > 2:
+            passed = "the break of the signal candle did not come in time"
+        elif s["j"] is None and not ((px >= s["entry"]) if up else (px <= s["entry"])):
+            if not day:
+                no("NIFTY", f"{s['side']} {s['name']}: waiting for a break of {s['entry']:.2f}")
+                continue
+            passed = "waiting for the break"
+        elif not (s["sl"] < px < s["tps"][0] if up else s["tps"][0] < px < s["sl"]):
+            passed = "the price is already past T1 or the stop"
+        if passed and not day:
+            no("NIFTY", f"{s['side']} {s['name']}: {passed}")
+            continue
+        skey = f"5m {s['time']} {s['side']} {s['trigger']}"
+        key = (u["id"], kind, "NIFTY", "5m", f"{s['time']} {s['trigger']}", s["side"])
+        with ORDER_LOCK:
+            done = any(o_.get("user") == u["id"] and o_.get("bot") and o_["symbol"] == "NIFTY" and o_.get("date") == today and o_.get("bot_sigkey") == skey for o_ in ORDERS)
+        if done:
+            AUTO_SEEN[key] = True
+        if (AUTO_SEEN.get(key) or done) and not manual:
+            continue
+        lv = {"sl": s["sl"], "tp1": s["tps"][0], "tp2": s["tps"][1], "tp3": s["tps"][2], "tp4": s["tps"][3]}
+        out.append({"symbol": "NIFTY", "side": s["side"], "px": px, "levels": lv, "tf": "5m", "etype": "fresh", "grade": None, "score": None, "dist": 0.0, "key": key, "sigkey": skey,
+                    "taken": bool(done), "time": s["time"], "status": "taken" if done else "passed" if passed else "open", "reason": passed, "tstop": NC_TSTOP_MIN,
+                    "note": f"{s['trigger']} {s['side']} {s['name']} at {s['time']}, RSI {s['rsi']:.0f}"})
+    return out
 
 
 def bot_exit(u, pos, reason):
@@ -4075,6 +4279,11 @@ def bot_manage(u, pos):
             bot_log(u["id"], f"{pos['label']}: T{step} reached ({px:.2f}), stop moved to {stop:.2f}" + (" (the entry)." if step == 1 else f" (T{step - 1})."), bot=kind)
             if step >= len(lv):
                 return bot_exit(u, pos, f"T{step} reached, all targets done")
+        tm_ = pos.get("bot_tstop_min")
+        if tm_ and step == 0 and time.time() - float(pos.get("bot_t_in") or 0) >= tm_ * 60:
+            r_ = abs(pos["bot_entry_under"] - pos["bot_sl"])
+            if (px - pos["bot_entry_under"]) * (1 if up else -1) < 0.25 * r_:
+                return bot_exit(u, pos, f"time stop: no progress in {tm_} minutes")
     ltp = bot_opt_ltp(u, pos)
     if ltp and ltp <= pos["bot_p_sl"]:
         return bot_exit(u, pos, "option safety stop")
@@ -4526,43 +4735,38 @@ def bt_open_after(a, j, last):
     return True, side
 
 
-def bt_gap_trades(sym, df, interval, p):
-    """Gap continuation: yesterday's signal still open, today gaps the same way and the first candle confirms: enter at its close, target the next pivot."""
+def bt_nc_trades(sym, df, interval, p):
+    """The Nifty confluence strategy (pivot break + trend line + VWAP + RSI, and the opening-range break) over every day in the candles, one trade at a time, up to 3 a day."""
+    if interval != "5m":
+        return [], f"{sym}: the confluence strategy needs 5 minute candles"
     df = bt_norm(df) if df.index.tz is None else df
-    if interval == "1d":
-        return [], f"{sym}: gap continuation needs 5 or 15 minute candles"
     if len(df) < MIN_BARS:
         return [], f"{sym}: only {len(df)} candles, at least {MIN_BARS} are needed"
-    a, idx = bt_arrays(df), df.index
-    days = sorted(set(idx.date))
-    sig = np.nonzero(a["buy"] | a["sell"])[0]
-    params = {"gap_max": p["gap_max"], "min_tgt": p["min_tgt"], "min_sl": p["min_sl"]}
+    a = {k: df[c].to_numpy(float) for k, c in (("o", "Open"), ("h", "High"), ("l", "Low"), ("c", "Close"))}
+    idx = df.index
+    days = sorted(set(df.index.strftime("%Y-%m-%d")))
     out, whys = [], {}
+    ef, et = p["entry_from"].strftime("%H:%M"), p["entry_to"].strftime("%H:%M")
     for d in days[1:]:
-        before = [x for x in days if x < d]
-        y = before[-1]
-        iy = np.nonzero(idx.date == y)[0]
-        idd = np.nonzero(idx.date == d)[0]
-        if not len(iy) or not len(idd) or idx[idd[0]].time() != dtime(9, 15):
+        try:
+            sets, why, _ = nc_signals(df, d, None, et)
+        except Exception:
             continue
-        last = int(iy[-1])
-        js = sig[sig <= last]
-        side = None
-        if len(js):
-            alive, sd_ = bt_open_after(a, int(js[-1]), last)
-            if alive or last - int(js[-1]) <= FRESH_BARS:
-                side = "BUY" if sd_ == 1 else "SELL"
-        prev = (float(a["h"][iy].max()), float(a["l"][iy].min()), float(a["c"][last]))
-        f = int(idd[0])
-        plan, why = nifty_plan(side, prev, (float(a["o"][f]), float(a["h"][f]), float(a["l"][f]), float(a["c"][f])), params)
-        if not plan:
-            whys[re.sub(r"[-+]?\d+(\.\d+)?", "#", why)] = whys.get(re.sub(r"[-+]?\d+(\.\d+)?", "#", why), 0) + 1
-            continue
-        sd_ = 1 if plan["side"] == "BUY" else -1
-        k, px, w = bt_walk(a, idx, f, f + 1, sd_, plan["entry"], plan["sl"], plan["tp2"], True, p["squareoff"])
-        out.append({"sym": sym, "side": sd_, "t_in": idx[f], "t_out": idx[k], "entry": plan["entry"], "exit": px, "risk": abs(plan["entry"] - plan["sl"]),
-                    "sl": plan["sl"], "tp": plan["tp2"], "why": w, "kind": "gap"})
-    return out, (f"{sym}: {sum(whys.values())} days had no trade, mostly: " + max(whys, key=whys.get) if whys and not out else None)
+        for k_, n_ in why.items():
+            whys[k_] = whys.get(k_, 0) + n_
+        free, n = -1, 0
+        for s_ in sets:
+            j = s_["j"]
+            if j is None or j <= free or n >= 3 or idx[j].strftime("%H:%M") < ef or (not p.get("sell_ok", True) and s_["dir"] == -1):
+                continue
+            kx, px, w = nc_walk(a["o"], a["h"], a["l"], a["c"], idx, j, s_["dir"], s_["entry"], s_["sl"], s_["tps"], NC_TSTOP_MIN // 5, p["squareoff"])
+            free, n = kx, n + 1
+            out.append({"sym": sym, "side": s_["dir"], "t_in": idx[j], "t_out": idx[kx], "entry": s_["entry"], "exit": px, "risk": s_["risk"], "sl": s_["sl"], "tp": s_["tps"][3], "why": w,
+                        "kind": s_["trigger"]})
+    note = None
+    if not out:
+        note = f"{sym}: no setups in the period" + (f"; most common reason: {max(whys, key=whys.get)}" if whys else "")
+    return out, note
 
 
 def bs_price(S, K, T, sig, right):
@@ -4742,7 +4946,7 @@ def bt_run(params, candles, trades_in=None):
     trades, problems = list(trades_in or []), []
     for sym, df in candles.items():
         try:
-            tr, why = (bt_gap_trades if p["strategy"] == "gap" else bt_signal_trades)(sym, df, p["interval"], p)
+            tr, why = {"confluence": bt_nc_trades}.get(p["strategy"], bt_signal_trades)(sym, df, p["interval"], p)
         except Exception as e:
             tr, why = [], f"{sym}: could not be tested ({type(e).__name__})"
         trades += tr
@@ -4786,9 +4990,11 @@ def bt_params(payload):
         kind = str(payload.get("kind", "stock"))
         if kind not in ("stock", "futures", "options"):
             raise ValueError("Choose stock, futures or options")
-        strategy = str(payload.get("strategy", "signal"))
-        if strategy not in ("signal", "gap", "movers"):
-            raise ValueError("Choose the signal, the gap continuation or the early movers strategy")
+        strategy = str(payload.get("strategy", "confluence"))
+        if strategy not in ("signal", "movers", "confluence"):
+            raise ValueError("Choose the Nifty confluence, the signal or the early movers strategy")
+        if strategy == "confluence":
+            interval = "5m"
         raw = payload.get("symbols", "")
         syms = [s.strip().upper() for s in (raw.split(",") if isinstance(raw, str) else raw) if str(s).strip()]
         syms = list(dict.fromkeys(syms))
@@ -4810,13 +5016,10 @@ def bt_params(payload):
              "leverage": num("leverage", 1, 20, 5 if interval != "1d" else 1), "margin_pct": num("margin_pct", 3, 100, 12),
              "lot_size": int(num("lot_size", 0, 100000, 0)) or None, "iv": num("iv", 5, 150, 15), "dte": num("dte", 1, 60, 4 if "NIFTY" in "".join(syms) else 15),
              "brokerage": num("brokerage", 0, 500, 20), "other_pct": num("other_pct", 0, 1, 0.05), "slippage": num("slippage", 0, 2, 0.03),
-             "min_grade": str(payload.get("min_grade", "any")) if str(payload.get("min_grade", "any")) in GRADE_NEED else "any",
-             "gap_max": num("gap_max", 0.2, 5, 1.5 if all(s in INDEX_YF for s in syms) else 2.0), "min_tgt": NIFTY_MIN_TARGET_PCT, "min_sl": NIFTY_MIN_SL_PCT}
-        if strategy == "gap" and interval == "1d":
-            raise ValueError("Gap continuation needs a 5 or 15 minute timeframe")
+             "min_grade": str(payload.get("min_grade", "any")) if str(payload.get("min_grade", "any")) in GRADE_NEED else "any"}
         if interval == "1d" and p["intraday"]:
             p["intraday"] = False
-        if strategy in ("gap", "movers"):
+        if strategy in ("movers", "confluence"):
             p["intraday"] = True
         return p, None
     except ValueError as e:
@@ -7614,8 +7817,11 @@ def paper_option_prices(u, orders):
 
 @app.get("/api/portfolio")
 def api_portfolio(request: Request):
+    return portfolio_data(request.state.user)
+
+
+def portfolio_data(u):
     """Positions with live profit and loss, and the broker balance. Live mode reads the broker; paper mode is worked out from paper orders."""
-    u = request.state.user
     mode = user_mode(u)[0]
     pos, funds, errors = [], [], []
     if mode == "live":
@@ -7672,6 +7878,373 @@ def api_portfolio(request: Request):
     return {"mode": mode, "positions": pos, "totals": tot, "funds": funds, "errors": errors}
 
 
+# ── Kill switch: stops new orders for the rest of the day, by hand, by a daily loss limit, or for everyone (admin). Exits stay open. ──
+KILL = {"loaded": False, "by": {}}   # scope ("all" or "u<id>") -> {"day", "reason", "auto", "ts"}
+KILL_PNL = {}                        # user id -> (time, today's result) from the last loss-limit check
+KILL_SECONDS = int(os.getenv("KILL_SECONDS", "30"))
+
+
+def kill_all_rows():
+    if not KILL["loaded"]:
+        try:
+            KILL["by"] = {r["scope"]: r for r in q("SELECT * FROM kill WHERE day=?", (ist_now().strftime("%Y-%m-%d"),))}
+            KILL["loaded"] = True
+        except Exception as e:
+            print("kill switch load:", e, flush=True)
+    return KILL["by"]
+
+
+def kill_for(uid):
+    """The stop that applies to this person today, or None. A stop from an earlier day no longer counts."""
+    today = ist_now().strftime("%Y-%m-%d")
+    by = kill_all_rows()
+    for scope in ("all", f"u{uid}"):
+        k = by.get(scope)
+        if k and k.get("day") == today:
+            return {**k, "scope": scope}
+    return None
+
+
+def kill_set(scope, reason, auto):
+    rec = {"scope": scope, "day": ist_now().strftime("%Y-%m-%d"), "reason": reason[:300], "auto": 1 if auto else 0, "ts": ist_now().strftime("%H:%M:%S")}
+    x("INSERT INTO kill(scope, day, reason, auto, ts) VALUES(?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET day=excluded.day, reason=excluded.reason, auto=excluded.auto, ts=excluded.ts",
+      (rec["scope"], rec["day"], rec["reason"], rec["auto"], rec["ts"]))
+    kill_all_rows()
+    KILL["by"][scope] = rec
+
+
+def kill_clear(scope):
+    x("DELETE FROM kill WHERE scope=?", (scope,))
+    kill_all_rows()
+    KILL["by"].pop(scope, None)
+
+
+def kill_reduces(uid, mode, label, side, units):
+    """True when the order only closes part or all of a position this dashboard opened today."""
+    with ORDER_LOCK:
+        net = sum((o["qty"] if o["side"] == "BUY" else -o["qty"]) for o in ORDERS
+                  if o.get("user") == uid and o.get("mode") == mode and o.get("label") == label and o.get("status") == "complete" and o.get("date") == ist_now().strftime("%Y-%m-%d"))
+    return (side == "SELL" and net > 0 and units <= net) or (side == "BUY" and net < 0 and units <= -net)
+
+
+def kill_block(uid, mode, label, side, units):
+    k = kill_for(uid)
+    if not k or kill_reduces(uid, mode, label, side, units):
+        return None
+    return ("Trading is stopped for everyone today: " if k["scope"] == "all" else "Trading is stopped for you today: ") + k["reason"] + " Orders that close a position you opened today are still allowed."
+
+
+def kill_pause_bots(uid, why):
+    for kind in BOT_KINDS:
+        cfg = bot_cfg(uid, kind)
+        if cfg["mode"] != "off" and not cfg["paused"]:
+            cfg["paused"] = True
+            bot_log(uid, "Paused by the kill switch: " + why, bot=kind)
+
+
+def kill_trip(uid, reason, auto=False, exit_bots=False):
+    kill_set(f"u{uid}", reason, auto)
+    kill_pause_bots(uid, reason)
+    if exit_bots:
+        u = user_by_id(uid)
+        if u:
+            for kind in BOT_KINDS:
+                for pos in bot_positions(uid, kind=kind):
+                    try:
+                        bot_exit(u, pos, "kill switch")
+                    except Exception as e:
+                        print("kill switch exit:", e, flush=True)
+    try:
+        notify_user(uid, "Trading stopped for today", reason + " New orders are blocked until tomorrow. Orders that close today's positions still work.")
+    except Exception:
+        pass
+
+
+def kill_limit(uid):
+    r = q("SELECT daily_loss FROM kill_cfg WHERE user_id=?", (uid,))
+    return float(r[0]["daily_loss"]) if r else 0.0
+
+
+def kill_check():
+    """A person whose result today has gone past their daily loss limit is stopped for the rest of the day."""
+    today = ist_now().strftime("%Y-%m-%d")
+    for r in q("SELECT user_id, daily_loss FROM kill_cfg WHERE daily_loss>0"):
+        uid, lim = r["user_id"], float(r["daily_loss"])
+        if kill_for(uid):
+            continue
+        with ORDER_LOCK:
+            if not any(o.get("user") == uid and o.get("date") == today for o in ORDERS):
+                continue
+        u = user_by_id(uid)
+        if not u:
+            continue
+        pnl = portfolio_data(u)["totals"]["pnl"]
+        KILL_PNL[uid] = (time.time(), pnl)
+        if pnl <= -lim:
+            kill_trip(uid, f"Your daily loss limit of ₹{lim:,.0f} was reached (today's result is ₹{pnl:,.0f}).", auto=True)
+
+
+def kill_loop():
+    while True:
+        time.sleep(KILL_SECONDS)
+        try:
+            kill_check()
+        except Exception as e:
+            print("kill loop:", type(e).__name__, str(e)[:100], flush=True)
+
+
+@app.get("/api/kill")
+def api_kill(request: Request):
+    u = request.state.user
+    k = kill_for(u["id"])
+    pnl = KILL_PNL.get(u["id"])
+    return {"active": bool(k), "scope": k["scope"] if k else None, "reason": k["reason"] if k else None, "auto": bool(k and k["auto"]), "since": k["ts"] if k else None,
+            "can_reset": bool(k and k["scope"] != "all" and not k["auto"]), "need_pin": bool(u["pin_hash"]), "limit": kill_limit(u["id"]),
+            "pnl": None if not pnl or time.time() - pnl[0] > 600 else round(pnl[1], 2)}
+
+
+@app.post("/api/kill")
+def api_kill_post(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    action = str(payload.get("action", ""))
+    k = kill_for(u["id"])
+    if action == "trip":
+        if k:
+            return {"error": "Trading is already stopped for today."}
+        kill_trip(u["id"], "You stopped trading for today.", exit_bots=bool(payload.get("exit_bots")))
+    elif action == "reset":
+        if not k:
+            return {"ok": True}
+        if k["scope"] == "all":
+            return {"error": "The administrator stopped trading for everyone today. Only the administrator can release it."}
+        if k["auto"]:
+            return {"error": "Your daily loss limit was reached, so trading stays stopped until tomorrow. This is on purpose. Your administrator can release it if needed."}
+        err = pin_error(u, payload.get("pin"), True) if u["pin_hash"] else None
+        if err:
+            return {"error": err}
+        kill_clear(f"u{u['id']}")
+    elif action == "limit":
+        try:
+            lim = float(payload.get("limit") or 0)
+        except (TypeError, ValueError):
+            return {"error": "Enter the limit as a number of rupees, or 0 to switch it off."}
+        if not (0 <= lim <= 1e8):
+            return {"error": "Enter a limit between 0 and 10 crore."}
+        x("INSERT INTO kill_cfg(user_id, daily_loss) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET daily_loss=excluded.daily_loss", (u["id"], lim))
+    else:
+        return {"error": "Unknown action."}
+    return api_kill(request)
+
+
+@app.get("/api/admin/kill")
+def api_admin_kill(request: Request):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    by = kill_all_rows()
+    names = {r["id"]: r["username"] for r in q("SELECT id, username FROM users")}
+    today = ist_now().strftime("%Y-%m-%d")
+    return {"all": by.get("all") if by.get("all") and by["all"]["day"] == today else None,
+            "users": [{"id": int(sc[1:]), "name": names.get(int(sc[1:]), "?"), "reason": k["reason"], "auto": bool(k["auto"]), "since": k["ts"]}
+                      for sc, k in by.items() if sc != "all" and k["day"] == today]}
+
+
+@app.post("/api/admin/kill")
+def api_admin_kill_post(request: Request, payload: dict = Body(...)):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    action = str(payload.get("action", ""))
+    if action == "trip_all":
+        kill_set("all", "The administrator stopped trading for everyone." if not payload.get("reason") else "The administrator stopped trading: " + str(payload["reason"])[:200], False)
+        for (uid, _kind) in list(OPTBOT):
+            kill_pause_bots(uid, "stopped for everyone by the administrator")
+        for r in q("SELECT id FROM users WHERE active=1"):
+            try:
+                notify_user(r["id"], "Trading stopped for today", "The administrator stopped trading for everyone. New orders are blocked until tomorrow.")
+            except Exception:
+                pass
+    elif action == "reset_all":
+        kill_clear("all")
+    elif action == "reset_user":
+        try:
+            uid = int(payload.get("user_id"))
+        except (TypeError, ValueError):
+            return {"error": "Choose a person."}
+        kill_clear(f"u{uid}")
+    else:
+        return {"error": "Unknown action."}
+    return api_admin_kill(request)
+
+
+# ── Trade journal: every finished trade, from the order log, kept for good with a note and a tag ──
+JSYNC = {"t": 0.0}
+JOURNAL_DAYS = {"today": 0, "7d": 7, "30d": 30, "90d": 90, "all": None}
+
+
+def journal_trades(recs):
+    """Finished trades from order records. An autopilot trade is one record with its exit; other orders are matched buys against sells by instrument and day."""
+    out, groups = [], {}
+    for o in recs:
+        if o.get("bot"):
+            pnl = bot_pnl(o) if o.get("bot_state") == "closed" else None
+            if pnl is None or o.get("bot_exit"):
+                continue
+            ent, ex = o.get("avg_price") or o["price"], o.get("bot_exit_px")
+            out.append({"id": "b:" + str(o["id"]), "user": o["user"], "day": o["date"], "time": o.get("time", ""), "label": o["label"], "symbol": o.get("symbol"), "dir": "LONG", "qty": o["qty"],
+                        "entry": round(ent, 2), "exit": round(ex, 2), "pnl": pnl, "pnl_pct": round(pnl / (ent * o["qty"]) * 100, 2) if ent and o["qty"] else None, "mode": o["mode"], "source": "Autopilot"})
+            continue
+        if o.get("status") != "complete" or not o.get("qty"):
+            continue
+        groups.setdefault((o["user"], o["mode"], o["label"], o["date"]), []).append(o)
+    for (uid, mode, label, day), g in groups.items():
+        g.sort(key=lambda o: o.get("time", ""))
+        bq = sum(o["qty"] for o in g if o["side"] == "BUY")
+        sq = sum(o["qty"] for o in g if o["side"] == "SELL")
+        m = min(bq, sq)
+        if m <= 0:
+            continue
+        px = lambda o: o.get("avg_price") or o["price"]
+        ba = sum(o["qty"] * px(o) for o in g if o["side"] == "BUY") / bq
+        sa = sum(o["qty"] * px(o) for o in g if o["side"] == "SELL") / sq
+        long_ = g[0]["side"] == "BUY"
+        ent, ex = (ba, sa) if long_ else (sa, ba)
+        pnl = round(m * (sa - ba), 2)
+        out.append({"id": f"m:{uid}:{mode}:{label}:{day}", "user": uid, "day": day, "time": g[-1].get("time", ""), "label": label, "symbol": g[0].get("symbol"), "dir": "LONG" if long_ else "SHORT",
+                    "qty": m, "entry": round(ent, 2), "exit": round(ex, 2), "pnl": pnl, "pnl_pct": round(pnl / (ent * m) * 100, 2) if ent else None, "mode": mode, "source": "Order ticket"})
+    return out
+
+
+def journal_sync(force=False):
+    if not force and time.time() - JSYNC["t"] < 60:
+        return
+    JSYNC["t"] = time.time()
+    since = (ist_now() - timedelta(days=14)).strftime("%Y-%m-%d")
+    latest = {}
+    try:
+        lines = [r["rec"] for r in q("SELECT rec FROM order_log WHERE day>=? ORDER BY n", (since,))] if USE_PG else (open(ORDER_LOG) if os.path.exists(ORDER_LOG) else [])
+        for ln in lines:
+            try:
+                o = json.loads(ln)
+            except ValueError:
+                continue
+            if (o.get("date") or "") >= since and o.get("id"):
+                latest[o["id"]] = o
+    except Exception as e:
+        print("journal read:", e, flush=True)
+    with ORDER_LOCK:
+        for o in ORDERS:
+            latest[o["id"]] = dict(o)
+    for t in journal_trades(latest.values()):
+        try:
+            x("INSERT INTO journal(id, user_id, day, data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (t["id"], t["user"], t["day"], json.dumps(t)))
+        except Exception as e:
+            print("journal write:", e, flush=True)
+
+
+def journal_loop():
+    while True:
+        time.sleep(1800)
+        try:
+            journal_sync(True)
+        except Exception as e:
+            print("journal loop:", e, flush=True)
+
+
+def journal_stats(trades):
+    """trades: oldest first."""
+    n = len(trades)
+    if not n:
+        return {"n": 0}
+    pn = [t["pnl"] for t in trades]
+    w, l_ = [v for v in pn if v > 0], [v for v in pn if v <= 0]
+    cum, peak, dd, curve = 0.0, 0.0, 0.0, []
+    for v in pn:
+        cum += v
+        peak = max(peak, cum)
+        dd = max(dd, peak - cum)
+        curve.append(round(cum, 2))
+    grp = lambda key: sorted(({"k": k, "n": len(v), "win": round(sum(1 for t in v if t["pnl"] > 0) / len(v) * 100), "pnl": round(sum(t["pnl"] for t in v), 2)}
+                              for k, v in _group(trades, key).items()), key=lambda r: -r["n"])
+    return {"n": n, "total": round(sum(pn), 2), "win_pct": round(len(w) / n * 100, 1), "avg_win": round(sum(w) / len(w), 2) if w else None,
+            "avg_loss": round(sum(l_) / len(l_), 2) if l_ else None, "pf": round(sum(w) / -sum(l_), 2) if l_ and sum(l_) < 0 else None,
+            "expect": round(sum(pn) / n, 2), "best": round(max(pn), 2), "worst": round(min(pn), 2), "max_dd": round(dd, 2), "curve": curve[-300:],
+            "by_source": grp(lambda t: t["source"]), "by_tag": grp(lambda t: t.get("tag") or "(no tag)"),
+            "by_day": grp(lambda t: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][datetime.strptime(t["day"], "%Y-%m-%d").weekday()])}
+
+
+def _group(trades, key):
+    out = {}
+    for t in trades:
+        out.setdefault(key(t), []).append(t)
+    return out
+
+
+@app.get("/api/journal")
+def api_journal(request: Request, period: str = "30d", mode: str = "all"):
+    u = request.state.user
+    journal_sync()
+    span = JOURNAL_DAYS.get(period, 30)
+    args, sql = [u["id"]], "SELECT id, data, note, tag FROM journal WHERE user_id=?"
+    if span is not None:
+        args.append((ist_now() - timedelta(days=span)).strftime("%Y-%m-%d"))
+        sql += " AND day>=?"
+    trades = []
+    for r in q(sql, tuple(args)):
+        try:
+            t = json.loads(r["data"])
+        except ValueError:
+            continue
+        t.update(id=r["id"], note=r["note"], tag=r["tag"])
+        if mode in ("paper", "live", "hand") and ((t["mode"] == "hand") != (mode == "hand") or (mode != "hand" and t["mode"] != mode)):
+            continue
+        trades.append(t)
+    trades.sort(key=lambda t: (t["day"], t.get("time", ""), t["id"]))
+    return {"stats": journal_stats(trades), "trades": trades[::-1][:300], "total": len(trades), "period": period, "mode": mode}
+
+
+@app.put("/api/journal/note")
+def api_journal_note(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    jid = str(payload.get("id", ""))
+    if not q("SELECT id FROM journal WHERE id=? AND user_id=?", (jid, u["id"])):
+        return {"error": "That trade was not found."}
+    x("UPDATE journal SET note=?, tag=? WHERE id=? AND user_id=?", (str(payload.get("note", ""))[:500], str(payload.get("tag", "")).strip()[:30], jid, u["id"]))
+    return {"ok": True}
+
+
+@app.post("/api/journal/add")
+def api_journal_add(request: Request, payload: dict = Body(...)):
+    """A trade made outside this dashboard, such as shares bought here and sold in the broker app."""
+    u = request.state.user
+    try:
+        day = datetime.strptime(str(payload.get("day", "")), "%Y-%m-%d").date()
+        qty, ent, ex = float(payload.get("qty")), float(payload.get("entry")), float(payload.get("exit"))
+    except (TypeError, ValueError):
+        return {"error": "Enter the date as YYYY-MM-DD, and the quantity and both prices as numbers."}
+    label = re.sub(r"\s+", " ", str(payload.get("label", ""))).strip()[:40]
+    side = "SHORT" if str(payload.get("dir", "")).upper() == "SHORT" else "LONG"
+    if not label or not (0 < qty <= 1e8) or ent <= 0 or ex <= 0:
+        return {"error": "Enter an instrument, a quantity above zero and prices above zero."}
+    if day > ist_now().date() or day < ist_now().date() - timedelta(days=800):
+        return {"error": "The date must be in the past two years and not in the future."}
+    pnl = round((ex - ent) * qty * (1 if side == "LONG" else -1), 2)
+    jid = "h:" + secrets.token_hex(6)
+    t = {"id": jid, "user": u["id"], "day": day.isoformat(), "time": "", "label": label, "symbol": label.split()[0].upper(), "dir": side, "qty": qty, "entry": round(ent, 2), "exit": round(ex, 2),
+         "pnl": pnl, "pnl_pct": round(pnl / (ent * qty) * 100, 2), "mode": "hand", "source": "By hand"}
+    x("INSERT INTO journal(id, user_id, day, data, note, tag) VALUES(?,?,?,?,?,?)", (jid, u["id"], t["day"], json.dumps(t), str(payload.get("note", ""))[:500], str(payload.get("tag", "")).strip()[:30]))
+    return {"ok": True, "id": jid}
+
+
+@app.delete("/api/journal/{jid}")
+def api_journal_delete(request: Request, jid: str):
+    u = request.state.user
+    if not jid.startswith("h:"):
+        return {"error": "Only trades you added by hand can be deleted. The rest come from your orders."}
+    x("DELETE FROM journal WHERE id=? AND user_id=?", (jid, u["id"]))
+    return {"ok": True}
+
+
 PAST_BOT = {}   # (user id, bot) -> (time, trades from earlier days). Read from the order log at most once a minute.
 PAST_BOT_DAYS = int(os.getenv("PAST_BOT_DAYS", "30"))
 
@@ -7720,7 +8293,7 @@ def bot_view(u, kind="scanner", old=False):
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
     return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
-            "rules": bot_rules(kind), "old_rules": kind == "nifty" or AUTO_OLD_RULES or not AUTO_MOM,
+            "rules": bot_rules(kind), "old_rules": kind != "nifty" and (AUTO_OLD_RULES or not AUTO_MOM),
             "signals": manual_signals(u, kind, old),
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
 
@@ -7849,6 +8422,12 @@ def replay_load(kind, set_progress):
                 errors.append(f"{sname} {tf}: {e}")
                 continue
             if S:
+                if sname == "NIFTY" and tf == "5m" and kind == "nifty":
+                    S["nc_df"] = df
+                    try:
+                        S["nc_vw"] = dhan_candles("NIFTY", "5m", _days(PERIODS["5m"]), fut=True) if use_dhan() else None
+                    except Exception:
+                        S["nc_vw"] = None
                 data.setdefault(sname, {})[tf] = S
     days = sorted({d for v in data.values() if "5m" in v for d in v["5m"]["dates"]})[-30:]
     REPLAY_DATA[kind] = hit = (time.time(), data, errors, days)
@@ -7907,8 +8486,63 @@ def replay_mom_cands(data, syms, day, T, endt):
     return out, None
 
 
+def replay_run_nc(data, day, cfg):
+    """The Nifty confluence strategy on one past day, in the same result shape as the other replays."""
+    N = (data.get("NIFTY") or {}).get("5m")
+    if not N or N.get("nc_df") is None:
+        return {"error": "NIFTY 5 minute candles were not loaded."}
+    max_trades = int(cfg.get("max_trades", 3))
+    first, last = OPTBOT_FIRST_ENTRY.strftime("%H:%M"), OPTBOT_LAST_ENTRY.strftime("%H:%M")
+    sets, why, d = nc_signals(N["nc_df"], day, N.get("nc_vw"), last)
+    if why.get("no candles for the day"):
+        return {"error": f"No candles for {day} in the data loaded."}
+    where = {int(t): i for i, t in enumerate(N["ts"])}
+    signals, trades, skips = [], [], {}
+    free = ""
+    for s_ in sets:
+        k5 = where.get(int(d.index[s_["j"]].timestamp())) if s_["j"] is not None else None
+        at = _hm(N["close_ts"][k5]) if k5 is not None else s_["time"]
+        sg = {"symbol": "NIFTY", "side": s_["side"], "right": "CE" if s_["side"] == "BUY" else "PE", "tf": "5m", "type": s_["trigger"], "at": at, "signal_time": f"{day} {s_['time']}",
+              "price": round(s_["entry"], 2), "sl": round(s_["sl"], 2), "tps": [round(t, 2) for t in s_["tps"]], "move": None, "taken": False, "why_not": None, "ts": int(d.index[s_["k"]].timestamp()), "day": day}
+        signals.append(sg)
+        if k5 is None:
+            sg["why_not"] = "its trigger was never broken"
+        elif at < first or at > last:
+            sg["why_not"] = "outside the entry hours"
+        elif at <= free:
+            sg["why_not"] = "already in a trade"
+        elif len(trades) >= max_trades:
+            sg["why_not"] = f"daily limit of {max_trades} trades reached"
+        else:
+            g = {"side": s_["side"], "dir": s_["dir"], "entry": s_["entry"], "sl": s_["sl"], "tps": s_["tps"], "risk": s_["risk"], "date": day, "time": s_["time"], "j": k5, "hits": 0, "open": True,
+                 "tstop": NC_TSTOP_MIN // 5}
+            c = {"symbol": "NIFTY", "tf": "5m", "g": g, "px": s_["entry"], "key": (day, s_["time"], s_["trigger"]), "etype": s_["trigger"], "dist": 0.0, "at": at, "chg": None, "S5": N, "k5": k5, "sts": int(N["ts"][k5])}
+            tr = replay_trade(c, day)
+            trades.append(tr)
+            sg["taken"] = True
+            free = tr["exit_hhmm"]
+    for k_, n_ in why.items():
+        skips[k_] = n_
+    for sg in signals:
+        if not sg["taken"] and not sg["why_not"]:
+            sg["why_not"] = "not taken"
+    tot = round(sum(t["r"] for t in trades), 2)
+    win = [t for t in trades if t["r"] > 0]
+    summ = {"signals": len(signals), "trades": len(trades), "wins": len(win), "losses": sum(1 for t in trades if t["r"] < 0), "flat": sum(1 for t in trades if t["r"] == 0),
+            "total_r": tot, "avg_r": round(tot / len(trades), 2) if trades else 0.0, "win_rate": round(len(win) / len(trades) * 100) if trades else 0,
+            "best": max((t["r"] for t in trades), default=0), "worst": min((t["r"] for t in trades), default=0)}
+    eq, run = [], 0.0
+    for t in trades:
+        run += t["r"]
+        eq.append(round(run, 2))
+    return {"day": day, "bot": "nifty", "equity": eq, "summary": summ, "trades": trades, "signals": signals, "skips": sorted(skips.items(), key=lambda x: -x[1]), "max_trades": max_trades, "entries": "confluence",
+            "vwap_proxy": bool(d.attrs.get("vwap_proxy"))}
+
+
 def replay_run(data, kind, day, cfg):
     """One day, one 5 minute step at a time. Returns the signals that qualified, the trades the autopilot would have taken, and why the others were left out."""
+    if kind == "nifty":
+        return replay_run_nc(data, day, cfg)
     ent = cfg.get("entries", "both")
     max_trades = int(cfg.get("max_trades", 3))
     syms = [s for s, v in data.items() if "5m" in v and "15m" in v and not (kind == "scanner" and s == "NIFTY")]
@@ -8157,6 +8791,9 @@ def replay_trade(c, day):
             stop = entry if step == 1 else lv[step - 2]
         if step >= 4:
             exit_px, exit_at, why = lv[3], ck, "T4 reached"
+            break
+        if g.get("tstop") and step == 0 and k - start >= g["tstop"] and (float(S["c"][k]) - entry) * dr < 0.25 * risk:
+            exit_px, exit_at, why = float(S["c"][k]), ck, f"time stop ({g['tstop'] * 5} minutes without progress)"
             break
         if ck >= sq:
             exit_px, exit_at, why = float(S["c"][k]), ck, "end of day"
@@ -9291,6 +9928,7 @@ h1::before{content:"";width:12px;height:26px;border-radius:4px;background:linear
 .seg{border-radius:12px;box-shadow:var(--shadow)}
 .seg button[aria-pressed=true]{background:var(--g);color:#fff}
 .mode{border-bottom:0;gap:6px;background:var(--panel);padding:5px;border-radius:14px;box-shadow:var(--shadow);width:fit-content;max-width:100%;overflow-x:auto}
+@media(min-width:900px){.mode{flex-wrap:wrap;overflow-x:visible}}
 .mode button{border-radius:10px;border-bottom:0;margin:0;padding:8px 16px;white-space:nowrap}
 .mode button[aria-pressed=true]{background:var(--g);color:#fff}
 .mode button:hover{background:var(--flat)}.mode button[aria-pressed=true]:hover{background:var(--g)}
@@ -9386,7 +10024,8 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div id="toast" role="status" aria-live="polite"></div>
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">SWING</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="btst">BTST</button><button data-m="levels">Scanner</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<div class="note" id="killBar" hidden style="margin:0 0 10px;border-color:var(--sell);color:var(--sell)"></div>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">SWING</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="btst">BTST</button><button data-m="levels">Scanner</button><button data-m="journal">Journal</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -9467,10 +10106,10 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="card botbox">
  <div class="ixrow"><b>Backtest</b><span class="sub">See how a strategy would have grown your funds on past candles. Results are estimates, not promises.</span></div>
  <div class="botrow">
-  <label>Strategy<select id="btStrategy"><option value="signal">Signals (fresh and ongoing)</option><option value="gap">Gap continuation at the open</option><option value="movers">Early movers (the stock Autopilot rule)</option></select></label>
+  <label>Strategy<select id="btStrategy"><option value="confluence" selected>Nifty confluence (pivot, VWAP, RSI + opening range)</option><option value="signal">Signals (fresh and ongoing)</option><option value="movers">Early movers (the stock Autopilot rule)</option></select></label>
   <label>Trade<select id="btKind"><option value="stock">Stocks / index (cash)</option><option value="futures">Futures</option><option value="options">Options (buying)</option></select></label>
   <label>Symbols (up to 10, comma separated)<input id="btSyms" value="NIFTY" placeholder="NIFTY, RELIANCE, TCS"></label>
-  <label>Timeframe<select id="btTf"><option value="5m">5 minute (last ~2 months)</option><option value="15m" selected>15 minute (last ~2 months)</option><option value="1d">Daily (years)</option></select></label>
+  <label>Timeframe<select id="btTf"><option value="5m" selected>5 minute (last ~2 months)</option><option value="15m">15 minute (last ~2 months)</option><option value="1d">Daily (years)</option></select></label>
   <label>Days of history<input id="btDays" type="number" min="10" step="1" value="58"></label>
  </div>
  <div class="botrow">
@@ -9511,6 +10150,30 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <h3 style="margin:14px 0 6px">Trades <span class="sub" id="btListNote"></span></h3>
  <div class="wrap"><table id="btTrades"></table></div>
 </div>
+</section>
+<section id="view-journal" hidden>
+<div class="card"><h3>Kill switch</h3>
+ <div class="sub" id="kzNote"></div>
+ <div class="botrow" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px"><label style="display:flex;align-items:center;gap:6px;white-space:nowrap">Daily loss limit ₹ <input id="kzLimit" size="8" inputmode="numeric" placeholder="0 = off"></label><button class="btn" id="kzSave">Save limit</button>
+  <span style="flex:1"></span>
+  <label style="display:flex;align-items:center;gap:6px;white-space:nowrap"><input type="checkbox" id="kzExit" style="width:auto"> also sell the autopilot's open positions</label>
+  <button class="btn" id="kzTrip" style="background:var(--sell);color:#fff">Stop trading for today</button>
+  <input id="kzPin" type="password" placeholder="Order PIN" size="8" autocomplete="off" hidden><button class="btn go" id="kzReset" hidden>Resume trading</button></div>
+ <div class="sub" id="kzMsg" style="margin-top:6px"></div></div>
+<div class="botrow" style="margin:12px 0 8px;gap:10px;flex-wrap:wrap"><label>Period <select id="jPeriod"><option value="today">Today</option><option value="7d">7 days</option><option value="30d" selected>30 days</option><option value="90d">90 days</option><option value="all">All</option></select></label>
+ <label>Trades <select id="jMode"><option value="all">All</option><option value="paper">Paper</option><option value="live">Live</option><option value="hand">By hand</option></select></label></div>
+<div class="hkpi" id="jKpi"></div>
+<div class="card"><h3>Result over time <span class="sub">running total, trade by trade</span></h3><div id="jCurve"></div></div>
+<div id="jGroups" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin:12px 0"></div>
+<h3 style="margin:14px 0 6px">Trades <span class="sub" id="jCount"></span></h3>
+<div class="wrap"><table id="jTable"></table></div>
+<datalist id="jTags"><option>followed plan</option><option>chased</option><option>early exit</option><option>held too long</option><option>moved stop</option><option>revenge trade</option><option>good patience</option></datalist>
+<div class="card" style="margin-top:14px"><h3>Add a trade made elsewhere</h3>
+ <div class="sub">For a trade this dashboard could not see, such as shares bought here and sold in your broker app. Charges are not included in any figure here.</div>
+ <div class="botrow" style="flex-wrap:wrap;gap:8px;margin-top:8px"><label>Date <input id="jaDay" type="date"></label><label>Instrument <input id="jaLabel" size="16" placeholder="BHEL"></label>
+  <label>Side <select id="jaDir"><option>LONG</option><option>SHORT</option></select></label><label>Quantity <input id="jaQty" size="6" inputmode="numeric"></label>
+  <label>Entry <input id="jaIn" size="8" inputmode="decimal"></label><label>Exit <input id="jaOut" size="8" inputmode="decimal"></label><label>Note <input id="jaNote" size="22"></label><button class="btn go" id="jaAdd">Add</button></div>
+ <div class="sub" id="jaMsg"></div></div>
 </section>
 <section id="view-levels" hidden>
 <div class="note" id="lvNote" style="margin:0 0 10px">Stocks at a turning point: near a 52 week high or low, through last month's high or low, or a recent signal with one of those levels behind it.</div>
@@ -9578,6 +10241,10 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </section>
 <section id="view-admin" hidden>
  <div class="card"><h3>Overview</h3><div class="osum" id="admOv" style="margin-bottom:0"></div></div>
+ <div class="card"><h3>Stop all trading</h3>
+  <div class="sub">Blocks new orders for every person for the rest of today and pauses every autopilot. Orders that close a position opened today still work. It ends by itself tomorrow.</div>
+  <div class="botrow"><button class="btn" id="akTrip" style="background:var(--sell);color:#fff">Stop everyone</button><button class="btn go" id="akReset">Release everyone</button></div>
+  <div class="sub" id="akNote"></div></div>
  <div class="card"><h3>Special trading session</h3>
   <div class="sub">On a day the exchange opens outside the usual hours (Muhurat trading, a weekend session), live orders stay blocked until you open it here. It lasts for today only and is forgotten on restart. To keep it through restarts, set SPECIAL_SESSIONS (for example 2026-11-08 18:00-19:15) in Render.</div>
   <div class="botrow"><label>From<input id="ssFrom" value="09:15" size="5"></label><label>To<input id="ssTo" value="15:30" size="5"></label><button class="btn go" id="ssOpen">Open for today</button><button class="btn" id="ssClear">Clear</button></div>
@@ -9961,10 +10628,12 @@ setInterval(()=>{if(mode==="charts"&&cw.ready&&!document.hidden&&cw.sym&&cwOpenN
 function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
 function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
  ensureTf();
- const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",btst:"btst",levels:"levels",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
- ["stocks","charts","commodities","autopilot","btst","levels","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",btst:"btst",levels:"levels",journal:"journal",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","charts","commodities","autopilot","btst","levels","journal","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
  if(m==="btst")btstLoad();else clearTimeout(btstTimer);
  if(m==="levels")lvLoad();else clearTimeout(lvTimer);
+ if(m==="journal"){kzLoad();jLoad()}
+ if(m==="admin")akLoad();
  if(m==="charts")cwShow();
  if(m==="commodities"){cmPaint();cmLoad()}else clearTimeout(cmTimer);
  document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
@@ -10238,7 +10907,7 @@ async function btRun(){clearTimeout(btTimer);
  poll()}
 function initBacktest(){$("btRun").onclick=btRun;
  $("btTf").onchange=()=>{const dly=$("btTf").value==="1d";$("btDays").value=dly?730:58;$("btIntra").checked=!dly;$("btIntra").disabled=dly;$("btLev").value=dly?1:5};
- $("btStrategy").onchange=()=>{const v=$("btStrategy").value,m=v==="movers",g=v==="gap"||m;if((g&&$("btTf").value==="1d")||(m&&$("btTf").value!=="5m")){$("btTf").value="5m";$("btTf").onchange()}$("btSyms").disabled=m;$("btSyms").title=m?"The early-mover strategy uses the whole F&O list":"";$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true}}
+ $("btStrategy").onchange=()=>{const v=$("btStrategy").value,m=v==="movers",g=m||v==="confluence";if((g&&$("btTf").value==="1d")||((m||v==="confluence")&&$("btTf").value!=="5m")){$("btTf").value="5m";$("btTf").onchange()}$("btSyms").disabled=m;$("btSyms").title=m?"The early-mover strategy uses the whole F&O list":"";$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true}}
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
  $("scOnly").onchange=()=>{scLoad()};$("scConf").onchange=()=>{scRender()};
@@ -10582,6 +11251,44 @@ async function loadSource(){try{const d=await (await api("/api/admin/source")).j
 function tokTxt(t){if(!t||!t.enabled)return "";const h=s=>s==null?"":s>=3600?Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m":Math.max(0,Math.floor(s/60))+"m";
  return `. Dhan token: ${t.expires_in==null?"expiry unknown":t.expires_in>0?"valid for "+h(t.expires_in):'<span style="color:var(--sell)">expired</span>'}, ${t.auto?"signs in by itself every day at "+esc(t.at)+" IST":"extended automatically (add DHAN_PIN and DHAN_TOTP_SECRET to sign in by itself)"}${t.how&&t.last_ok_age!=null?`, last ${esc(t.how)} ${h(t.last_ok_age)} ago`:""}${t.error?`. <span style="color:var(--sell)">${esc(t.error)}</span>`:""} <button class="btn" onclick="tokNow(this)">Renew now</button>`}
 async function tokNow(b){b.disabled=true;b.textContent="Renewing…";const d=await post("/api/admin/dhan-token",{});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
+let kzData=null;
+async function killPoll(){try{const d=await (await api("/api/kill")).json();kzData=d;const b=$("killBar");
+ if(b){b.hidden=!d.active;b.textContent=d.active?(d.scope==="all"?"Trading is stopped for everyone today. ":"Trading is stopped for you today. ")+d.reason+" New orders are blocked. Orders that close a position you opened today still work.":""}
+ if(mode==="journal")kzPaint(d)}catch(e){}}
+setTimeout(killPoll,2500);setInterval(killPoll,20000);
+async function kzLoad(){await killPoll()}
+function kzPaint(d){if(!d)return;const lim=d.limit;
+ $("kzNote").innerHTML=d.active?`<b style="color:var(--sell)">Stopped since ${esc(d.since)}.</b> ${esc(d.reason)}`+(d.can_reset?" You can resume below.":d.scope==="all"?" Only the administrator can release it.":" It stays stopped until tomorrow."):
+  `New orders are allowed. `+(lim>0?`Trading stops by itself if today's result falls to −₹${lim.toLocaleString("en-IN")}`+(d.pnl!=null?` (now ${d.pnl>=0?"+":"−"}₹${Math.abs(d.pnl).toLocaleString("en-IN")})`:"")+". The check runs every half minute, so a fast loss can pass the limit slightly.":"No daily loss limit is set. A limit stops new orders for the rest of the day once your result today falls that far.");
+ if(document.activeElement!==$("kzLimit"))$("kzLimit").value=lim>0?lim:"";
+ $("kzTrip").hidden=d.active;$("kzExit").parentElement.hidden=d.active;$("kzReset").hidden=!(d.active&&d.can_reset);$("kzPin").hidden=!(d.active&&d.can_reset&&d.need_pin)}
+$("kzSave").onclick=async()=>{const r=await post("/api/kill",{action:"limit",limit:$("kzLimit").value||0});$("kzMsg").textContent=r.error||"Limit saved.";if(!r.error)killPoll()};
+$("kzTrip").onclick=async()=>{const r=await post("/api/kill",{action:"trip",exit_bots:$("kzExit").checked});$("kzMsg").textContent=r.error||"Trading is stopped for today.";killPoll()};
+$("kzReset").onclick=async()=>{const r=await post("/api/kill",{action:"reset",pin:$("kzPin").value});$("kzMsg").textContent=r.error||"Trading resumed.";$("kzPin").value="";killPoll()};
+async function akLoad(){try{const d=await (await api("/api/admin/kill")).json();if(d.error)return;
+ $("akNote").innerHTML=(d.all?`<b style="color:var(--sell)">Everyone is stopped since ${esc(d.all.ts)}.</b> `:"Nobody is stopped for everyone. ")+(d.users.length?"Stopped for themselves today: "+d.users.map(u=>`${esc(u.name)} (${u.auto?"loss limit":"by hand"}) <button class="btn" data-aku="${u.id}">Release</button>`).join(", ")+".":"")}catch(e){}}
+$("akTrip").onclick=async()=>{await post("/api/admin/kill",{action:"trip_all"});akLoad();killPoll()};
+$("akReset").onclick=async()=>{await post("/api/admin/kill",{action:"reset_all"});akLoad();killPoll()};
+$("akNote").onclick=async e=>{const b=e.target.closest("[data-aku]");if(b){await post("/api/admin/kill",{action:"reset_user",user_id:+b.dataset.aku});akLoad()}};
+// ── journal ──
+async function jLoad(){try{const d=await (await api(`/api/journal?period=${$("jPeriod").value}&mode=${$("jMode").value}`)).json();jPaint(d)}catch(e){}}
+const jm=v=>v==null?"–":(v<0?"−":"")+"₹"+Math.abs(v).toLocaleString("en-IN",{maximumFractionDigits:2});
+function jPaint(d){const s=d.stats||{n:0},T=d.trades||[];
+ $("jKpi").innerHTML=s.n?[["Net result",jm(s.total),s.n+" trades",s.total],["Win rate",s.win_pct+"%",`avg win ${jm(s.avg_win)}, avg loss ${jm(s.avg_loss)}`],["Profit factor",s.pf==null?"–":s.pf,s.pf==null?"no losing trades":s.pf>=1?"profit is more than loss":"loss is more than profit"],
+  ["Average per trade",jm(s.expect),"expectancy",s.expect],["Best / worst",jm(s.best),"worst "+jm(s.worst)],["Biggest drawdown",jm(s.max_dd),"peak to trough"]].map(k=>`<div><span class="l">${k[0]}</span><span class="v ${k[3]==null?"":pnlCls(k[3])}">${k[1]}</span><span class="s">${k[2]}</span></div>`).join(""):"";
+ const c=s.curve||[];
+ if(c.length>1){const mn=Math.min(0,...c),mx=Math.max(0,...c),W=640,H=130,sy=v=>H-8-(v-mn)/((mx-mn)||1)*(H-16),sx=i=>8+i/(c.length-1)*(W-16),last=c[c.length-1];
+  $("jCurve").innerHTML=`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:150px" role="img" aria-label="Running result"><line x1="8" x2="${W-8}" y1="${sy(0)}" y2="${sy(0)}" stroke="currentColor" opacity=".25" stroke-dasharray="4 4"/><polyline fill="none" stroke="${last>=0?"var(--buy)":"var(--sell)"}" stroke-width="2.5" stroke-linejoin="round" points="${c.map((v,i)=>sx(i)+","+sy(v)).join(" ")}"/></svg><div class="sub">From ${jm(c[0])} after the first trade to ${jm(last)} after ${c.length}.</div>`}
+ else $("jCurve").innerHTML=`<div class="sub">${s.n?"Needs at least two trades to draw.":"No finished trades yet. A trade appears here once it is closed: bought and sold from the order ticket, or closed by the autopilot."}</div>`;
+ const gt=(t,a)=>a&&a.length?`<div class="card"><h3>${t}</h3><div class="wrap"><table><thead><tr><th></th><th>Trades</th><th>Win %</th><th>Result</th></tr></thead><tbody>${a.map(r=>`<tr><td>${esc(r.k)}</td><td>${r.n}</td><td>${r.win}%</td><td class="${pnlCls(r.pnl)}">${jm(r.pnl)}</td></tr>`).join("")}</tbody></table></div></div>`:"";
+ $("jGroups").innerHTML=s.n?gt("By source",s.by_source)+gt("By tag",s.by_tag)+gt("By weekday",s.by_day):"";
+ $("jCount").textContent=d.total>T.length?`showing the latest ${T.length} of ${d.total}`:d.total?d.total+" trades":"";
+ $("jTable").innerHTML=T.length?`<thead><tr><th>Date</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Result</th><th>Source</th><th>Tag</th><th>Note</th><th></th></tr></thead><tbody>`+T.map(t=>`<tr data-j="${esc(t.id)}"><td>${esc(t.day)}<br><span class="sub">${esc(t.time||"")}</span></td><td><b>${esc(t.label)}</b>${t.mode==="live"?' <span class="tag">Live</span>':""}</td><td>${t.dir}</td><td>${t.qty}</td><td>${t.entry}</td><td>${t.exit}</td><td class="${pnlCls(t.pnl)}"><b>${jm(t.pnl)}</b><br><span class="sub">${t.pnl_pct==null?"":(t.pnl_pct>0?"+":"")+t.pnl_pct+"%"}</span></td><td>${esc(t.source)}</td><td><input data-jt list="jTags" size="12" maxlength="30" value="${esc(t.tag||"")}"></td><td><input data-jn size="24" maxlength="500" value="${esc(t.note||"")}"></td><td>${t.id.startsWith("h:")?`<button class="btn" data-jd="${esc(t.id)}">Delete</button>`:""}</td></tr>`).join("")+"</tbody>":""}
+$("jTable").onchange=async e=>{const tr=e.target.closest("tr[data-j]");if(!tr)return;await api("/api/journal/note",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:tr.dataset.j,tag:tr.querySelector("[data-jt]").value,note:tr.querySelector("[data-jn]").value})})};
+$("jTable").onclick=async e=>{const b=e.target.closest("[data-jd]");if(b){await api("/api/journal/"+encodeURIComponent(b.dataset.jd),{method:"DELETE"});jLoad()}};
+$("jPeriod").onchange=$("jMode").onchange=jLoad;
+$("jaAdd").onclick=async()=>{const r=await post("/api/journal/add",{day:$("jaDay").value,label:$("jaLabel").value,dir:$("jaDir").value,qty:$("jaQty").value,entry:$("jaIn").value,exit:$("jaOut").value,note:$("jaNote").value});
+ $("jaMsg").textContent=r.error||"Added.";if(!r.error){["jaLabel","jaQty","jaIn","jaOut","jaNote"].forEach(i=>$(i).value="");jLoad()}};
 let lvTimer=null,lvTab="hi",lvData=null;
 const LV_TABS=[["hi","Near 52 week high"],["lo","Near 52 week low"],["up","Monthly breakout"],["dn","Monthly breakdown"],["sl","Signal + level"]];
 const LV_TXT={hi:["52 week high","Below the high"],lo:["52 week low","Above the low"],up:["Last month's high","Above it"],dn:["Last month's low","Below it"],sl:["Why it is listed","Signal"]};
