@@ -25,6 +25,7 @@ import csv
 import math
 import hashlib
 import hmac
+import asyncio
 import json
 import sqlite3
 import os
@@ -1336,6 +1337,16 @@ def dhan_parse(buf):
             elif code == 8 and i + 62 <= n:
                 pkt["ltp"] = struct.unpack_from("<f", buf, i + 8)[0]
                 pkt["vol"] = struct.unpack_from("<i", buf, i + 22)[0]
+                pkt["full"] = {"avg": struct.unpack_from("<f", buf, i + 18)[0], "ts": struct.unpack_from("<i", buf, i + 26)[0], "tb": struct.unpack_from("<i", buf, i + 30)[0],
+                               "oi": struct.unpack_from("<i", buf, i + 34)[0], "open": struct.unpack_from("<f", buf, i + 46)[0], "close": struct.unpack_from("<f", buf, i + 50)[0],
+                               "high": struct.unpack_from("<f", buf, i + 54)[0], "low": struct.unpack_from("<f", buf, i + 58)[0], "bids": [], "asks": []}
+                if i + 162 <= n:
+                    for lv in range(5):
+                        bq, aq, bo, ao, bp, ap = struct.unpack_from("<iihhff", buf, i + 62 + lv * 20)
+                        if bp > 0:
+                            pkt["full"]["bids"].append({"p": round(bp, 2), "q": bq, "o": bo})
+                        if ap > 0:
+                            pkt["full"]["asks"].append({"p": round(ap, 2), "q": aq, "o": ao})
             elif code == 6 and i + 12 <= n:
                 pkt["prev"] = struct.unpack_from("<f", buf, i + 8)[0]   # the exchange's previous close, sent when a script is subscribed
             elif code == 50 and i + 10 <= n:
@@ -1345,6 +1356,34 @@ def dhan_parse(buf):
         out.append(pkt)
         i += max(size, 8)
     return out
+
+
+FULLQ = {}   # (segment name, security id) -> the latest full packet of a contract somebody is watching (price, 5 level depth, volume, open interest)
+DHAN_SEG_NAME = {v: k for k, v in DHAN_SEG.items()}
+WS_WATCH, WS_SENT, WS_LOCK = {}, set(), threading.Lock()   # contracts to stream: key -> last time somebody asked; keys already subscribed on the open connection
+
+
+def ws_watch(key):
+    with WS_LOCK:
+        WS_WATCH[key] = time.time()
+
+
+def ws_sync(ws):
+    """On the open connection: subscribe the contracts people are watching (full packets, with depth) and drop the ones nobody has watched for 2 minutes."""
+    now = time.time()
+    with WS_LOCK:
+        for k in [k for k, t in WS_WATCH.items() if now - t > 120]:
+            del WS_WATCH[k]
+        add = [k for k in WS_WATCH if k not in WS_SENT]
+        drop = [k for k in WS_SENT if k not in WS_WATCH]
+        WS_SENT.update(add)
+        WS_SENT.difference_update(drop)
+    for code, keys in ((21, add), (22, drop)):
+        for i in range(0, len(keys), 100):
+            part = keys[i:i + 100]
+            ws.send(json.dumps({"RequestCode": code, "InstrumentCount": len(part), "InstrumentList": [{"ExchangeSegment": sg, "SecurityId": sid} for sg, sid in part]}))
+    for k in drop:
+        FULLQ.pop(k, None)
 
 
 PREV_CLOSE = {}   # symbol -> {"p": the exchange's previous close, "d": the day it was received}
@@ -1364,6 +1403,8 @@ def dhan_on_packets(pkts, lookup, now_ts=None):
             continue
         if "ltp" not in p:
             continue
+        if "full" in p:   # a contract somebody is watching: keep the whole packet for the live stream
+            FULLQ[(DHAN_SEG_NAME.get(p["seg"]), str(p["sid"]))] = dict(p["full"], ltp=float(p["ltp"]), vol=int(p.get("vol") or 0), t=now_ts)
         sym = lookup.get((p["seg"], p["sid"]))
         price = p["ltp"]
         if not sym or not price or price != price or price <= 0:
@@ -1425,6 +1466,8 @@ def dhan_ws_session(connect=None, stop=None):
     with connect(url) as ws:
         DHAN_STAT.update(ws="connected", error=None, connects=DHAN_STAT["connects"] + 1, subscribed=len(items), last=time.time())
         live_reset()
+        with WS_LOCK:
+            WS_SENT.clear()
         for m in dhan_subscriptions(items):
             ws.send(m)
         if not first:
@@ -1448,6 +1491,10 @@ def dhan_ws_session(connect=None, stop=None):
                         return "auth" if code in DHAN_AUTH_CODES else "refused"
                 dhan_on_packets(pkts, lookup)
             touch = dhan_housekeeping(touch)
+            try:
+                ws_sync(ws)
+            except Exception:
+                pass
             if time.time() - heard > 60:
                 return "silent"
     return "closed"
@@ -1979,7 +2026,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20c"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20e"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3360,6 +3407,7 @@ def autopilot_loop():
 def start_engine():
     threading.Thread(target=autopilot_loop, daemon=True).start()
     threading.Thread(target=kill_loop, daemon=True).start()
+    threading.Thread(target=quote_loop, daemon=True).start()
     threading.Thread(target=journal_loop, daemon=True).start()
     if DATA_BROKER in ("angel", "dhan"):
         FEED["source"] = DATA_BROKER
@@ -7080,6 +7128,149 @@ def api_sector_chart(sector: str, tf: str = DEFAULT_INTERVAL):
     return JSONResponse(d)
 
 
+# ── Market depth and live quote: best 5 bids and offers, volume, open interest, for a share, a futures contract or an option. One batched Dhan call a second serves every viewer ──
+QUOTE_WANT, QUOTE_CACHE, QUOTE_LOCK = {}, {}, threading.Lock()
+
+
+def quote_loop():
+    """Every ~1.1 s: one /marketfeed/quote call for everything somebody looked at in the last 10 seconds (Dhan allows about one call a second)."""
+    while True:
+        time.sleep(1.1)
+        try:
+            if not (use_dhan() and market_window()):
+                time.sleep(4)
+                continue
+            now = time.time()
+            with QUOTE_LOCK:
+                for k in [k for k, t in QUOTE_WANT.items() if now - t > 10]:
+                    del QUOTE_WANT[k]
+                want = list(QUOTE_WANT)
+            if not want:
+                continue
+            by = {}
+            for seg, sid in want[:900]:
+                by.setdefault(seg, []).append(int(sid))
+            res = dhan_post("/marketfeed/quote", by)
+            t = time.time()
+            for seg, d in ((res or {}).get("data") or {}).items():
+                for sid, v in (d or {}).items():
+                    QUOTE_CACHE[(seg, str(sid))] = (t, v or {})
+        except Exception as e:
+            QUOTE_CACHE["error"] = (time.time(), str(e)[:120])
+
+
+def quote_levels(lst):
+    out = []
+    for x in (lst or [])[:5]:
+        pr = _num((x or {}).get("price"))
+        if pr:
+            out.append({"p": pr, "q": int(_num((x or {}).get("quantity")) or 0), "o": int(_num((x or {}).get("orders")) or 0)})
+    return out
+
+
+def depth_key(symbol, inst, expiry, strike, side):
+    """((segment, security id), None) for a share, a futures contract or an option, or (None, why not)."""
+    symbol = symbol.upper().strip()
+    if not re.fullmatch(r"[A-Z0-9&\-]{1,20}", symbol):
+        return None, "Enter a valid symbol."
+    if not use_dhan():
+        return None, "Market depth comes from Dhan's data feed. Set DATA_BROKER=dhan on the server."
+    try:
+        if inst == "opt":
+            if not load_master("dhan"):
+                return None, "Dhan's instrument list could not be loaded."
+            ek = datetime.strptime(expiry, EXPIRY_FMT).strftime("%d%b%Y").upper()
+            hit = opt_find(M("dhan")["opt"], symbol, ek, float(strike), side)
+            if not hit:
+                return None, "This contract is not in Dhan's instrument list."
+            return (hit[3], str(hit[0])), None
+        if inst == "fut":
+            f = dhan_future_inst(symbol)
+            return ((f[1], str(f[0])), None) if f else (None, "No futures contract found.")
+        f = dhan_inst(symbol)
+        return ((f[1], str(f[0])), None) if f else (None, "Not in Dhan's instrument list.")
+    except Exception as e:
+        return None, f"Could not find the contract ({type(e).__name__})."
+
+
+def depth_payload(key, symbol, inst, expiry, strike, side, iv):
+    """The newest quote of a contract: from the live stream when it is flowing, else from the batched quote call. None when there is nothing recent."""
+    full = FULLQ.get(key)
+    if full and time.time() - full["t"] < 6:
+        out = {"ltp": full["ltp"], "age": round(time.time() - full["t"], 1), "bids": full["bids"], "asks": full["asks"], "vol": full["vol"], "oi": full["oi"], "avg": full["avg"],
+               "chg": None, "tb": full["tb"], "ts": full["ts"], "ohlc": {"open": full["open"], "high": full["high"], "low": full["low"], "close": full["close"]}, "lc": None, "uc": None, "live": True}
+    else:
+        hit = QUOTE_CACHE.get(key)
+        if not hit or time.time() - hit[0] > 8:
+            return None
+        v, d = hit[1], hit[1].get("depth") or {}
+        out = {"ltp": _num(v.get("last_price")), "age": round(time.time() - hit[0], 1), "bids": quote_levels(d.get("buy")), "asks": quote_levels(d.get("sell")), "vol": int(_num(v.get("volume")) or 0),
+               "oi": int(_num(v.get("oi")) or 0), "avg": _num(v.get("average_price")), "chg": _num(v.get("net_change")), "tb": int(_num(v.get("buy_quantity")) or 0), "ts": int(_num(v.get("sell_quantity")) or 0),
+               "ohlc": v.get("ohlc") or {}, "lc": _num(v.get("lower_circuit_limit")), "uc": _num(v.get("upper_circuit_limit")), "live": False}
+    und = fresh_ltp(symbol) if inst == "opt" else None
+    out["und"] = und
+    if inst == "opt" and und:
+        out["delta"] = est_delta(und, float(strike), side, expiry, iv or None)
+    return out
+
+
+@app.get("/api/depth")
+def api_depth(symbol: str, inst: str = "stock", expiry: str = "", strike: float = 0.0, side: str = "CE", iv: float = 0.0):
+    """Live quote and 5 level depth of one instrument. inst: stock, fut or opt."""
+    symbol = symbol.upper().strip()
+    key, err = depth_key(symbol, inst, expiry, strike, side)
+    if err:
+        return {"error": err}
+    if key[0] == "IDX_I":
+        return {"nodepth": True, "und": fresh_ltp(symbol)}
+    ws_watch(key)
+    with QUOTE_LOCK:
+        QUOTE_WANT[key] = time.time()
+    out = depth_payload(key, symbol, inst, expiry, strike, side, iv)
+    end = time.time() + 2.5
+    while out is None and time.time() < end:
+        time.sleep(0.15)
+        out = depth_payload(key, symbol, inst, expiry, strike, side, iv)
+    if out is None:
+        err = QUOTE_CACHE.get("error")
+        return {"error": "No quote yet" + (f" ({err[1]})" if err and time.time() - err[0] < 30 else "") + ". Quotes arrive during market hours."}
+    return out
+
+
+@app.get("/api/stream")
+async def api_stream(request: Request, symbol: str, inst: str = "stock", expiry: str = "", strike: float = 0.0, side: str = "CE", iv: float = 0.0):
+    """Server-sent events: the contract's price and depth the moment the exchange feed sends them (checked every 100 ms), plus a heartbeat. The page falls back to /api/depth if this is not flowing."""
+    symbol = symbol.upper().strip()
+    key, err = depth_key(symbol, inst, expiry, strike, side)
+    if err or key[0] == "IDX_I":
+        return JSONResponse({"error": err or "No depth for an index."}, status_code=400)
+
+    async def gen():
+        last, beat, und0, end = None, time.time(), None, time.time() + 600   # a connection lasts 10 minutes; the browser reconnects by itself
+        yield "retry: 1500\n\n"
+        while time.time() < end:
+            if await request.is_disconnected():
+                return
+            ws_watch(key)
+            with QUOTE_LOCK:
+                QUOTE_WANT[key] = time.time()
+            full = FULLQ.get(key)
+            und = fresh_ltp(symbol) if inst == "opt" else None
+            stamp = (full["t"] if full else None, und)
+            if full and time.time() - full["t"] < 6 and stamp != last:
+                last = stamp
+                out = depth_payload(key, symbol, inst, expiry, strike, side, iv)
+                if out:
+                    yield "data: " + json.dumps(out) + "\n\n"
+                    beat = time.time()
+            elif time.time() - beat > 10:
+                beat = time.time()
+                yield ": keep-alive\n\n"
+            await asyncio.sleep(0.1)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.get("/api/ltp")
 def api_ltp(symbol: str):
     """The latest live price the server holds for a symbol (None when it is stale or unknown); the Trade Desk charts use it to move the forming candle."""
@@ -7203,7 +7394,7 @@ def api_option_history(request: Request, symbol: str, expiry: str, strike: float
     for side in ("CE", "PE"):
         key = (symbol, expiry, float(strike), side, minutes, span)
         hit = OPT_HIST.get(key)
-        if hit and time.time() - hit[0] < 20:
+        if hit and time.time() - hit[0] < 8:
             full[side.lower()] = hit[1]
             continue
         try:
@@ -7218,7 +7409,7 @@ def api_option_history(request: Request, symbol: str, expiry: str, strike: float
         full[side.lower()] = rows
     ukey = (symbol, "UND", 0.0, "", minutes, span)   # the parent script, on the same candle size and days, for a like-for-like comparison
     hit = OPT_HIST.get(ukey)
-    if hit and time.time() - hit[0] < 20:
+    if hit and time.time() - hit[0] < 8:
         full["und"] = hit[1]
     else:
         try:
@@ -9833,6 +10024,10 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .chtfs button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
 .fdb{font-weight:600}.fdb.on{color:var(--buy)}.fdb.off{color:#f59e0b}
 .chnav{display:inline-flex;align-items:center;gap:6px}.chnav .btn{padding:4px 10px}
+.dpt{margin:6px 0 10px;font-size:12px}.dpt table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}.dpt td{padding:2px 6px;text-align:right}
+.dpt td.o{color:var(--mute);width:9%}.dpt td.q{width:21%;background:linear-gradient(to left,var(--bq,rgba(10,125,90,.28)) var(--w,0%),transparent var(--w,0%))}.dpt td.q.r{background:linear-gradient(to right,rgba(192,57,43,.28) var(--w,0%),transparent var(--w,0%));text-align:left}
+.dpt td.bp{color:var(--buy,#0a7d5a);font-weight:600}.dpt td.ap{color:var(--sell,#c0392b);font-weight:600;text-align:left}.dpt td.ap~td.o{text-align:left}.dpt th{font-weight:500;color:var(--mute);padding:2px 6px;text-align:right}
+.dpt .st{display:flex;flex-wrap:wrap;gap:4px 14px;color:var(--mute);margin:4px 0}.dpt .st b{color:var(--ink)}.dpt .bar{height:6px;border-radius:3px;background:rgba(192,57,43,.45);overflow:hidden;margin:4px 0}.dpt .bar i{display:block;height:100%;background:rgba(10,125,90,.6)}
 .chleg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--mute);margin-bottom:6px}.chleg i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
 #chart{height:min(62vh,560px);width:100%}
 .cwrap{display:grid;grid-template-columns:316px minmax(0,1fr);gap:12px;align-items:start}
@@ -10052,7 +10247,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div id="cwOpt" hidden><label class="sub">Expiry <select id="cwExp"></select></label><label class="sub">Strike <select id="cwStrike"></select></label>
    <div class="seg" id="cwSide" role="group" aria-label="Call or put"><button data-r="CE">Call (CE)</button><button data-r="PE">Put (PE)</button></div>
    <div class="seg" id="cwDays" role="group" aria-label="Days"><button data-d="1">1 day</button><button data-d="3">3 days</button></div></div>
-  <div class="chleg" id="cwLeg"></div><div id="cwMsg" class="tkmsg" role="status"></div>
+  <div class="chleg" id="cwLeg"></div><div id="cwMsg" class="tkmsg" role="status"></div><div class="dpt" id="cwDepth" hidden></div>
   <div id="cwChart"></div>
   <div id="cwBaseW" hidden><div class="sub" id="cwBaseT" style="margin:8px 0 2px"></div><div id="cwChart2"></div></div>
   <p class="sub">Press ↑ or ↓ to move to the previous or next symbol, ← or → to change the timeframe.</p>
@@ -10312,6 +10507,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <label class="chk" id="tkTrailL"><input type="checkbox" id="tkTrail"> Trail it up as targets are reached</label>
  </div>
  <div class="tkfunds" id="tkFunds" hidden></div>
+ <div class="dpt" id="tkDepth" hidden></div>
  <div class="tkreview" id="tkReview" hidden></div>
  <div class="tkgrid" id="tkConfirm" hidden>
   <label id="tkPinL" hidden>Order PIN<input id="tkPin" type="password" autocomplete="off"></label>
@@ -10550,6 +10746,8 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
    const m=cw.tf==="5m"?"5m":cw.tf==="1d"?"1d":"15m",days=cw.tf==="1d"?3:cw.days;
    const h=await (await api(`/api/options/history?symbol=${encodeURIComponent(sym)}&expiry=${encodeURIComponent(cw.exp)}&strike=${cw.strike}&tf=${m}&days=${days}`)).json();if(my!==cw.my)return;
    if(h.error){if(silent)return;$("cwMsg").textContent=h.error;cwClear();return}
+   {const rw=ch.rows.find(r=>r.strike===cw.strike),lg=rw&&rw[cw.side.toLowerCase()];cw.iv=lg&&+lg.iv>0?+lg.iv:0}
+   cw.sig=null;
    const rows=h[cw.side.toLowerCase()]||[];if(!rows.length){if(silent)return;$("cwMsg").textContent="No price history for this contract yet.";cwClear();return}
    if(h.daily){   // Daily: the option's days are built from hourly candles (today's is still forming); the stock's own Daily chart gives the base chart and the signals
     candles=rows.map(r=>({time:r.t,open:r.o,high:r.h,low:r.l,close:r.c}));const t0=candles[0].time;
@@ -10561,7 +10759,7 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
    }else{
    candles=rows.map(r=>({time:r.t+19800,open:r.o,high:r.h,low:r.l,close:r.c}));
    und=(h.und||[]).map(r=>({time:r.t+19800,open:r.o,high:r.h,low:r.l,close:r.c}));undErr=h.und_error||"";
-   const iu=(h.ind||{}).und;if(iu&&iu.stop)undLines={stop:iu.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(iu.ema||[]).map(([t,v])=>[t+19800,v])};if(iu)undMarks=mkOf(iu.marks,19800);
+   const iu=(h.ind||{}).und;if(iu&&iu.stop)undLines={stop:iu.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(iu.ema||[]).map(([t,v])=>[t+19800,v])};if(iu)undMarks=mkOf(iu.marks,19800);if(iu&&iu.sig&&iu.sig.visible)cw.sig=iu.sig;
    const ind=(h.ind||{})[cw.side.toLowerCase()];if(ind&&ind.stop)lines={stop:ind.stop.map(([t,v,d])=>[t+19800,v,d]),ema:(ind.ema||[]).map(([t,v])=>[t+19800,v])};if(iu&&iu.marks){const T=candles.map(c=>c.time),ce=cw.side==="CE",put=new Map();   // the stock's signals as option trades: a CE is bought on a stock BUY and sold on a stock SELL, a PE the other way round
     for(const [t0,sd] of iu.marks){const t=t0+19800;let k=-1;for(let i=T.length-1;i>=0;i--)if(T[i]<=t){k=i;break}if(k<0)continue;put.set(T[k],(ce?sd==="BUY":sd==="SELL")?{time:T[k],position:"belowBar",color:"#0a7d5a",shape:"arrowUp",text:"BUY "+cw.side}:{time:T[k],position:"aboveBar",color:"#c0392b",shape:"arrowDown",text:"EXIT "+cw.side})}
     markers=[...put.values()].sort((a,b)=>a.time-b.time)}
@@ -10603,8 +10801,58 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
    const k2=c2.addCandlestickSeries({upColor:up,downColor:dn,borderUpColor:up,borderDownColor:dn,wickUpColor:up,wickDownColor:dn});k2.setData(padTo(und));cw.k2=k2;cw.bar2=Object.assign({},und[und.length-1]);if(undMarks.length)k2.setMarkers(undMarks);
    let lock=false;const same=!!TL||und.length===candles.length;   // the same candles: follow each other by position, which keeps the empty space at the right edge; otherwise by time
    const link=(a,b)=>same?a.timeScale().subscribeVisibleLogicalRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleLogicalRange(r)}catch(e){}lock=false}):a.timeScale().subscribeVisibleTimeRangeChange(r=>{if(lock||!r)return;lock=true;try{b.timeScale().setVisibleRange(r)}catch(e){}lock=false});link(ch,c2);link(c2,ch);
-   try{if(same){const r=ch.timeScale().getVisibleLogicalRange();if(r)c2.timeScale().setVisibleLogicalRange(r)}else{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}}catch(e){}}}}
-const cw_REFRESH_MS=20000;
+   try{if(same){const r=ch.timeScale().getVisibleLogicalRange();if(r)c2.timeScale().setVisibleLogicalRange(r)}else{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}}catch(e){}}}
+ cwDrawLevels();cwDepthPoll()}
+const cw_REFRESH_MS=12000;
+const dpn=n=>Number(n).toLocaleString("en-IN");
+function dpHtml(d){   // best 5 bids and offers, with totals and the day's numbers
+ if(!d)return "";if(d.error)return `<div class="sub">${esc(d.error)}</div>`;if(d.nodepth)return "";
+ const b=d.bids||[],a=d.asks||[],mx=Math.max(1,...b.map(x=>x.q),...a.map(x=>x.q)),n=Math.max(b.length,a.length,1);let rows="";
+ for(let i=0;i<n;i++){const x=b[i],y=a[i];rows+=`<tr><td class="o">${x?x.o:""}</td><td class="q" style="--w:${x?(x.q/mx*100).toFixed(0):0}%">${x?dpn(x.q):""}</td><td class="bp">${x?x.p.toFixed(2):"–"}</td><td class="ap">${y?y.p.toFixed(2):"–"}</td><td class="q r" style="--w:${y?(y.q/mx*100).toFixed(0):0}%">${y?dpn(y.q):""}</td><td class="o">${y?y.o:""}</td></tr>`}
+ const tot=(d.tb||0)+(d.ts||0),pct=tot?d.tb/tot*100:50,sp=b[0]&&a[0]?a[0].p-b[0].p:null,oh=d.ohlc||{};
+ return `<table><thead><tr><th>Orders</th><th>Bid qty</th><th>Bid</th><th style="text-align:left">Ask</th><th style="text-align:left">Ask qty</th><th style="text-align:left">Orders</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="sub">No orders in the book right now.</td></tr>'}</tbody></table>`
+  +`<div class="bar" title="Total waiting to buy vs to sell"><i style="width:${pct.toFixed(0)}%"></i></div>`
+  +`<div class="st"><span>Buyers <b>${dpn(d.tb||0)}</b></span><span>Sellers <b>${dpn(d.ts||0)}</b></span>${sp!=null?`<span>Spread <b>${sp.toFixed(2)}</b></span>`:""}${d.ltp?`<span>LTP <b>${d.ltp.toFixed(2)}</b></span>`:""}${d.avg?`<span>Avg <b>${d.avg.toFixed(2)}</b></span>`:""}<span>Volume <b>${dpn(d.vol||0)}</b></span>${d.oi?`<span>OI <b>${dpn(d.oi)}</b></span>`:""}${oh.high?`<span>High <b>${(+oh.high).toFixed(2)}</b></span><span>Low <b>${(+oh.low).toFixed(2)}</b></span>`:""}${d.lc&&d.uc?`<span>Circuit <b>${d.lc}–${d.uc}</b></span>`:""}</div>`}
+function cwDrawLevels(){   // the latest signal's entry, stop and targets: on the stock chart as they are, on the option chart as an estimated premium (delta x the stock's move)
+ for(const [ser,l] of (cw.pl||[])){try{ser.removePriceLine(l)}catch(e){}}cw.pl=[];
+ const sg=cw.sig;if(!sg||cw.inst!=="opt"||!cw.obj)return;
+ const d=cw.dp||{},ok=(cw.side==="CE")===(sg.side==="BUY"),f=cw.side==="CE"?1:-1,cv=v=>d.ltp&&d.und&&d.delta?d.ltp+f*d.delta*(v-d.und):null;
+ const key=[sg.entry,sg.sl,sg.hits,sg.sl_hit,ok,d.ltp&&d.und&&d.delta?(cv(sg.entry)||0).toFixed(1):""].join("|");if(key===cw.plKey&&cw.pl.length)return;cw.plKey=key;
+ const mk=(ser,price,color,title,style)=>{if(!ser||!(price>0))return;try{cw.pl.push([ser,ser.createPriceLine({price,color,lineWidth:1,lineStyle:style,axisLabelVisible:true,title})])}catch(e){}};
+ const ink="#888",dn="#c0392b",up="#0a7d5a",tag=t=>t+(sg.side==="BUY"?"":"");
+ mk(cw.k2,sg.entry,ink,"Entry",0);mk(cw.k2,sg.sl,dn,"SL"+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((p,i)=>mk(cw.k2,p,up,"T"+(i+1)+(sg.hits>i?" ✓":""),2));
+ if(ok&&cv(sg.entry)!=null){mk(cw.cs,cv(sg.entry),ink,"Entry est.",0);mk(cw.cs,cv(sg.sl),dn,"SL est."+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((p,i)=>mk(cw.cs,cv(p),up,"T"+(i+1)+" est."+(sg.hits>i?" ✓":""),2))}}
+let dpBusy=false,cwES=null,cwESu="",cwEST=0,dpRaf=0;
+function cwDepthUrl(){if(!cw.sym||!cw.obj)return "";let u=`/api/depth?symbol=${encodeURIComponent(cw.sym)}&inst=${cw.inst}`;
+ if(cw.inst==="opt"){if(cw.strike==null||!cw.exp)return "";u+=`&expiry=${encodeURIComponent(cw.exp)}&strike=${cw.strike}&side=${cw.side}&iv=${cw.iv||0}`}return u}
+function cwApply(d,inst){   // a new quote, from the stream or from a poll: paint the depth, move the forming candles, redraw the level lines
+ cw.dp=d;if(!dpRaf)dpRaf=requestAnimationFrame(()=>{dpRaf=0;const el=$("cwDepth");if(el&&cw.dp){const h=dpHtml(cw.dp);el.hidden=!h;if(h)el.innerHTML=h}});
+ if(d.ltp){cwTick(cw.cs,cw.bar,d.ltp);if(inst==="opt"&&d.und)cwTick(cw.k2,cw.bar2,d.und);const lv=$("cwLive");if(lv)lv.textContent="● live "+new Date(Date.now()+19800000).toISOString().slice(11,19)+" · "+d.ltp.toFixed(2)}
+ if(inst==="opt")cwDrawLevels()}
+function cwStream(){   // one live connection for the contract on screen; it is reopened when the contract changes and closed when the chart is not in view
+ const u=(document.hidden||mode!=="charts"||!cwOpenNow()||!window.EventSource)?"":cwDepthUrl();
+ if(!u){if(cwES){cwES.close();cwES=null;cwESu=""}return}
+ if(cwES&&cwESu===u)return;if(cwES)cwES.close();cwESu=u;const my=cw.my,inst=cw.inst;
+ cwES=new EventSource(u.replace("/api/depth","/api/stream"));
+ cwES.onmessage=e=>{if(my!==cw.my)return;try{const d=JSON.parse(e.data);cwEST=Date.now();cwApply(d,inst)}catch(x){}}}
+async function cwDepthPoll(){   // every 1.5 s: keeps the stream open, and asks for a quote itself only while the stream is silent
+ cwStream();
+ if(dpBusy||document.hidden||mode!=="charts"||!cw.sym||!cw.obj||!cwOpenNow()||Date.now()-cwEST<4000)return;
+ const u=cwDepthUrl();if(!u)return;const sym=cw.sym,my=cw.my,inst=cw.inst;dpBusy=true;
+ try{const d=await (await api(u)).json();if(my!==cw.my||sym!==cw.sym)return;
+  if(d.error||d.nodepth){const el=$("cwDepth");if(el){const h=dpHtml(d);el.hidden=!h;if(h)el.innerHTML=h}cw.dp=d;return}
+  cwApply(d,inst)}
+ catch(e){}finally{dpBusy=false}}
+setInterval(cwDepthPoll,1500);
+let tkDT=null,tkES=null,tkEST=0;
+function tkDepthStart(s){clearInterval(tkDT);if(tkES){tkES.close();tkES=null}const el=$("tkDepth");el.hidden=true;el.innerHTML="";tkEST=0;
+ let u=`/api/depth?symbol=${encodeURIComponent(s.symbol)}&inst=`+(s.kind==="option"?"opt":s.kind==="future"?"fut":"stock");
+ if(s.kind==="option")u+=`&expiry=${encodeURIComponent(s.expiry)}&strike=${s.strike}&side=${s.right}`;
+ const paint=d=>{if(!$("ticket").open)return;const h=dpHtml(d);el.hidden=!h;if(h)el.innerHTML=h};
+ if(window.EventSource){tkES=new EventSource(u.replace("/api/depth","/api/stream"));tkES.onmessage=e=>{try{tkEST=Date.now();paint(JSON.parse(e.data))}catch(x){}}}
+ const q=()=>{if(Date.now()-tkEST<4000)return;api(u).then(r=>r.json()).then(paint).catch(()=>{})};
+ q();tkDT=setInterval(()=>{if(!$("ticket").open){clearInterval(tkDT);if(tkES){tkES.close();tkES=null}}else q()},2000)}
+
 const cwOpenNow=()=>{const n=new Date(Date.now()+19800000),d=n.getUTCDay(),m=n.getUTCHours()*60+n.getUTCMinutes();return d>0&&d<6&&m>=555&&m<930};   // 09:15 to 15:30 India time, Monday to Friday
 function cwTick(ser,bar,p,tfv){   // the live price moves the forming candle; a new candle starts when its time comes
  tfv=tfv||cw.tf;if(!ser||!bar||!(p>0)||tfv==="1w")return null;let t;
@@ -10625,7 +10873,7 @@ async function cwLiveTick(){if(cwTickBusy||document.hidden||mode!=="charts"||!cw
  catch(e){}finally{cwTickBusy=false}}
 setInterval(cwLiveTick,3000);
 setInterval(()=>{if(mode==="charts"&&cw.ready&&!document.hidden&&cw.sym&&cwOpenNow())cwLoad(true)},cw_REFRESH_MS);
-function cwClear(){if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
+function cwClear(){cw.pl=[];cw.plKey="";if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
 function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
  ensureTf();
  const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",btst:"btst",levels:"levels",journal:"journal",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
@@ -11158,7 +11406,7 @@ function openTicket(s){tk=s;const opt=s.kind==="option",fut=s.kind==="future";
  const bl=tradeInfo.brokers||[];$("tkBroker").innerHTML=bl.map(x=>`<option value="${x}">${tradeInfo.broker_names[x]}</option>`).join("");
  $("tkBrokerL").hidden=bl.length<2;if(tradeInfo.default_broker&&bl.length)$("tkBroker").value=tradeInfo.default_broker;
  $("tkAutoBox").hidden=opt;$("tkAuto").checked=!opt;$("tkTrail").checked=false;$("tkTrailL").hidden=false;
- $("tkPin").value="";resetReview();$("ticket").showModal();fundsLoad()}
+ $("tkPin").value="";resetReview();$("ticket").showModal();fundsLoad();tkDepthStart(s)}
 ["tkSide","tkQty","tkType","tkPrice","tkProd","tkBroker","tkAuto","tkTrail"].forEach(id=>{$(id).addEventListener("input",resetReview);$(id).addEventListener("change",resetReview)});
 $("tkQty").addEventListener("input",fundsPaint);
 ["tkSide","tkType","tkPrice","tkProd","tkBroker"].forEach(id=>$(id).addEventListener("change",()=>{clearTimeout(fundsTimer);fundsTimer=setTimeout(fundsLoad,300)}));
