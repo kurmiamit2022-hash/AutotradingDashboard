@@ -2026,7 +2026,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20f"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20g"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -10819,15 +10819,18 @@ function dpHtml(d){   // best 5 bids and offers side by side, with the buyer and
   +`<tr><td></td><td class="bl" style="color:var(--buy,#0a7d5a)">${dpn(tb)}</td><td class="lab bl">All buyers</td><td class="lab al sep">All sellers</td><td class="al" style="color:var(--sell,#c0392b)">${dpn(ts)}</td><td></td></tr></tfoot></table>`
   +`<div class="bar" title="All waiting to buy vs to sell"><i style="width:${pct.toFixed(0)}%"></i></div>`
   +`<div class="st"><span>Buy ${pct.toFixed(0)}% · Sell ${(100-pct).toFixed(0)}%</span>${sp!=null?`<span>Spread <b>${sp.toFixed(2)}</b></span>`:""}${d.ltp?`<span>LTP <b>${d.ltp.toFixed(2)}</b></span>`:""}${d.avg?`<span>Avg <b>${d.avg.toFixed(2)}</b></span>`:""}<span>Volume <b>${dpn(d.vol||0)}</b></span>${d.oi?`<span>OI <b>${dpn(d.oi)}</b></span>`:""}${oh.high?`<span>High <b>${(+oh.high).toFixed(2)}</b></span><span>Low <b>${(+oh.low).toFixed(2)}</b></span>`:""}${d.lc&&d.uc?`<span>Circuit <b>${d.lc}–${d.uc}</b></span>`:""}</div>`}
+function cwDelta(u,k){   // a quick Black-Scholes delta (size only) for when no live quote has arrived, e.g. before the market opens
+ const iv=(cw.iv>0?cw.iv:30)/100,dd=Date.parse(cw.exp),T=Math.max(((isNaN(dd)?Date.now()+7*864e5:dd)-Date.now())/31536e6,1/365),d1=(Math.log(u/k)+0.5*iv*iv*T)/(iv*Math.sqrt(T));
+ const t=1/(1+0.2316419*Math.abs(d1)),n=1-0.3989423*Math.exp(-d1*d1/2)*t*(0.3193815+t*(-0.3565638+t*(1.781478+t*(-1.821256+t*1.330274))));const c=d1>=0?n:1-n;return cw.side==="CE"?c:1-c}
 function cwDrawLevels(){   // the latest signal's entry, stop and targets: on the stock chart as they are, on the option chart as an estimated premium (delta x the stock's move)
  for(const [ser,l] of (cw.pl||[])){try{ser.removePriceLine(l)}catch(e){}}cw.pl=[];
  const sg=cw.sig;if(!sg||cw.inst!=="opt"||!cw.obj)return;
- const d=cw.dp||{},ok=(cw.side==="CE")===(sg.side==="BUY"),f=cw.side==="CE"?1:-1,cv=v=>d.ltp&&d.und&&d.delta?d.ltp+f*d.delta*(v-d.und):null;
- const key=[sg.entry,sg.sl,sg.hits,sg.sl_hit,ok,d.ltp&&d.und&&d.delta?(cv(sg.entry)||0).toFixed(1):""].join("|");if(key===cw.plKey&&cw.pl.length)return;cw.plKey=key;
+ const d=cw.dp||{},p=d.ltp||(cw.bar&&cw.bar.close),u=d.und||(cw.bar2&&cw.bar2.close),f=cw.side==="CE"?1:-1,dl=d.delta||(u&&cw.strike?cwDelta(u,cw.strike):0.5),cv=v=>p&&u?Math.max(0.05,p+f*dl*(v-u)):null;
+ const key=[sg.entry,sg.sl,sg.hits,sg.sl_hit,cv(sg.entry)==null?"":cv(sg.entry).toFixed(1)].join("|");if(key===cw.plKey&&cw.pl.length)return;cw.plKey=key;
  const mk=(ser,price,color,title,style)=>{if(!ser||!(price>0))return;try{cw.pl.push([ser,ser.createPriceLine({price,color,lineWidth:1,lineStyle:style,axisLabelVisible:true,title})])}catch(e){}};
- const ink="#888",dn="#c0392b",up="#0a7d5a",tag=t=>t+(sg.side==="BUY"?"":"");
- mk(cw.k2,sg.entry,ink,"Entry",0);mk(cw.k2,sg.sl,dn,"SL"+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((p,i)=>mk(cw.k2,p,up,"T"+(i+1)+(sg.hits>i?" ✓":""),2));
- if(ok&&cv(sg.entry)!=null){mk(cw.cs,cv(sg.entry),ink,"Entry est.",0);mk(cw.cs,cv(sg.sl),dn,"SL est."+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((p,i)=>mk(cw.cs,cv(p),up,"T"+(i+1)+" est."+(sg.hits>i?" ✓":""),2))}}
+ const ink="#888",dn="#c0392b",up="#0a7d5a";
+ mk(cw.k2,sg.entry,ink,"Entry",0);mk(cw.k2,sg.sl,dn,"SL"+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((q,i)=>mk(cw.k2,q,up,"T"+(i+1)+(sg.hits>i?" ✓":""),2));
+ if(cv(sg.entry)!=null){mk(cw.cs,cv(sg.entry),ink,"Entry est.",0);mk(cw.cs,cv(sg.sl),dn,"SL est."+(sg.sl_hit?" ✖":""),0);sg.tps.forEach((q,i)=>mk(cw.cs,cv(q),up,"T"+(i+1)+" est."+(sg.hits>i?" ✓":""),2))}}
 let dpBusy=false,cwES=null,cwESu="",cwEST=0,dpRaf=0;
 function cwDepthUrl(){if(!cw.sym||!cw.obj)return "";let u=`/api/depth?symbol=${encodeURIComponent(cw.sym)}&inst=${cw.inst}`;
  if(cw.inst==="opt"){if(cw.strike==null||!cw.exp)return "";u+=`&expiry=${encodeURIComponent(cw.exp)}&strike=${cw.strike}&side=${cw.side}&iv=${cw.iv||0}`}return u}
