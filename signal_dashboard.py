@@ -26,6 +26,7 @@ import math
 import hashlib
 import hmac
 import asyncio
+import collections
 import gc
 import json
 import sqlite3
@@ -2027,7 +2028,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20i"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20k"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2137,6 +2138,7 @@ ALERT_DDL = [
     "CREATE TABLE IF NOT EXISTS watchlist(user_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(user_id, symbol))",
     "CREATE TABLE IF NOT EXISTS kill(scope TEXT PRIMARY KEY, day TEXT NOT NULL, reason TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, ts TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS kill_cfg(user_id INTEGER PRIMARY KEY, daily_loss REAL NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS botcfg(user_id INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(user_id, kind))",
     "CREATE TABLE IF NOT EXISTS journal(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, data TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', tag TEXT NOT NULL DEFAULT '')",
     "CREATE INDEX IF NOT EXISTS journal_user_day ON journal(user_id, day)",
 ]
@@ -3407,6 +3409,7 @@ def autopilot_loop():
 
 # ── memory: the caches below have no natural size limit, so a janitor expires them, and trims the heap's unused pages back to the system ──
 MEM_EMERGENCY = float(os.getenv("MEM_EMERGENCY", "0.95"))   # share of the instance limit at which every cache is dropped
+MEM_HIST = collections.deque(maxlen=1440)   # one sample a minute for the last 24 hours: (time, memory MB, limit MB, cache entries, threads)
 MEM = {"rss": 0.0, "limit": 0.0, "peak": 0.0, "trims": 0, "purges": 0, "last_purge": None}
 
 
@@ -3443,15 +3446,19 @@ def cache_sweep(hard=False):
         for k, v in list(cache.items()):
             try:
                 t = v["t"] if pos == "t" else v[0]
-                if hard or now - t > ttl:
+                if (hard and cache is not CHAIN_CACHE) or now - t > ttl:   # the option chains the autopilot buys from are never dropped in an emergency
                     cache.pop(k, None)
             except Exception:
                 cache.pop(k, None)
-    if hard or now - (NC_CACHE.get("d") or (0,))[0] > 300:
+    if now - (NC_CACHE.get("d") or (0,))[0] > 300:   # the NIFTY candles the autopilot reads are kept in an emergency too
         NC_CACHE.clear()
     for k, v in list(QUOTE_CACHE.items()):
         if k != "error" and now - v[0] > 60:
             QUOTE_CACHE.pop(k, None)
+
+
+def mem_entries():
+    return len(BT_CACHE) + len(OPT_HIST) + len(CHART_CACHE) + len(REPLAY_DATA) + len(CHAIN_CACHE) + len(DHAN_OC) + len(PF_OPT)
 
 
 def mem_loop():
@@ -3463,6 +3470,8 @@ def mem_loop():
             cache_sweep()
             rss, limit = mem_read()
             MEM.update(rss=rss, limit=limit, peak=max(MEM["peak"], rss))
+            if n % 2 == 1:
+                MEM_HIST.append((int(time.time()), round(rss), round(limit), mem_entries(), threading.active_count()))
             if limit and rss > MEM_EMERGENCY * limit:   # close to the instance's limit: drop every cache before the platform kills the process
                 cache_sweep(hard=True)
                 MEM["purges"] += 1
@@ -3477,19 +3486,43 @@ def mem_loop():
             pass
 
 
+ENGINE = {}   # name -> (target, thread)
+
+
+def engine_start(name, target):
+    t = threading.Thread(target=target, daemon=True, name=name)
+    ENGINE[name] = (target, t)
+    t.start()
+
+
+def watchdog_loop():
+    """Every 20 seconds: a background loop that has died (the autopilot, the feeds) is started again."""
+    while True:
+        time.sleep(20)
+        for name, (target, t) in list(ENGINE.items()):
+            try:
+                if name != "watchdog" and not t.is_alive():
+                    print(f"[watchdog] {name} had stopped; started again", flush=True)
+                    engine_start(name, target)
+            except Exception:
+                pass
+
+
 def start_engine():
-    threading.Thread(target=mem_loop, daemon=True).start()
-    threading.Thread(target=autopilot_loop, daemon=True).start()
-    threading.Thread(target=kill_loop, daemon=True).start()
-    threading.Thread(target=quote_loop, daemon=True).start()
-    threading.Thread(target=journal_loop, daemon=True).start()
+    bot_restore()
+    engine_start("watchdog", watchdog_loop)
+    engine_start("mem_loop", mem_loop)
+    engine_start("autopilot_loop", autopilot_loop)
+    engine_start("kill_loop", kill_loop)
+    engine_start("quote_loop", quote_loop)
+    engine_start("journal_loop", journal_loop)
     if DATA_BROKER in ("angel", "dhan"):
         FEED["source"] = DATA_BROKER
-        threading.Thread(target=feed_loop, daemon=True).start()
+        engine_start("feed_loop", feed_loop)
     if DATA_BROKER == "dhan":
-        threading.Thread(target=dhan_ws_loop, daemon=True).start()
+        engine_start("dhan_ws_loop", dhan_ws_loop)
         if DHAN_AUTO_RENEW:
-            threading.Thread(target=dhan_token_loop, daemon=True).start()
+            engine_start("dhan_token_loop", dhan_token_loop)
 
 
 # ── BSE index options (Sensex, Bankex): NSE's site has no BSE contracts, so the chain is built from the broker's instrument list
@@ -4411,10 +4444,60 @@ def bot_manage(u, pos):
         return bot_exit(u, pos, "option safety stop")
 
 
+BOT_SAVED = {}   # (user id, kind) -> the last saved JSON text
+
+
+def bot_persist():
+    """Saves each autopilot's settings and state to the database whenever they change, so a restart can pick them up again."""
+    today = ist_now().strftime("%Y-%m-%d")
+    for (uid, kind), cfg in list(OPTBOT.items()):
+        try:
+            rec = {k: cfg.get(k) for k in ("mode", "paused", "last_mode", "max_trades", "lots", "loss_limit", "armed_day", "entries", "min_grade")}
+            rec.update(day=today, live_pref=MODE_PREF.get(uid) == "live")
+            txt = json.dumps(rec, sort_keys=True)
+            if BOT_SAVED.get((uid, kind)) == txt:
+                continue
+            x("DELETE FROM botcfg WHERE user_id=? AND kind=?", (uid, kind))
+            x("INSERT INTO botcfg(user_id, kind, data) VALUES(?,?,?)", (uid, kind, txt))
+            BOT_SAVED[(uid, kind)] = txt
+        except Exception:
+            pass
+
+
+def bot_restore():
+    """After a restart: bring back today's autopilots as they were (running, paused or off). A live one comes back only if it was armed today and the account may still trade live."""
+    today = ist_now().strftime("%Y-%m-%d")
+    try:
+        rows = q("SELECT user_id, kind, data FROM botcfg")
+    except Exception:
+        return
+    for r in rows:
+        try:
+            rec = json.loads(r["data"])
+            uid, kind = int(r["user_id"]), bot_kind(r["kind"])
+            if rec.get("day") != today or rec.get("mode") not in ("paper", "live"):
+                continue
+            u = user_by_id(uid)
+            if not u:
+                continue
+            cfg = bot_cfg(uid, kind)
+            if rec["mode"] == "live" and not (rec.get("armed_day") == today and rec.get("live_pref") and not live_blocker(u)):
+                bot_log(uid, f"{kind.title()} autopilot was live before the restart but could not be resumed: arm it again with your PIN.", bot=kind)
+                continue
+            cfg.update({k: rec[k] for k in ("mode", "paused", "last_mode", "max_trades", "lots", "loss_limit", "armed_day", "entries", "min_grade") if rec.get(k) is not None})
+            if rec["mode"] == "live":
+                MODE_PREF[uid] = "live"
+            BOT_SAVED[(uid, kind)] = json.dumps(rec, sort_keys=True)
+            bot_log(uid, f"{kind.title()} autopilot resumed after a server restart ({cfg['mode'].upper()}{', paused' if cfg.get('paused') else ''}).", bot=kind)
+        except Exception:
+            pass
+
+
 def optbot_once():
     if not market_open_now():
         return
     today = ist_now().strftime("%Y-%m-%d")
+    bot_persist()
     now_t = ist_now().time()
     uids = {k[0] for k, c in OPTBOT.items() if c["mode"] != "off"} | {o["user"] for o in list(ORDERS) if o.get("bot") and o.get("bot_state") == "open"}
     for o in list(ORDERS):
@@ -4429,6 +4512,8 @@ def optbot_once():
         for kind in BOT_KINDS:
             cfg = bot_cfg(uid, kind)
             try:
+                if cfg["mode"] == "live" and cfg["armed_day"] == today and user_mode(u)[0] != "live" and not live_blocker(u):
+                    MODE_PREF[uid] = "live"   # a sign-in resets the account to paper; an autopilot armed with the PIN today keeps going
                 if cfg["mode"] == "live" and (cfg["armed_day"] != today or user_mode(u)[0] != "live"):
                     cfg["mode"] = "off"
                     bot_log(uid, f"Live {kind} autopilot was switched off because it was not armed today or your account is no longer in live mode.", bot=kind)
@@ -9306,6 +9391,7 @@ def api_optbot_set(request: Request, payload: dict = Body(...)):
     if mode != "off":
         cfg["last_mode"] = mode
     bot_log(u["id"], f"{kind.title()} autopilot set to {mode.upper()}: up to {cfg['max_trades']} trades, {cfg['lots']} lot(s), daily loss limit {cfg['loss_limit']:.0f}.", bot=kind)
+    bot_persist()
     return {"ok": True, **bot_view(u, kind)}
 
 
@@ -9340,6 +9426,7 @@ def api_optbot_control(request: Request, payload: dict = Body(...)):
         left = len(bot_positions(u["id"], kind=kind))
         cfg.update(mode="off", paused=False)
         bot_log(u["id"], f"{kind.title()} stopped: " + ("all positions closed." if not left else f"{left} position(s) could not be closed. Check them in your broker app."), bot=kind)
+        bot_persist()
         return {"ok": True, "left": left, **bot_view(u, kind)}
     elif action == "save":
         err = bot_apply(u, payload, cfg["mode"], kind)
@@ -9347,6 +9434,7 @@ def api_optbot_control(request: Request, payload: dict = Body(...)):
             return {"error": err}
     else:
         return {"error": "Unknown action."}
+    bot_persist()
     return {"ok": True, **bot_view(u, kind)}
 
 
@@ -9633,7 +9721,8 @@ def api_admin_health(request: Request):
     sizes = {"Backtest candles": len(BT_CACHE), "Option history": len(OPT_HIST), "Charts": len(CHART_CACHE), "Replay sets": len(REPLAY_DATA), "Option chains": len(CHAIN_CACHE) + len(DHAN_OC) + len(PF_OPT),
              "Live contracts": len(FULLQ), "Prices": len(LTP), "Past signals": sum(len(v) for v in HIST.values()), "Orders in memory": len(ORDERS)}
     return {"rss": round(rss), "limit": round(limit), "pct": round(rss / limit * 100) if limit else None, "peak": round(MEM["peak"]), "threads": threading.active_count(), "caches": sizes,
-            "trims": MEM["trims"], "purges": MEM["purges"], "last_purge": MEM["last_purge"], "heavy_free": HEAVY._value}
+            "trims": MEM["trims"], "purges": MEM["purges"], "last_purge": MEM["last_purge"], "heavy_free": HEAVY._value, "emergency": MEM_EMERGENCY,
+            "hist": [list(x) for x in list(MEM_HIST)[-1440:]] + [[int(time.time()), round(rss), round(limit), mem_entries(), threading.active_count()]]}
 
 
 @app.get("/api/admin/orderip")
@@ -10581,7 +10670,8 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div class="card"><h3>Server health</h3>
   <div class="sub">Memory in use against this instance's limit, and what is held in memory. The server drops its caches by itself when memory passes 95% of the limit.</div>
   <div class="botrow"><button class="btn go" id="memGo">Check memory</button></div>
-  <div class="sub" id="memNote"></div></div>
+  <div class="sub" id="memNote"></div>
+  <div id="memChart" style="height:230px;margin-top:8px" hidden></div><div class="sub" id="memLeg" hidden></div></div>
  <div class="card"><h3>Everyone's orders today</h3><div class="wrap"><table id="admOrd"></table></div></div>
  <div class="card"><h3>Add a user</h3>
   <div class="grid2" style="margin-bottom:0"><label>Username<input id="nuName" autocomplete="off"></label><label>Temporary password (at least 10 characters)<input id="nuPw" type="password" autocomplete="new-password"></label></div>
@@ -11713,8 +11803,19 @@ $("bsBody").onclick=e=>{const c=e.target.closest("[data-bsc]"),b=e.target.closes
  else if(b){openTicket({kind:"equity",symbol:b.dataset.bsb,label:b.dataset.bsb+" shares",side:"BUY",price:+b.dataset.p,tf:"1d"});const pr=$("tkProd");if(pr)pr.value="DELIVERY"}};
 async function oipCheck(){const n=$("oipNote");n.textContent="Checking…";try{const d=await (await api("/api/admin/orderip")).json();if(d.error){n.textContent=d.error;return}
  n.innerHTML=(d.proxy_on?`Orders go out from <b>${esc(d.via_proxy||"?")}</b>`+(d.via_proxy_error?` (could not reach the proxy: ${esc(d.via_proxy_error)})`:"")+`. Save this address, and its pair, in Dhan.`:"<b>No proxy is set</b>, so orders go out from the server's own address.")+` Everything else goes out from ${esc(d.direct||"?")}.`}catch(e){n.textContent="Could not check. Try again."}}
+let memCh=null;
+function memPlot(d){   // memory over the last 24 hours (one point a minute since the server started), against the limit and the emergency line
+ const el=$("memChart"),lg=$("memLeg"),h=d.hist||[];if(h.length<2||!window.LightweightCharts){el.hidden=true;lg.hidden=true;return}
+ el.hidden=false;lg.hidden=false;if(memCh){memCh.remove();memCh=null}
+ const css=getComputedStyle(document.documentElement),col=(n,f)=>css.getPropertyValue(n).trim()||f,ink=col("--ink","#222"),line=col("--line","#ddd"),up=col("--buy","#0a7d5a"),dn=col("--sell","#c0392b");
+ memCh=LightweightCharts.createChart(el,{autoSize:true,layout:{background:{color:"transparent"},textColor:ink},grid:{vertLines:{color:line},horzLines:{color:line}},rightPriceScale:{borderColor:line},leftPriceScale:{visible:true,borderColor:line},timeScale:{borderColor:line,timeVisible:true,secondsVisible:false}});
+ const T=x=>x[0]+19800,mem=memCh.addAreaSeries({lineColor:"#4c8dff",topColor:"rgba(76,141,255,.35)",bottomColor:"rgba(76,141,255,.02)",lineWidth:2,title:"Memory MB"});mem.setData(h.map(x=>({time:T(x),value:x[1]})));
+ if(d.limit){const l=memCh.addLineSeries({color:dn,lineWidth:1,title:"Limit"});l.setData(h.map(x=>({time:T(x),value:x[2]||d.limit})));const e=memCh.addLineSeries({color:"#e0a030",lineWidth:1,lineStyle:2,title:"Emergency"});e.setData(h.map(x=>({time:T(x),value:(x[2]||d.limit)*(d.emergency||0.95)})))}
+ const c=memCh.addLineSeries({color:up,lineWidth:1,priceScaleId:"left",title:"Cache entries"});c.setData(h.map(x=>({time:T(x),value:x[3]})));
+ memCh.timeScale().fitContent();lg.textContent="Blue: memory in use (MB, right scale). Red: the instance limit. Amber dashes: where every cache is dropped. Green: items held in the caches (left scale). One point a minute since the server last started.";
+}
 async function memCheck(){const n=$("memNote");n.textContent="Checking…";try{const d=await (await api("/api/admin/health")).json();if(d.error){n.textContent=d.error;return}
- n.innerHTML=`Memory <b>${d.rss} MB</b>`+(d.limit?` of ${d.limit} MB (<b>${d.pct}%</b>)`:" (the limit is not visible here)")+`, peak ${d.peak} MB. Threads ${d.threads}. Caches dropped ${d.purges} times`+(d.last_purge?` (last at ${d.last_purge})`:"")+`.<br>`+Object.entries(d.caches).map(([k,v])=>`${esc(k)} <b>${v}</b>`).join(" · ")}catch(e){n.textContent="Could not read it."}}
+ memPlot(d);n.innerHTML=`Memory <b>${d.rss} MB</b>`+(d.limit?` of ${d.limit} MB (<b>${d.pct}%</b>)`:" (the limit is not visible here)")+`, peak ${d.peak} MB. Threads ${d.threads}. Caches dropped ${d.purges} times`+(d.last_purge?` (last at ${d.last_purge})`:"")+`.<br>`+Object.entries(d.caches).map(([k,v])=>`${esc(k)} <b>${v}</b>`).join(" · ")}catch(e){n.textContent="Could not read it."}}
 async function srcSet(w){const d=await post("/api/admin/source",{source:w});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
 async function ssSet(b){const d=await post("/api/admin/session",b);if(d.error)$("ssNote").textContent=d.error;else loadSession()}
 async function loadUsers(){loadSession();loadSource();loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
