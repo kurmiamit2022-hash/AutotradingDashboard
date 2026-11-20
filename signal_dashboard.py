@@ -2028,7 +2028,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20o"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20p"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -10458,7 +10458,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
 <div class="note" id="killBar" hidden style="margin:0 0 10px;border-color:var(--sell);color:var(--sell)"></div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">SWING</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="btst">BTST</button><button data-m="levels">Scanner</button><button data-m="journal">Journal</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">SWING</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="levels">Scanner</button><button data-m="journal">Journal</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -10610,11 +10610,10 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </section>
 <section id="view-levels" hidden>
 <div class="note" id="lvNote" style="margin:0 0 10px">Stocks at a turning point: near a 52 week high or low, through last month's high or low, or a recent signal with one of those levels behind it.</div>
-<div class="botrow" style="margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;gap:8px"><span id="lvTabs" style="flex:1 1 640px"></span><label style="flex:none;white-space:nowrap;display:flex;align-items:center;gap:6px;margin:6px 0 0">Near means within <select id="lvNear" style="width:auto;min-width:56px"><option>1</option><option>2</option><option selected>3</option><option>5</option></select> %</label></div>
-<div class="wrap"><table id="lvTable"><thead><tr><th>Symbol</th><th>Price</th><th>Day %</th><th id="lvLvl">Level</th><th id="lvDist">Distance</th><th></th></tr></thead><tbody id="lvBody"></tbody></table></div>
+<div class="botrow" style="margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;gap:8px"><span id="lvTabs" style="flex:1 1 640px"></span><label id="lvNearL" style="flex:none;white-space:nowrap;display:flex;align-items:center;gap:6px;margin:6px 0 0">Near means within <select id="lvNear" style="width:auto;min-width:56px"><option>1</option><option>2</option><option selected>3</option><option>5</option></select> %</label></div>
+<div class="wrap" id="lvWrap"><table id="lvTable"><thead><tr><th>Symbol</th><th>Price</th><th>Day %</th><th id="lvLvl">Level</th><th id="lvDist">Distance</th><th></th></tr></thead><tbody id="lvBody"></tbody></table></div>
 <div class="sub" id="lvEmpty" style="margin-top:8px"></div>
-</section>
-<section id="view-btst" hidden>
+<div id="lvBtst" hidden>
 <div class="note" id="bsNote" style="margin:0 0 10px">Stocks that closed strong today and may carry into tomorrow. Buy near the close, sell in the first hour of the next session.</div>
 <div id="bsWarn"></div>
 <div class="wrap"><table id="bsTable"><thead><tr><th>Symbol</th><th>Rules met</th><th>Price</th><th>Day %</th><th>Close in range</th><th>Volume ×</th><th>Breakout</th><th>Stop (risk)</th><th></th></tr></thead><tbody id="bsBody"></tbody></table></div>
@@ -10622,6 +10621,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <h3 style="margin:18px 0 6px">Backtest of the same rules <span class="sub" id="bsBtNote"></span></h3>
 <div class="wrap"><table id="bsBt"></table></div>
 <div class="sub" id="bsBtFoot" style="margin-top:8px"></div>
+</div>
 </section>
 <section id="view-orders" hidden>
 <div class="hkpi" id="pfKpi"></div>
@@ -11123,11 +11123,11 @@ async function cwLiveTick(){if(cwTickBusy||document.hidden||mode!=="charts"||!cw
 setInterval(cwLiveTick,3000);
 setInterval(()=>{if(mode==="charts"&&cw.ready&&!document.hidden&&cw.sym&&cwOpenNow())cwLoad(true)},cw_REFRESH_MS);
 function cwClear(){cw.pl=[];cw.plKey="";if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
-function setMode(m){if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
+function setMode(m){if(m==="btst"){m="levels";lvTab="bs"}if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
  ensureTf();
- const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",btst:"btst",levels:"levels",journal:"journal",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
- ["stocks","charts","commodities","autopilot","btst","levels","journal","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
- if(m==="btst")btstLoad();else clearTimeout(btstTimer);
+ const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",levels:"levels",journal:"journal",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
+ ["stocks","charts","commodities","autopilot","levels","journal","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
+ if(m!=="levels")clearTimeout(btstTimer);
  if(m==="levels")lvLoad();else clearTimeout(lvTimer);
  if(m==="journal"){kzLoad();jLoad()}
  if(m==="admin")akLoad();
@@ -11786,33 +11786,35 @@ $("jTable").onclick=async e=>{const b=e.target.closest("[data-jd]");if(b){await 
 $("jPeriod").onchange=$("jMode").onchange=jLoad;
 $("jaAdd").onclick=async()=>{const r=await post("/api/journal/add",{day:$("jaDay").value,label:$("jaLabel").value,dir:$("jaDir").value,qty:$("jaQty").value,entry:$("jaIn").value,exit:$("jaOut").value,note:$("jaNote").value});
  $("jaMsg").textContent=r.error||"Added.";if(!r.error){["jaLabel","jaQty","jaIn","jaOut","jaNote"].forEach(i=>$(i).value="");jLoad()}};
-let lvTimer=null,lvTab="hi",lvData=null;
-const LV_TABS=[["hi","Near 52 week high"],["lo","Near 52 week low"],["up","Monthly breakout"],["dn","Monthly breakdown"],["sl","Signal + level"]];
+let lvTimer=null,lvTab="hi",lvData=null,btstN=null;
+const LV_TABS=[["hi","Near 52 week high"],["lo","Near 52 week low"],["up","Monthly breakout"],["dn","Monthly breakdown"],["sl","Signal + level"],["bs","BTST (buy today, sell tomorrow)"]];
 const LV_TXT={hi:["52 week high","Below the high"],lo:["52 week low","Above the low"],up:["Last month's high","Above it"],dn:["Last month's low","Below it"],sl:["Why it is listed","Signal"]};
 const LV_HELP={hi:"Within the chosen distance of the highest price in the last 52 weeks. A stock at the high shows 0%.",lo:"Within the chosen distance of the lowest price in the last 52 weeks. A stock at the low shows 0%.",
  up:"Trading above the highest price of the previous calendar month. The smaller the distance, the fresher the breakout.",dn:"Trading below the lowest price of the previous calendar month. The smaller the distance, the fresher the breakdown.",
  sl:"A recent daily BUY with a high nearby, or a recent daily SELL with a low nearby: two reasons that agree. Signals up to a few days old and still running are listed, newest first."};
 async function lvLoad(){clearTimeout(lvTimer);
  try{lvData=await (await api("/api/levels?near="+$("lvNear").value)).json();lvPaint()}catch(e){$("lvNote").textContent="Cannot reach the server."}
+ if(lvTab==="bs")btstLoad();
  if(mode==="levels")lvTimer=setTimeout(lvLoad,20000)}
-function lvPaint(){const d=lvData;if(!d)return;
- $("lvTabs").innerHTML=LV_TABS.map(([k,t])=>`<button class="btn${k===lvTab?" go":""}" data-lv="${k}">${t} <b>${d.counts[k]}</b></button>`).join(" ");
+function lvPaint(){const bs=lvTab==="bs",d=lvData||(bs?{counts:{},lists:{}}:null);if(!d)return;
+ $("lvTabs").innerHTML=LV_TABS.map(([k,t])=>`<button class="btn${k===lvTab?" go":""}" data-lv="${k}">${t} <b>${k==="bs"?(btstN==null?"":btstN):d.counts[k]}</b></button>`).join(" ");
+ $("lvBtst").hidden=!bs;$("lvWrap").hidden=bs;$("lvEmpty").hidden=bs;$("lvNearL").hidden=bs;$("lvNote").hidden=bs;if(bs)return;
  $("lvLvl").textContent=LV_TXT[lvTab][0];$("lvDist").textContent=LV_TXT[lvTab][1];
  const rows=d.lists[lvTab]||[];
  const c1=x=>lvTab==="sl"?x.why.map(esc).join("<br>"):`${x.level.toFixed(2)}<br><span class="sub">${esc(x.when)}</span>`;
  const c2=x=>lvTab==="sl"?`<b class="${x.side==="BUY"?"up":"dn"}">${x.side}</b><br><span class="sub">${x.age===0?"this candle":x.age+" candle"+(x.age>1?"s":"")+" ago"} · ${esc(x.status)}</span>`:`<span class="${lvTab==="hi"||lvTab==="up"?"up":"dn"}">${x.dist.toFixed(2)}%${x.new?' <b>new</b>':""}</span>`;
  $("lvBody").innerHTML=rows.map(x=>`<tr><td><b>${esc(x.symbol)}</b>${x.cash?' <span class="sub">Cash</span>':""}${lvTab!=="sl"&&(x.signal==="BUY"||x.signal==="SELL")?` <span class="${x.signal==="BUY"?"up":"dn"}">${esc(x.signal)}</span>`:""}<br><span class="sub">${esc(x.sector||"")}</span></td><td>${x.price.toFixed(2)}</td><td class="${x.chg>=0?"up":"dn"}">${pct1(x.chg)}</td><td>${c1(x)}</td><td>${c2(x)}</td><td><button class="btn" data-lvc="${esc(x.symbol)}">Chart</button></td></tr>`).join("");
  $("lvEmpty").textContent=(rows.length?"":d.scanning?"Scanning…":"No stock matches right now. ")+LV_HELP[lvTab]+` Covers ${d.stocks} stocks`+(d.cash_loaded?" (F&O and cash).":" (F&O; open SWING once to add the cash stocks).")+(d.counts[lvTab]>rows.length?` Showing the closest ${rows.length} of ${d.counts[lvTab]}.`:"")}
-$("lvTabs").onclick=e=>{const b=e.target.closest("[data-lv]");if(b){lvTab=b.dataset.lv;lvPaint()}};
+$("lvTabs").onclick=e=>{const b=e.target.closest("[data-lv]");if(b){lvTab=b.dataset.lv;lvPaint();if(lvTab==="bs")btstLoad();else clearTimeout(btstTimer)}};
 $("lvNear").onchange=lvLoad;
 $("lvBody").onclick=e=>{const c=e.target.closest("[data-lvc]");if(c)openChart(c.dataset.lvc,"1d")};
 let btstTimer=null,btstBtDone=false;
 const pct1=x=>x==null?"–":(x>0?"+":"")+x.toFixed(2)+"%";
 async function btstLoad(){clearTimeout(btstTimer);
  try{const d=await (await api("/api/btst")).json();btstPaint(d)}catch(e){$("bsNote").textContent="Cannot reach the server."}
- if(mode==="btst")btstTimer=setTimeout(btstLoad,15000);
+ if(mode==="levels"&&lvTab==="bs")btstTimer=setTimeout(btstLoad,15000);
  if(!btstBtDone){btstBtDone=true;try{btstBt(await (await api("/api/btst/backtest")).json())}catch(e){btstBtDone=false}}}
-function btstPaint(d){const r=d.rules||{};
+function btstPaint(d){const r=d.rules||{};btstN=(d.rows||[]).length;if(lvData)lvPaint();else if(lvTab==="bs")lvPaint();
  $("bsNote").innerHTML=`Rules: the close sits in the top ${Math.round((1-r.pos)*100)}% of today's range, the day is up ${r.chg[0]}% to ${r.chg[1]}%, volume is at least ${r.vol}× its 20 day average, and the price is at a 20 day high. A stock needs 3 or 4 of the 4 to be listed. `+(d.best_time?"<b>This is the best checking window (3:00 to 3:25 pm).</b>":d.open?"Check again between 3:00 and 3:25 pm, when the day's close is nearly settled.":"The market is closed, so this shows the last session. Check again from 3:00 pm on a trading day.")+` Next trading day: ${esc(d.next_day)}. Sell in your broker app the next morning: this dashboard cannot sell delivery shares.`;
  $("bsWarn").innerHTML=(d.warn||[]).map(w=>`<div class="note" style="margin:0 0 8px;border-color:var(--sell)">${esc(w)}</div>`).join("");
  $("bsBody").innerHTML=(d.rows||[]).map(x=>`<tr${x.event?' style="opacity:.55"':""}><td><b>${esc(x.symbol)}</b>${x.signal==="BUY"?' <span class="up">BUY</span>':""}<br><span class="sub">${esc(x.sector||"")}${x.sector_chg==null?"":" "+pct1(x.sector_chg)}</span>${x.event?`<br><span class="dn">${esc(x.event)}</span>`:""}</td><td>${x.score===4?"<b class=up>4 of 4</b>":"3 of 4"}</td><td>${x.price.toFixed(2)}</td><td class="${x.ok[1]?"up":""}">${pct1(x.chg)}</td><td class="${x.ok[0]?"up":""}">${x.pos==null?"–":Math.round(x.pos*100)+"%"}</td><td class="${x.ok[2]?"up":""}">${x.vol_x==null?"–":x.vol_x.toFixed(1)+"×"}</td><td class="${x.brk?"up":""}">${x.brk?"yes":"no"}</td><td>${x.stop.toFixed(2)}<br><span class="${x.risk>4?"dn":"sub"}">${x.risk.toFixed(1)}% risk</span></td><td style="white-space:nowrap"><button class="btn" data-bsc="${esc(x.symbol)}">Chart</button> <button class="btn go" data-bsb="${esc(x.symbol)}" data-p="${x.price}">Buy</button></td></tr>`).join("");
