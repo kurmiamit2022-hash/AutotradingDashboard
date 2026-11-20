@@ -26,6 +26,7 @@ import math
 import hashlib
 import hmac
 import asyncio
+import gc
 import json
 import sqlite3
 import os
@@ -2026,7 +2027,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20g"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20i"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3404,7 +3405,80 @@ def autopilot_loop():
         time.sleep(AUTOPILOT_SECONDS)
 
 
+# ── memory: the caches below have no natural size limit, so a janitor expires them, and trims the heap's unused pages back to the system ──
+MEM_EMERGENCY = float(os.getenv("MEM_EMERGENCY", "0.95"))   # share of the instance limit at which every cache is dropped
+MEM = {"rss": 0.0, "limit": 0.0, "peak": 0.0, "trims": 0, "purges": 0, "last_purge": None}
+
+
+def mem_read():
+    try:
+        rss = int(open("/proc/self/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
+    except Exception:
+        rss = 0.0
+    limit = 0.0
+    for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = open(f).read().strip()
+            if v.isdigit() and int(v) < 1 << 50:
+                limit = int(v) / 1e6
+                break
+        except Exception:
+            pass
+    return rss, limit
+
+
+def mem_trim():
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        MEM["trims"] += 1
+    except Exception:
+        pass
+
+
+def cache_sweep(hard=False):
+    """Drops expired cache entries (everything when hard)."""
+    now = time.time()
+    for cache, ttl, pos in ((BT_CACHE, 900, 0), (OPT_HIST, 120, 0), (PF_OPT, 60, 0), (DHAN_OC, 60, 0), (CHART_CACHE, 300, 0), (REPLAY_DATA, 1800, 0), (MANUAL_SIG, 120, 0), (CHAIN_CACHE, 600, "t")):
+        for k, v in list(cache.items()):
+            try:
+                t = v["t"] if pos == "t" else v[0]
+                if hard or now - t > ttl:
+                    cache.pop(k, None)
+            except Exception:
+                cache.pop(k, None)
+    if hard or now - (NC_CACHE.get("d") or (0,))[0] > 300:
+        NC_CACHE.clear()
+    for k, v in list(QUOTE_CACHE.items()):
+        if k != "error" and now - v[0] > 60:
+            QUOTE_CACHE.pop(k, None)
+
+
+def mem_loop():
+    n = 0
+    while True:
+        time.sleep(30)
+        try:
+            n += 1
+            cache_sweep()
+            rss, limit = mem_read()
+            MEM.update(rss=rss, limit=limit, peak=max(MEM["peak"], rss))
+            if limit and rss > MEM_EMERGENCY * limit:   # close to the instance's limit: drop every cache before the platform kills the process
+                cache_sweep(hard=True)
+                MEM["purges"] += 1
+                MEM["last_purge"] = ist_now().strftime("%H:%M:%S")
+                gc.collect()
+                mem_trim()
+                print(f"[memory] {rss:.0f} MB of {limit:.0f} MB: caches dropped", flush=True)
+            elif n % 2 == 0:
+                gc.collect()
+                mem_trim()
+        except Exception:
+            pass
+
+
 def start_engine():
+    threading.Thread(target=mem_loop, daemon=True).start()
     threading.Thread(target=autopilot_loop, daemon=True).start()
     threading.Thread(target=kill_loop, daemon=True).start()
     threading.Thread(target=quote_loop, daemon=True).start()
@@ -5074,7 +5148,20 @@ def bt_params(payload):
         return None, str(e)
 
 
+HEAVY = threading.Semaphore(int(os.getenv("HEAVY_JOBS", "2")))   # backtests and replays load hundreds of candle frames each; only this many run at once, the rest wait
+
+
 def bt_job(jid, user_id, p):
+    if not HEAVY.acquire(blocking=False):
+        BT_JOBS[jid]["note"] = "Waiting for other heavy runs to finish"
+        HEAVY.acquire()
+    try:
+        _bt_job(jid, user_id, p)
+    finally:
+        HEAVY.release()
+
+
+def _bt_job(jid, user_id, p):
     job = BT_JOBS[jid]
     try:
         if p["strategy"] == "movers":
@@ -5115,6 +5202,18 @@ def bt_job(jid, user_id, p):
 
 # ── Web app ──
 app = FastAPI(title="SignalDesk", docs_url=None, redoc_url=None, openapi_url=None)
+from starlette.middleware.gzip import GZipMiddleware
+
+
+class SmartGZip(GZipMiddleware):
+    """Compresses the big JSON answers; the live stream is left alone, because compression would hold its messages back."""
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/api/stream":
+            return await self.app(scope, receive, send)
+        return await super().__call__(scope, receive, send)
+
+
+app.add_middleware(SmartGZip, minimum_size=1000, compresslevel=5)
 
 
 PUBLIC_PATHS = {"/login", "/api/login", "/signup", "/api/signup", "/forgot", "/api/forgot", "/admin"}
@@ -9001,6 +9100,18 @@ def replay_trade(c, day):
 
 
 def replay_job(uid, kind, day):
+    if not HEAVY.acquire(blocking=False):
+        j = REPLAY_JOB.get((uid, kind))
+        if j is not None:
+            j["msg"] = "Waiting for other heavy runs to finish"
+        HEAVY.acquire()
+    try:
+        _replay_job(uid, kind, day)
+    finally:
+        HEAVY.release()
+
+
+def _replay_job(uid, kind, day):
     j = REPLAY_JOB[(uid, kind)]
     try:
         def prog(done, total):
@@ -9511,6 +9622,18 @@ def api_broker_delete(request: Request, b: str):
 # ── admin ──
 def need_admin(request):
     return None if request.state.user["role"] == "admin" else JSONResponse({"error": "Admins only."}, status_code=403)
+
+
+@app.get("/api/admin/health")
+def api_admin_health(request: Request):
+    if (r := need_admin(request)) is not None:
+        return r
+    rss, limit = mem_read()
+    MEM.update(rss=rss, limit=limit, peak=max(MEM["peak"], rss))
+    sizes = {"Backtest candles": len(BT_CACHE), "Option history": len(OPT_HIST), "Charts": len(CHART_CACHE), "Replay sets": len(REPLAY_DATA), "Option chains": len(CHAIN_CACHE) + len(DHAN_OC) + len(PF_OPT),
+             "Live contracts": len(FULLQ), "Prices": len(LTP), "Past signals": sum(len(v) for v in HIST.values()), "Orders in memory": len(ORDERS)}
+    return {"rss": round(rss), "limit": round(limit), "pct": round(rss / limit * 100) if limit else None, "peak": round(MEM["peak"]), "threads": threading.active_count(), "caches": sizes,
+            "trims": MEM["trims"], "purges": MEM["purges"], "last_purge": MEM["last_purge"], "heavy_free": HEAVY._value}
 
 
 @app.get("/api/admin/orderip")
@@ -10455,6 +10578,10 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="sub">Dhan accepts order calls only from the addresses saved in its Static IP Setting. With ORDER_PROXY (or QUOTAGUARDSTATIC_URL) set, orders go out through the proxy; everything else goes out directly.</div>
   <div class="botrow"><button class="btn go" id="oipGo">Check order IP</button></div>
   <div class="sub" id="oipNote"></div></div>
+ <div class="card"><h3>Server health</h3>
+  <div class="sub">Memory in use against this instance's limit, and what is held in memory. The server drops its caches by itself when memory passes 95% of the limit.</div>
+  <div class="botrow"><button class="btn go" id="memGo">Check memory</button></div>
+  <div class="sub" id="memNote"></div></div>
  <div class="card"><h3>Everyone's orders today</h3><div class="wrap"><table id="admOrd"></table></div></div>
  <div class="card"><h3>Add a user</h3>
   <div class="grid2" style="margin-bottom:0"><label>Username<input id="nuName" autocomplete="off"></label><label>Temporary password (at least 10 characters)<input id="nuPw" type="password" autocomplete="new-password"></label></div>
@@ -11586,6 +11713,8 @@ $("bsBody").onclick=e=>{const c=e.target.closest("[data-bsc]"),b=e.target.closes
  else if(b){openTicket({kind:"equity",symbol:b.dataset.bsb,label:b.dataset.bsb+" shares",side:"BUY",price:+b.dataset.p,tf:"1d"});const pr=$("tkProd");if(pr)pr.value="DELIVERY"}};
 async function oipCheck(){const n=$("oipNote");n.textContent="Checking…";try{const d=await (await api("/api/admin/orderip")).json();if(d.error){n.textContent=d.error;return}
  n.innerHTML=(d.proxy_on?`Orders go out from <b>${esc(d.via_proxy||"?")}</b>`+(d.via_proxy_error?` (could not reach the proxy: ${esc(d.via_proxy_error)})`:"")+`. Save this address, and its pair, in Dhan.`:"<b>No proxy is set</b>, so orders go out from the server's own address.")+` Everything else goes out from ${esc(d.direct||"?")}.`}catch(e){n.textContent="Could not check. Try again."}}
+async function memCheck(){const n=$("memNote");n.textContent="Checking…";try{const d=await (await api("/api/admin/health")).json();if(d.error){n.textContent=d.error;return}
+ n.innerHTML=`Memory <b>${d.rss} MB</b>`+(d.limit?` of ${d.limit} MB (<b>${d.pct}%</b>)`:" (the limit is not visible here)")+`, peak ${d.peak} MB. Threads ${d.threads}. Caches dropped ${d.purges} times`+(d.last_purge?` (last at ${d.last_purge})`:"")+`.<br>`+Object.entries(d.caches).map(([k,v])=>`${esc(k)} <b>${v}</b>`).join(" · ")}catch(e){n.textContent="Could not read it."}}
 async function srcSet(w){const d=await post("/api/admin/source",{source:w});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
 async function ssSet(b){const d=await post("/api/admin/session",b);if(d.error)$("ssNote").textContent=d.error;else loadSession()}
 async function loadUsers(){loadSession();loadSource();loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
@@ -11601,7 +11730,7 @@ $("usrTable").onclick=async e=>{const b=e.target.closest("button[data-act]");if(
  else if(b.dataset.act==="limits"){limUser=u;const c=u.caps;$("limTitle").textContent="Limits for "+u.username;$("limValue").value=c.max_order_value;$("limQty").value=c.max_qty;$("limOrders").value=c.max_orders;$("limLots").value=c.max_fut_lots;$("limFut").value=c.max_fut_value;$("limSell").value=c.allow_option_selling?"1":"0";$("limMsg").textContent="";$("limDlg").showModal();return}
  if(d)$("admNote").textContent=d.error||"Saved.";loadUsers()};
 $("limClose").onclick=()=>$("limDlg").close();
-$("ssOpen").onclick=()=>ssSet({start:$("ssFrom").value,end:$("ssTo").value});$("ssClear").onclick=()=>ssSet({clear:true});$("oipGo").onclick=oipCheck;$("srcDhan").onclick=()=>srcSet("dhan");$("srcYahoo").onclick=()=>srcSet("yahoo");
+$("ssOpen").onclick=()=>ssSet({start:$("ssFrom").value,end:$("ssTo").value});$("ssClear").onclick=()=>ssSet({clear:true});$("oipGo").onclick=oipCheck;$("memGo").onclick=memCheck;$("srcDhan").onclick=()=>srcSet("dhan");$("srcYahoo").onclick=()=>srcSet("yahoo");
 $("limSave").onclick=async()=>{const d=await send("PATCH","/api/admin/users/"+limUser.id,{caps:{max_order_value:$("limValue").value,max_qty:$("limQty").value,max_orders:$("limOrders").value,max_fut_lots:$("limLots").value,max_fut_value:$("limFut").value,allow_option_selling:$("limSell").value==="1"}});
  if(d.error){$("limMsg").textContent=d.error;return}$("limDlg").close();loadUsers()};
 $("addUser").onclick=async()=>{const d=await send("POST","/api/admin/users",{username:$("nuName").value,password:$("nuPw").value,role:$("nuRole").value});$("admNote").textContent=d.error||"User added. Live trading is off for them until you enable it.";if(!d.error){$("nuName").value="";$("nuPw").value=""}loadUsers()};
