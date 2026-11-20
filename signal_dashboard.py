@@ -2028,7 +2028,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20n"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20o"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -8512,7 +8512,25 @@ def journal_sync(force=False):
     with ORDER_LOCK:
         for o in ORDERS:
             latest[o["id"]] = dict(o)
-    for t in journal_trades(latest.values()):
+    trades, plain = [], []
+    for o in latest.values():
+        if o.get("bot"):
+            try:
+                trades.extend(journal_trades([o]))
+            except Exception as e:
+                print("journal skip", o.get("id"), repr(e), flush=True)
+        else:
+            plain.append(o)
+    try:
+        trades.extend(journal_trades(plain))
+    except Exception as e:
+        print("journal orders:", repr(e), flush=True)
+        for o in plain:
+            try:
+                trades.extend(journal_trades([o]))
+            except Exception:
+                pass
+    for t in trades:
         try:
             x("INSERT INTO journal(id, user_id, day, data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (t["id"], t["user"], t["day"], json.dumps(t)))
         except Exception as e:
@@ -8560,7 +8578,10 @@ def _group(trades, key):
 @app.get("/api/journal")
 def api_journal(request: Request, period: str = "30d", mode: str = "all"):
     u = request.state.user
-    journal_sync()
+    try:
+        journal_sync()
+    except Exception as e:
+        print("journal sync:", repr(e), flush=True)
     span = JOURNAL_DAYS.get(period, 30)
     args, sql = [u["id"]], "SELECT id, data, note, tag FROM journal WHERE user_id=?"
     if span is not None:
@@ -11747,7 +11768,7 @@ $("akTrip").onclick=async()=>{await post("/api/admin/kill",{action:"trip_all"});
 $("akReset").onclick=async()=>{await post("/api/admin/kill",{action:"reset_all"});akLoad();killPoll()};
 $("akNote").onclick=async e=>{const b=e.target.closest("[data-aku]");if(b){await post("/api/admin/kill",{action:"reset_user",user_id:+b.dataset.aku});akLoad()}};
 // ── journal ──
-async function jLoad(){try{const d=await (await api(`/api/journal?period=${$("jPeriod").value}&mode=${$("jMode").value}`)).json();jPaint(d)}catch(e){}}
+async function jLoad(){try{const d=await (await api(`/api/journal?period=${$("jPeriod").value}&mode=${$("jMode").value}`)).json();if(d.error)throw new Error(d.error);jPaint(d)}catch(e){const m=document.getElementById("jCurve");if(m)m.innerHTML=`<div class="sub">The journal could not load (${esc(String(e.message||e))}). Reload the page; if it stays, tell the administrator.</div>`}}
 const jm=v=>v==null?"–":(v<0?"−":"")+"₹"+Math.abs(v).toLocaleString("en-IN",{maximumFractionDigits:2});
 function jPaint(d){const s=d.stats||{n:0},T=d.trades||[];
  $("jKpi").innerHTML=s.n?[["Net result",jm(s.total),s.n+" trades",s.total],["Win rate",s.win_pct+"%",`avg win ${jm(s.avg_win)}, avg loss ${jm(s.avg_loss)}`],["Profit factor",s.pf==null?"–":s.pf,s.pf==null?"no losing trades":s.pf>=1?"profit is more than loss":"loss is more than profit"],
