@@ -2028,7 +2028,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20p"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20q"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -10458,7 +10458,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="banner paper" id="banner"></div>
 <div class="banner live" id="dpBanner" hidden>You are signed in with the default admin password. Change it under Account now. Anyone who knows it can sign in as admin.</div>
 <div class="note" id="killBar" hidden style="margin:0 0 10px;border-color:var(--sell);color:var(--sell)"></div>
-<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">SWING</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="levels">Scanner</button><button data-m="journal">Journal</button><button data-m="history">History</button><button data-m="backtest">Backtest</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
+<nav class="mode" id="mode" aria-label="View"><button data-m="stocks">SWING</button><button data-m="charts">Trade Desk</button><button data-m="commodities">Commodities</button><button data-m="autopilot">Autopilot</button><button data-m="levels">Scanner</button><button data-m="perf">Performance</button><button data-m="orders">Portfolio</button><button data-m="account">Account</button><button data-m="admin" id="navAdmin" hidden>Admin</button></nav>
 <section id="view-stocks">
 <div class="idx" id="idxTiles"></div>
 <div class="sechead"><b>Sectors</b><span class="sub" id="secnote"></span></div>
@@ -10512,6 +10512,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <section id="view-autopilot" hidden>
 <div id="botHost"></div>
 </section>
+<div id="perfBar" class="botrow" style="margin-bottom:10px;gap:8px" hidden><button class="btn" data-pf="journal">Journal</button> <button class="btn" data-pf="history">History</button> <button class="btn" data-pf="backtest">Backtest</button></div>
 <section id="view-history" hidden>
 <div class="hbar">
  <input id="hSym" placeholder="Search symbol" aria-label="Search symbol">
@@ -11123,7 +11124,8 @@ async function cwLiveTick(){if(cwTickBusy||document.hidden||mode!=="charts"||!cw
 setInterval(cwLiveTick,3000);
 setInterval(()=>{if(mode==="charts"&&cw.ready&&!document.hidden&&cw.sym&&cwOpenNow())cwLoad(true)},cw_REFRESH_MS);
 function cwClear(){cw.pl=[];cw.plKey="";if(cw.obj){cw.obj.remove();cw.obj=null}if(cw.obj2){cw.obj2.remove();cw.obj2=null}$("cwBaseW").hidden=true;document.querySelector(".cwm").classList.remove("cwopt")}
-function setMode(m){if(m==="btst"){m="levels";lvTab="bs"}if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
+const PERF=["journal","history","backtest"];let perfLast="journal";
+function setMode(m){if(m==="perf")m=perfLast;if(PERF.includes(m))perfLast=m;if(m==="btst"){m="levels";lvTab="bs"}if(m==="index"||m==="options"||m==="scanner")m="charts";if(m==="futures")m="stocks";if(m==="admin"&&!(me&&me.user.role==="admin"))m="stocks";mode=m;try{localStorage.setItem("mode",m)}catch(e){}
  ensureTf();
  const vm={stocks:"stocks",futures:"stocks",charts:"charts",commodities:"commodities",autopilot:"autopilot",levels:"levels",journal:"journal",history:"history",backtest:"backtest",orders:"orders",account:"account",admin:"admin"};
  ["stocks","charts","commodities","autopilot","levels","journal","history","backtest","orders","account","admin"].forEach(x=>document.getElementById("view-"+x).hidden=x!==vm[m]);
@@ -11133,11 +11135,13 @@ function setMode(m){if(m==="btst"){m="levels";lvTab="bs"}if(m==="index"||m==="op
  if(m==="admin")akLoad();
  if(m==="charts")cwShow();
  if(m==="commodities"){cmPaint();cmLoad()}else clearTimeout(cmTimer);
- document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===m));
+ document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===(PERF.includes(m)?"perf":m)));
+ $("perfBar").hidden=!PERF.includes(m);document.querySelectorAll("#perfBar [data-pf]").forEach(b=>b.classList.toggle("go",b.dataset.pf===m));
  if(m==="autopilot")botLoad();else clearTimeout(botTimer);
  if(m==="orders")loadOrders();if(m==="history")loadHistory();if(m==="account"){loadMe();loadAlerts()}if(m==="admin")loadUsers();
  if(m==="stocks"||m==="futures"){filter="ALL";q="";document.getElementById("q").value="";renderHead();if(m==="futures")loadFutInfo();render();if(m==="stocks")loadCash()}}
 function initConf(){$("confOnly").onchange=()=>render()}
+document.getElementById("perfBar").onclick=e=>{const b=e.target.closest("[data-pf]");if(b)setMode(b.dataset.pf)};
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
 document.getElementById("omore").onchange=()=>{if(lastChain)renderChain(lastChain)};
 async function loadChain(quiet){
