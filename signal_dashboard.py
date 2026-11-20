@@ -2028,7 +2028,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20k"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-20n"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3754,15 +3754,16 @@ def cont_window_open():
     return AUTO_CONT_START <= t < AUTO_CONT_END
 
 
-AUTO_MOVE_MIN = float(os.getenv("AUTO_MOVE_MIN", "1"))   # the scanner autopilot only trades stocks whose move today (up or down) is between these percentages
-AUTO_MOVE_MAX = float(os.getenv("AUTO_MOVE_MAX", "3"))
+AUTO_MOVE_MIN = float(os.getenv("AUTO_MOVE_MIN", "1.8"))   # the scanner autopilot only trades stocks whose move today (up or down) is between these percentages
+AUTO_MOVE_MAX = float(os.getenv("AUTO_MOVE_MAX", "3.6"))
 AUTO_MOM = os.getenv("AUTO_MOM", "1") != "0"   # extra OR entry for the stock autopilot: a big mover early in the day, with no indicator signal needed
 AUTO_MOM_END = os.getenv("AUTO_MOM_END", "10:00")   # such entries are only taken before this time
-AUTO_MOM_PCT = float(os.getenv("AUTO_MOM_PCT", "2"))   # a stock that moved more than this percent either way qualifies
+AUTO_MOM_PCT = float(os.getenv("AUTO_MOM_PCT", "1.8"))   # a stock must have moved at least this percent either way ...
+AUTO_MOM_MAX = float(os.getenv("AUTO_MOM_MAX", "3.6"))   # ... and not more than this (a stock that has run further is not chased)
 AUTO_MOM_TOP = int(os.getenv("AUTO_MOM_TOP", "2"))   # sectors traded WITH the NIFTY trend: the best ones while NIFTY is up, the worst ones while it is down
 AUTO_MOM_COUNTER = int(os.getenv("AUTO_MOM_COUNTER", "1"))   # sectors traded against the NIFTY trend: the worst while it is up, the best while it is down
 AUTO_MOM_ATR = float(os.getenv("AUTO_MOM_ATR", "1.5"))   # its stop is this many of the stock's average candle ranges away (the same range the other entries use, kept between 1 and 3)
-AUTO_SENT = os.getenv("AUTO_SENT", "1") != "0"   # stock autopilot: trade the way NIFTY is leaning today (CE when it is up, PE when it is down)
+AUTO_SENT = os.getenv("AUTO_SENT", "0") == "1"   # 1 = the lean filter: with NIFTY flat (inside +-AUTO_SENT_MIN) nothing is bought, and the older signal entries only follow NIFTY. Off by default: a flat NIFTY then trades the best and the worst sector
 AUTO_SENT_MIN = float(os.getenv("AUTO_SENT_MIN", "0.1"))   # NIFTY must be at least this far from yesterday's close, up or down, to count as a lean
 AUTO_OLD_RULES = os.getenv("AUTO_OLD_RULES", "0") == "1"   # 1 brings back the indicator-signal entries (fresh and continuation) for the stock autopilot
 AUTO_MOVES = {}   # bot -> {symbol: (change today %, sector)}, kept for the manual list
@@ -3792,9 +3793,9 @@ def bot_rules(kind):
     if kind == "nifty":
         return NC_RULES + f" Entries from 9:20 to {OPTBOT_LAST_ENTRY.strftime('%H:%M')}, everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
     tail = f" Everything is sold by {OPTBOT_SQUAREOFF.strftime('%H:%M')}."
-    sent = " The trades that go with NIFTY are taken first. If NIFTY is flat, nothing is bought." if AUTO_SENT else ""
+    sent = " The trades that go with NIFTY are taken first. If NIFTY is flat, nothing is bought." if AUTO_SENT else " The trades that go with NIFTY are taken first. If NIFTY is flat, the best sector gets a CE and the worst sector a PE."
     mom = (f"Before {AUTO_MOM_END}, by the NIFTY trend. While NIFTY is down: a PE on stocks in the {AUTO_MOM_TOP} worst sectors of the day and a CE on stocks in the {AUTO_MOM_COUNTER} best sector. "
-           f"While NIFTY is up: a CE on stocks in the {AUTO_MOM_TOP} best sectors and a PE on stocks in the {AUTO_MOM_COUNTER} worst sector. The stock itself must have moved more than {AUTO_MOM_PCT:g}% the same way as its sector. "
+           f"While NIFTY is up: a CE on stocks in the {AUTO_MOM_TOP} best sectors and a PE on stocks in the {AUTO_MOM_COUNTER} worst sector. The stock itself must have moved between {AUTO_MOM_PCT:g}% and {AUTO_MOM_MAX:g}% the same way as its sector. "
            "No signal is needed.") if AUTO_MOM else ""
     if AUTO_MOM and not AUTO_OLD_RULES:
         return mom + sent + " Stop and targets T1 to T4 come from the stock's own range." + tail + " The Replay below runs these same early-mover rules on past days (using the 5 minute candles; the grade filter cannot be rebuilt for the past, so it is not applied)."
@@ -3826,7 +3827,7 @@ def mom_hot(avg, nside):
     """The sectors the early-mover rule trades, from {sector: average move} and the NIFTY side. NIFTY down: the AUTO_MOM_TOP worst sectors (PE) and the AUTO_MOM_COUNTER best (CE).
     NIFTY up: the AUTO_MOM_TOP best sectors (CE) and the AUTO_MOM_COUNTER worst (PE). Returns {sector: "gainers" or "losers"}."""
     order = sorted(avg, key=lambda k: -avg[k])
-    n_up, n_dn = (AUTO_MOM_TOP, AUTO_MOM_COUNTER) if nside == "BUY" else (AUTO_MOM_COUNTER, AUTO_MOM_TOP)
+    n_up, n_dn = (AUTO_MOM_TOP, AUTO_MOM_COUNTER) if nside == "BUY" else (AUTO_MOM_COUNTER, AUTO_MOM_TOP) if nside == "SELL" else (AUTO_MOM_COUNTER, AUTO_MOM_COUNTER)   # NIFTY flat: one best sector (CE), one worst (PE)
     hot = {k: "gainers" for k in order[:n_up] if avg[k] > 0}
     hot.update({k: "losers" for k in order[::-1][:n_dn] if avg[k] < 0})
     return hot
@@ -3841,7 +3842,7 @@ def mom_candidates(u, cfg, kind, rows, today, no, manual=False, day=False):
         return out
     nside, nchg = nifty_sentiment()
     ntxt = "NIFTY is not available" if nchg is None else f"NIFTY is {nchg:+.2f}%"
-    if nside is None:   # there is no trend to follow
+    if nside is None and AUTO_SENT:   # there is no trend to follow
         no("early movers", ("NIFTY is flat today (%+.2f%%)" % nchg if nchg is not None else "NIFTY is not available yet") + ", so there is no trend to follow and nothing is bought")
         return out
     mv = [(r, r.get("ltp_chg", r.get("chg"))) for r in rows if r.get("ltp") or r.get("close")]
@@ -3863,7 +3864,7 @@ def mom_candidates(u, cfg, kind, rows, today, no, manual=False, day=False):
     for r, m in mv:
         sym = r["symbol"]
         sec = r.get("sector") or sector_of(sym)
-        if sec not in hot or abs(m) <= AUTO_MOM_PCT:   # both must hold: its sector is one of the best or worst, and the stock itself moved more than AUTO_MOM_PCT
+        if sec not in hot or not (AUTO_MOM_PCT <= abs(m) <= AUTO_MOM_MAX):   # both must hold: its sector is one of the best or worst, and the stock itself moved more than AUTO_MOM_PCT
             continue
         side = "BUY" if hot[sec] == "gainers" else "SELL"
         if (m > 0) != (side == "BUY"):   # a stock moving against its own sector is left out
@@ -4034,7 +4035,8 @@ def auto_enter(u, cfg, kind):
     if why and not cands:   # say why, once per change or every 10 minutes, so a quiet autopilot can be understood
         text = "No trade: " + "; ".join(why[:6]) + (f"; and {len(why) - 6} more" if len(why) > 6 else "")
         last = BOT_DIAG.get((u["id"], kind))
-        if not last or last[1] != text or time.time() - last[0] > 600:
+        same = last and re.sub(r"[-+]?\d+(\.\d+)?", "#", last[1]) == re.sub(r"[-+]?\d+(\.\d+)?", "#", text)   # only the numbers moved: not a new reason
+        if not last or (not same and last[1] != text) or time.time() - last[0] > 600:
             BOT_DIAG[(u["id"], kind)] = (time.time(), text)
             bot_log(u["id"], text, bot=kind)
     for c in cands:
@@ -5266,7 +5268,7 @@ def _bt_job(jid, user_id, p):
             res = bt_run(p, {}, tr)
             res["problems"] = errors[:5] + res["problems"]
             res["notes"] = [f"Early movers: before {AUTO_MOM_END}, by the NIFTY trend. NIFTY down: sell the {AUTO_MOM_TOP} worst sectors, buy the {AUTO_MOM_COUNTER} best. NIFTY up: buy the {AUTO_MOM_TOP} best, sell the {AUTO_MOM_COUNTER} worst. "
-                            f"The stock must also have moved more than {AUTO_MOM_PCT:g}% the same way. At most {int(bot_cfg(user_id, 'scanner').get('max_trades', 3))} trades a day, as in your Autopilot settings. "
+                            f"The stock must also have moved between {AUTO_MOM_PCT:g}% and {AUTO_MOM_MAX:g}% the same way. At most {int(bot_cfg(user_id, 'scanner').get('max_trades', 3))} trades a day, as in your Autopilot settings. "
                             "The grade filter and the symbol list are not used; the timeframe is 5 minutes."] + res["notes"]
             res["params"] = {k: (v.strftime("%H:%M") if isinstance(v, dtime) else v) for k, v in p.items()}
             job.update(state="done", result=res)
@@ -8824,7 +8826,7 @@ def replay_mom_cands(data, syms, day, T, endt):
         return [], "no NIFTY close from the day before"
     nchg = (float(N["c"][kn]) / float(N["c"][d0 - 1]) - 1) * 100
     nside = "BUY" if nchg >= AUTO_SENT_MIN else "SELL" if nchg <= -AUTO_SENT_MIN else None
-    if nside is None:
+    if nside is None and AUTO_SENT:
         return [], "NIFTY was flat, so there was no trend to follow"
     items, grp = [], {}
     for s_ in syms:
@@ -8845,7 +8847,7 @@ def replay_mom_cands(data, syms, day, T, endt):
     hot = mom_hot(avg, nside)
     out = []
     for s_, S5, k5, ltp, m, sec in items:
-        if sec not in hot or abs(m) <= AUTO_MOM_PCT:
+        if sec not in hot or not (AUTO_MOM_PCT <= abs(m) <= AUTO_MOM_MAX):
             continue
         side = "BUY" if hot[sec] == "gainers" else "SELL"
         if (m > 0) != (side == "BUY"):
