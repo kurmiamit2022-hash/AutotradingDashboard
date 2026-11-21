@@ -2033,7 +2033,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-21d"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-21e"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -10494,8 +10494,12 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  main{padding-left:10px;padding-right:10px}
  input,select,textarea{font-size:16px!important}
  .btn,.mini,.mode button,.seg button{min-height:40px}
- .mode{position:sticky;top:0;z-index:20;margin-left:-4px;margin-right:-4px}
- .mode button{white-space:nowrap;padding:10px 14px}
+ .mode{position:fixed;left:0;right:0;bottom:0;top:auto;width:auto;max-width:none;z-index:20;margin:0;border-radius:16px 16px 0 0;padding:6px 6px calc(6px + env(safe-area-inset-bottom));overflow-x:auto;flex-wrap:nowrap;box-shadow:0 -6px 24px rgba(20,24,60,.14)}
+ .mode button{white-space:nowrap;padding:10px 14px;flex:0 0 auto}
+ main{padding-bottom:calc(84px + env(safe-area-inset-bottom))}
+ html,body{overflow-x:hidden;max-width:100%}
+ .chk,.botrow,.ctl{max-width:100%;flex-wrap:wrap}
+ #q{min-width:0;max-width:100%;width:100%}
  header{flex-direction:column;align-items:flex-start;gap:8px}
  .ctl{flex-wrap:wrap;gap:6px}
  dialog{width:100vw!important;max-width:100vw!important;max-height:100dvh;margin:0;border-radius:18px 18px 0 0;position:fixed;top:auto;bottom:0}
