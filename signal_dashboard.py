@@ -441,7 +441,12 @@ def levels_pack(df):
     py, pm = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
     m_ = d[[(t.year, t.month) == (py, pm) for t in d.index]]
     out = {"hi52": round(float(H[ih]), 2), "hi52_d": y.index[ih].strftime("%d %b %Y"), "lo52": round(float(L[il]), 2), "lo52_d": y.index[il].strftime("%d %b %Y"),
-           "days": len(y), "pm": None, "pm_hi": None, "pm_lo": None}
+           "days": len(y), "pm": None, "pm_hi": None, "pm_lo": None, "pd_hi": round(float(d["High"].iloc[-1]), 2), "pd_lo": round(float(d["Low"].iloc[-1]), 2),
+           "pd_d": d.index[-1].strftime("%d %b"), "pw_hi": None, "pw_lo": None}
+    mon = today - timedelta(days=today.weekday())   # the previous calendar week, Monday to Sunday
+    w_ = d[[mon - timedelta(days=7) <= t.date() < mon for t in d.index]]
+    if len(w_) >= 2:
+        out.update(pw_hi=round(float(w_["High"].max()), 2), pw_lo=round(float(w_["Low"].min()), 2))
     if len(m_) >= 5:
         out.update(pm=m_.index[0].strftime("%b"), pm_hi=round(float(m_["High"].max()), 2), pm_lo=round(float(m_["Low"].min()), 2))
     return out
@@ -2028,7 +2033,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-20q"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-21c"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5719,6 +5724,46 @@ def api_events(request: Request):
 SCAN_SIG_BARS = int(os.getenv("SCAN_SIG_BARS", "5"))     # signal plus level: how many daily candles old a signal may be
 
 
+BO_LEVELS = (("PD", "pd_hi", "pd_lo"), ("PW", "pw_hi", "pw_lo"), ("PM", "pm_hi", "pm_lo"), ("52W", "hi52", "lo52"))   # previous day, previous week, previous month, 52 weeks
+
+
+def _intra_signal(symbol, side, intra, today_s):
+    """The newest 5 or 15 minute signal of this side from today that has not hit its stop, or None."""
+    sig = None
+    for tf_ in ("5m", "15m"):
+        r_ = (intra.get(tf_) or {}).get(symbol)
+        if not r_ or r_.get("signal") != side or r_.get("signal_date") != today_s or r_.get("bars_ago") is None or r_.get("sl_hit"):
+            continue
+        cand = {"tf": tf_, "side": side, "ago": r_["bars_ago"], "time": r_.get("signal_time"), "status": r_.get("status"), "entry": r_.get("entry"), "sl": r_.get("sl"),
+                "t1": r_.get("tp1"), "t2": r_.get("tp2"), "t3": r_.get("tp3"), "t4": r_.get("tp4")}
+        if sig is None or cand["ago"] < sig["ago"]:
+            sig = cand
+    return sig
+
+
+def breakout_row(base, lv, price, intra, today_s):
+    """A stock trading beyond the previous day's, week's or month's high or low, or the 52 week high or low, with the 5 or 15 minute signal of the same direction that came after it (today), if any."""
+    up = [(k + "H", lv[h], (price / lv[h] - 1) * 100) for k, h, _ in BO_LEVELS if lv.get(h) and price > lv[h]]
+    dn = [(k + "L", lv[l_], (lv[l_] / price - 1) * 100) for k, _, l_ in BO_LEVELS if lv.get(l_) and price < lv[l_]]
+    if bool(up) == bool(dn):
+        return None   # nothing broken, or the two directions disagree
+    brk, side = (up, "BUY") if up else (dn, "SELL")
+    return {**base, "dir": "up" if up else "dn", "broke": [{"k": k, "level": lvl, "by": round(by, 2)} for k, lvl, by in sorted(brk, key=lambda x: x[2])],
+            "dist": round(min(b[2] for b in brk), 2), "sig": _intra_signal(base["symbol"], side, intra, today_s)}
+
+
+def pending_row(base, lv, price, intra, today_s, near):
+    """A stock still under a high or over a low, within `near` per cent of it: about to break. Same layout as the breakout row."""
+    up = [(k + "H", lv[h], (lv[h] / price - 1) * 100) for k, h, _ in BO_LEVELS if lv.get(h) and 0 < (lv[h] / price - 1) * 100 <= near]
+    dn = [(k + "L", lv[l_], (price / lv[l_] - 1) * 100) for k, _, l_ in BO_LEVELS if lv.get(l_) and 0 < (price / lv[l_] - 1) * 100 <= near]
+    if not up and not dn:
+        return None
+    side_up = bool(up) and (not dn or min(u[2] for u in up) <= min(d_[2] for d_ in dn))
+    brk, side = (up, "BUY") if side_up else (dn, "SELL")
+    return {**base, "dir": "up" if side_up else "dn", "broke": [{"k": k, "level": lvl, "by": round(by, 2)} for k, lvl, by in sorted(brk, key=lambda x: x[2])],
+            "dist": round(min(b[2] for b in brk), 2), "sig": _intra_signal(base["symbol"], side, intra, today_s)}
+
+
 def levels_scan(near=3.0):
     near = min(max(float(near), 0.5), 10.0)
     ensure_fresh("1d")
@@ -5731,7 +5776,11 @@ def levels_scan(near=3.0):
         if r["symbol"] not in seen and r.get("type") != "index":
             seen.add(r["symbol"])
             rows2.append(r)
-    lists = {"hi": [], "lo": [], "up": [], "dn": [], "sl": []}
+    lists = {"hi": [], "lo": [], "up": [], "dn": [], "sl": [], "bo": [], "pb": []}
+    ensure_fresh("15m")
+    with LOCK:
+        intra = {tf_: {r_["symbol"]: r_ for r_ in STATES[tf_]["rows"]} for tf_ in ("5m", "15m")}
+    today_s = ist_now().strftime("%Y-%m-%d")
     for r in apply_live(rows2):
         lv = r.get("lv")
         price = r.get("ltp", r["close"])
@@ -5750,6 +5799,12 @@ def levels_scan(near=3.0):
             lists["up"].append({**base, "level": lv["pm_hi"], "when": lv["pm"], "dist": round((price / lv["pm_hi"] - 1) * 100, 2)})
         if lv.get("pm_lo") and price < lv["pm_lo"]:
             lists["dn"].append({**base, "level": lv["pm_lo"], "when": lv["pm"], "dist": round((lv["pm_lo"] / price - 1) * 100, 2)})
+        bo = breakout_row(base, lv, price, intra, today_s)
+        if bo:
+            lists["bo"].append(bo)
+        pb = pending_row(base, lv, price, intra, today_s, near)
+        if pb:
+            lists["pb"].append(pb)
         # a recent daily signal that a level agrees with
         sig, ba = r.get("signal"), r.get("bars_ago")
         if sig in ("BUY", "SELL") and ba is not None and ba <= SCAN_SIG_BARS and (r.get("status") == "Open" or re.fullmatch(r"T[1-3] hit", str(r.get("status")))):
@@ -5766,8 +5821,11 @@ def levels_scan(near=3.0):
                     why.append("Below last month's low")
             if why:
                 lists["sl"].append({**base, "why": why, "side": sig, "age": ba, "status": r.get("status"), "dist": ba})
+    for k in ("bo", "pb"):
+        lists[k].sort(key=lambda x: (x["sig"] is None, x["dist"], x["symbol"]))   # a stock with a signal comes first, then the freshest breakouts and the nearest to breaking
     for k in lists:
-        lists[k].sort(key=lambda x: (x["dist"], x["symbol"]))   # closest to the level first: the freshest breakouts come before the ones that already ran (signal: newest first)
+        if k not in ("bo", "pb"):
+            lists[k].sort(key=lambda x: (x["dist"], x["symbol"]))   # closest to the level first: the freshest breakouts come before the ones that already ran (signal: newest first)
     return {"lists": {k: v[:150] for k, v in lists.items()}, "counts": {k: len(v) for k, v in lists.items()}, "near": near, "updated": upd, "scanning": bool(busy),
             "sig_bars": SCAN_SIG_BARS,
             "stocks": len(rows2), "cash_loaded": bool(cash)}
@@ -10612,8 +10670,32 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <section id="view-levels" hidden>
 <div class="note" id="lvNote" style="margin:0 0 10px">Stocks at a turning point: near a 52 week high or low, through last month's high or low, or a recent signal with one of those levels behind it.</div>
 <div class="botrow" style="margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;gap:8px"><span id="lvTabs" style="flex:1 1 640px"></span><label id="lvNearL" style="flex:none;white-space:nowrap;display:flex;align-items:center;gap:6px;margin:6px 0 0">Near means within <select id="lvNear" style="width:auto;min-width:56px"><option>1</option><option>2</option><option selected>3</option><option>5</option></select> %</label></div>
-<div class="wrap" id="lvWrap"><table id="lvTable"><thead><tr><th>Symbol</th><th>Price</th><th>Day %</th><th id="lvLvl">Level</th><th id="lvDist">Distance</th><th></th></tr></thead><tbody id="lvBody"></tbody></table></div>
+<style>#boTable th,#boTable td,#pbTable th,#pbTable td{text-align:left}</style><div class="wrap" id="lvWrap"><table id="lvTable"><thead><tr><th>Symbol</th><th>Price</th><th>Day %</th><th id="lvLvl">Level</th><th id="lvDist">Distance</th><th></th></tr></thead><tbody id="lvBody"></tbody></table></div>
 <div class="sub" id="lvEmpty" style="margin-top:8px"></div>
+<div id="lvBo" hidden>
+<div class="note" style="margin:0 0 10px">Stocks trading beyond the previous day's, previous week's, previous month's or 52 week high (a breakout up) or low (a breakdown). Tick the levels you want. A stock with a signal that came after the break, in the same direction, today, is listed first with its entry, stop and targets. A stock with no signal yet is on the list but is not a trade until one appears.</div>
+<div style="display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;margin:0 0 8px"><label style="display:flex;align-items:center;gap:6px;margin:0">Show <select id="boDir" style="width:auto"><option value="all">Breakouts and breakdowns</option><option value="up">Breakouts (highs)</option><option value="dn">Breakdowns (lows)</option></select></label>
+<span style="display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center" id="boLvls">Level:
+<label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="PD" checked style="width:auto;margin:0"> Daily</label>
+<label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="PW" checked style="width:auto;margin:0"> Weekly</label>
+<label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="PM" checked style="width:auto;margin:0"> Monthly</label>
+<label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="52" checked style="width:auto;margin:0"> 52 week</label></span>
+<label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="boSig" style="width:auto;margin:0"> Only stocks with a signal after the break</label></div>
+<div class="wrap"><table id="boTable" class="bot"><thead><tr><th>Symbol</th><th>Price</th><th>Broke</th><th>Signal after the break</th><th></th></tr></thead><tbody id="boBody"></tbody></table></div>
+<div class="sub" id="boEmpty" style="margin-top:8px"></div>
+</div>
+<div id="lvPb" hidden>
+<div class="note" style="margin:0 0 10px">Stocks that have not broken a level yet but are close to it: just under the previous day's, previous week's, previous month's or 52 week high (about to break up), or just over the matching low (about to break down). Near means within the percentage chosen in the “Near means within” box. A signal today in the same direction is shown first; a stock with no signal yet is one to watch, not a trade. When it breaks, it moves to the Breakouts tab.</div>
+<div style="display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;margin:0 0 8px"><label style="display:flex;align-items:center;gap:6px;margin:0">Show <select id="pbDir" style="width:auto"><option value="all">Near highs and lows</option><option value="up">Near highs (break up)</option><option value="dn">Near lows (break down)</option></select></label>
+<span style="display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center" id="pbLvls">Level:
+<label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="PD" checked style="width:auto;margin:0"> Daily</label>
+<label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="PW" checked style="width:auto;margin:0"> Weekly</label>
+<label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="PM" checked style="width:auto;margin:0"> Monthly</label>
+<label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="52" checked style="width:auto;margin:0"> 52 week</label></span>
+<label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="pbSig" style="width:auto;margin:0"> Only stocks with a signal in that direction</label></div>
+<div class="wrap"><table id="pbTable" class="bot"><thead><tr><th>Symbol</th><th>Price</th><th>Near</th><th>Signal today</th><th></th></tr></thead><tbody id="pbBody"></tbody></table></div>
+<div class="sub" id="pbEmpty" style="margin-top:8px"></div>
+</div>
 <div id="lvBtst" hidden>
 <div class="note" id="bsNote" style="margin:0 0 10px">Stocks that closed strong today and may carry into tomorrow. Buy near the close, sell in the first hour of the next session.</div>
 <div id="bsWarn"></div>
@@ -11790,8 +11872,8 @@ $("jTable").onclick=async e=>{const b=e.target.closest("[data-jd]");if(b){await 
 $("jPeriod").onchange=$("jMode").onchange=jLoad;
 $("jaAdd").onclick=async()=>{const r=await post("/api/journal/add",{day:$("jaDay").value,label:$("jaLabel").value,dir:$("jaDir").value,qty:$("jaQty").value,entry:$("jaIn").value,exit:$("jaOut").value,note:$("jaNote").value});
  $("jaMsg").textContent=r.error||"Added.";if(!r.error){["jaLabel","jaQty","jaIn","jaOut","jaNote"].forEach(i=>$(i).value="");jLoad()}};
-let lvTimer=null,lvTab="hi",lvData=null,btstN=null;
-const LV_TABS=[["hi","Near 52 week high"],["lo","Near 52 week low"],["up","Monthly breakout"],["dn","Monthly breakdown"],["sl","Signal + level"],["bs","BTST (buy today, sell tomorrow)"]];
+let lvTimer=null,lvTab="bo",lvData=null,btstN=null;
+const LV_TABS=[["bo","Breakouts (day · week · month · 52 week)"],["pb","Near a breakout (about to break)"],["sl","Signal + level"],["bs","BTST (buy today, sell tomorrow)"]];
 const LV_TXT={hi:["52 week high","Below the high"],lo:["52 week low","Above the low"],up:["Last month's high","Above it"],dn:["Last month's low","Below it"],sl:["Why it is listed","Signal"]};
 const LV_HELP={hi:"Within the chosen distance of the highest price in the last 52 weeks. A stock at the high shows 0%.",lo:"Within the chosen distance of the lowest price in the last 52 weeks. A stock at the low shows 0%.",
  up:"Trading above the highest price of the previous calendar month. The smaller the distance, the fresher the breakout.",dn:"Trading below the lowest price of the previous calendar month. The smaller the distance, the fresher the breakdown.",
@@ -11800,15 +11882,25 @@ async function lvLoad(){clearTimeout(lvTimer);
  try{lvData=await (await api("/api/levels?near="+$("lvNear").value)).json();lvPaint()}catch(e){$("lvNote").textContent="Cannot reach the server."}
  if(lvTab==="bs")btstLoad();
  if(mode==="levels")lvTimer=setTimeout(lvLoad,20000)}
-function lvPaint(){const bs=lvTab==="bs",d=lvData||(bs?{counts:{},lists:{}}:null);if(!d)return;
+function lvPaint(){const bs=lvTab==="bs",bo=lvTab==="bo",pb=lvTab==="pb",d=lvData||(bs?{counts:{},lists:{}}:null);if(!d)return;
  $("lvTabs").innerHTML=LV_TABS.map(([k,t])=>`<button class="btn${k===lvTab?" go":""}" data-lv="${k}">${t} <b>${k==="bs"?(btstN==null?"":btstN):d.counts[k]}</b></button>`).join(" ");
- $("lvBtst").hidden=!bs;$("lvWrap").hidden=bs;$("lvEmpty").hidden=bs;$("lvNearL").hidden=bs;$("lvNote").hidden=bs;if(bs)return;
+ $("lvBtst").hidden=!bs;$("lvBo").hidden=!bo;$("lvPb").hidden=!pb;$("lvWrap").hidden=bs||bo||pb;$("lvEmpty").hidden=bs||bo||pb;$("lvNearL").hidden=bs||bo;$("lvNote").hidden=bs||bo||pb;if(bo)boPaint(d);if(pb)pbPaint(d);if(bs||bo||pb)return;
  $("lvLvl").textContent=LV_TXT[lvTab][0];$("lvDist").textContent=LV_TXT[lvTab][1];
  const rows=d.lists[lvTab]||[];
  const c1=x=>lvTab==="sl"?x.why.map(esc).join("<br>"):`${x.level.toFixed(2)}<br><span class="sub">${esc(x.when)}</span>`;
  const c2=x=>lvTab==="sl"?`<b class="${x.side==="BUY"?"up":"dn"}">${x.side}</b><br><span class="sub">${x.age===0?"this candle":x.age+" candle"+(x.age>1?"s":"")+" ago"} · ${esc(x.status)}</span>`:`<span class="${lvTab==="hi"||lvTab==="up"?"up":"dn"}">${x.dist.toFixed(2)}%${x.new?' <b>new</b>':""}</span>`;
  $("lvBody").innerHTML=rows.map(x=>`<tr><td><b>${esc(x.symbol)}</b>${x.cash?' <span class="sub">Cash</span>':""}${lvTab!=="sl"&&(x.signal==="BUY"||x.signal==="SELL")?` <span class="${x.signal==="BUY"?"up":"dn"}">${esc(x.signal)}</span>`:""}<br><span class="sub">${esc(x.sector||"")}</span></td><td>${x.price.toFixed(2)}</td><td class="${x.chg>=0?"up":"dn"}">${pct1(x.chg)}</td><td>${c1(x)}</td><td>${c2(x)}</td><td><button class="btn" data-lvc="${esc(x.symbol)}">Chart</button></td></tr>`).join("");
  $("lvEmpty").textContent=(rows.length?"":d.scanning?"Scanning…":"No stock matches right now. ")+LV_HELP[lvTab]+` Covers ${d.stocks} stocks`+(d.cash_loaded?" (F&O and cash).":" (F&O; open SWING once to add the cash stocks).")+(d.counts[lvTab]>rows.length?` Showing the closest ${rows.length} of ${d.counts[lvTab]}.`:"")}
+function bpPaint(p,d){const dir=$(p+"Dir").value,only=$(p+"Sig").checked,pend=p==="pb",on=[...document.querySelectorAll("#"+p+"Lvls [data-bl]")].filter(c=>c.checked).map(c=>c.dataset.bl);
+ let rows=(d.lists[p]||[]).filter(x=>(dir==="all"||x.dir===dir)&&(!only||x.sig)&&x.broke.some(b=>on.some(k=>b.k.startsWith(k))));
+ const f2=v=>v==null?"–":(+v).toFixed(2);
+ $(p+"Body").innerHTML=rows.map(x=>{const s=x.sig,up=x.dir==="up";
+  const chips=x.broke.filter(b=>on.some(k=>b.k.startsWith(k))).map(b=>`<div><b class="${up?"up":"dn"}">${b.k}</b> ${f2(b.level)} <span class="sub">${pend?b.by.toFixed(2)+"% away":(up?"+":"−")+b.by.toFixed(2)+"% beyond"}</span></div>`).join("");
+  const sg=s?`<b class="${s.side==="BUY"?"up":"dn"}">${s.side}</b> on ${s.tf==="5m"?"5 min":"15 min"} <span class="sub">${s.ago===0?"this candle":s.ago+" candle"+(s.ago>1?"s":"")+" ago"}, ${esc(s.time||"")}, ${esc(s.status||"")}</span><br>Entry <b>${f2(s.entry)}</b> · Stop <b>${f2(s.sl)}</b><br><span class="sub">T1 ${f2(s.t1)} · T2 ${f2(s.t2)} · T3 ${f2(s.t3)} · T4 ${f2(s.t4)}</span>`:`<span class="sub">${pend?"No signal yet. Watch it.":"No signal yet. Wait for one."}</span>`;
+  return `<tr><td><b>${esc(x.symbol)}</b>${x.cash?' <span class="sub">Cash</span>':""}<br><span class="sub">${esc(x.sector||"")}</span></td><td>${x.price.toFixed(2)}<br><span class="${x.chg>=0?"up":"dn"}">${pct1(x.chg)}</span></td><td>${chips}</td><td>${sg}</td><td><button class="mini" data-boc="${esc(x.symbol)}">Chart</button></td></tr>`}).join("");
+ $(p+"Empty").textContent=rows.length?"Levels come from completed daily candles: the previous trading day (PDH, PDL), the previous calendar week (PWH, PWL), the previous calendar month (PMH, PML) and the last 52 weeks (52WH, 52WL). "+(pend?"The percentage is how far the price is from the level. The smallest is the closest to breaking.":"The percentage is how far the price is beyond the level. The smallest is the freshest break."):(d.scanning?"Scanning…":"No stock matches right now.")}
+const boPaint=d=>bpPaint("bo",d),pbPaint=d=>bpPaint("pb",d);
+["bo","pb"].forEach(p=>{$(p+"Dir").onchange=$(p+"Sig").onchange=$(p+"Lvls").onchange=()=>{if(lvData)bpPaint(p,lvData)};$(p+"Body").onclick=e=>{const c=e.target.closest("[data-boc]");if(c)openChart(c.dataset.boc,"15m")}});
 $("lvTabs").onclick=e=>{const b=e.target.closest("[data-lv]");if(b){lvTab=b.dataset.lv;lvPaint();if(lvTab==="bs")btstLoad();else clearTimeout(btstTimer)}};
 $("lvNear").onchange=lvLoad;
 $("lvBody").onclick=e=>{const c=e.target.closest("[data-lvc]");if(c)openChart(c.dataset.lvc,"1d")};
