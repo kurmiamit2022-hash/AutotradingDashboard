@@ -2033,7 +2033,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-21c"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-21d"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -10669,7 +10669,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </section>
 <section id="view-levels" hidden>
 <div class="note" id="lvNote" style="margin:0 0 10px">Stocks at a turning point: near a 52 week high or low, through last month's high or low, or a recent signal with one of those levels behind it.</div>
-<div class="botrow" style="margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;gap:8px"><span id="lvTabs" style="flex:1 1 640px"></span><label id="lvNearL" style="flex:none;white-space:nowrap;display:flex;align-items:center;gap:6px;margin:6px 0 0">Near means within <select id="lvNear" style="width:auto;min-width:56px"><option>1</option><option>2</option><option selected>3</option><option>5</option></select> %</label></div>
+<div class="botrow" style="margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;gap:8px"><span id="lvTabs" style="flex:1 1 640px"></span><label id="lvNearL" style="flex:none;white-space:nowrap;display:flex;align-items:center;gap:6px;margin:6px 0 0">Near means within <select id="lvNear" style="width:auto;min-width:56px"><option>1</option><option>2</option><option selected>3</option></select> %</label></div>
 <style>#boTable th,#boTable td,#pbTable th,#pbTable td{text-align:left}</style><div class="wrap" id="lvWrap"><table id="lvTable"><thead><tr><th>Symbol</th><th>Price</th><th>Day %</th><th id="lvLvl">Level</th><th id="lvDist">Distance</th><th></th></tr></thead><tbody id="lvBody"></tbody></table></div>
 <div class="sub" id="lvEmpty" style="margin-top:8px"></div>
 <div id="lvBo" hidden>
@@ -10680,6 +10680,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="PW" checked style="width:auto;margin:0"> Weekly</label>
 <label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="PM" checked style="width:auto;margin:0"> Monthly</label>
 <label style="display:flex;align-items:center;gap:5px;margin:0"><input type="checkbox" data-bl="52" checked style="width:auto;margin:0"> 52 week</label></span>
+<label style="display:flex;align-items:center;gap:6px;margin:0">Broke within <select id="boWithin" style="width:auto"><option value="1">1%</option><option value="2">2%</option><option value="3" selected>3%</option><option value="0">Any</option></select></label>
 <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="boSig" style="width:auto;margin:0"> Only stocks with a signal after the break</label></div>
 <div class="wrap"><table id="boTable" class="bot"><thead><tr><th>Symbol</th><th>Price</th><th>Broke</th><th>Signal after the break</th><th></th></tr></thead><tbody id="boBody"></tbody></table></div>
 <div class="sub" id="boEmpty" style="margin-top:8px"></div>
@@ -11891,16 +11892,16 @@ function lvPaint(){const bs=lvTab==="bs",bo=lvTab==="bo",pb=lvTab==="pb",d=lvDat
  const c2=x=>lvTab==="sl"?`<b class="${x.side==="BUY"?"up":"dn"}">${x.side}</b><br><span class="sub">${x.age===0?"this candle":x.age+" candle"+(x.age>1?"s":"")+" ago"} · ${esc(x.status)}</span>`:`<span class="${lvTab==="hi"||lvTab==="up"?"up":"dn"}">${x.dist.toFixed(2)}%${x.new?' <b>new</b>':""}</span>`;
  $("lvBody").innerHTML=rows.map(x=>`<tr><td><b>${esc(x.symbol)}</b>${x.cash?' <span class="sub">Cash</span>':""}${lvTab!=="sl"&&(x.signal==="BUY"||x.signal==="SELL")?` <span class="${x.signal==="BUY"?"up":"dn"}">${esc(x.signal)}</span>`:""}<br><span class="sub">${esc(x.sector||"")}</span></td><td>${x.price.toFixed(2)}</td><td class="${x.chg>=0?"up":"dn"}">${pct1(x.chg)}</td><td>${c1(x)}</td><td>${c2(x)}</td><td><button class="btn" data-lvc="${esc(x.symbol)}">Chart</button></td></tr>`).join("");
  $("lvEmpty").textContent=(rows.length?"":d.scanning?"Scanning…":"No stock matches right now. ")+LV_HELP[lvTab]+` Covers ${d.stocks} stocks`+(d.cash_loaded?" (F&O and cash).":" (F&O; open SWING once to add the cash stocks).")+(d.counts[lvTab]>rows.length?` Showing the closest ${rows.length} of ${d.counts[lvTab]}.`:"")}
-function bpPaint(p,d){const dir=$(p+"Dir").value,only=$(p+"Sig").checked,pend=p==="pb",on=[...document.querySelectorAll("#"+p+"Lvls [data-bl]")].filter(c=>c.checked).map(c=>c.dataset.bl);
- let rows=(d.lists[p]||[]).filter(x=>(dir==="all"||x.dir===dir)&&(!only||x.sig)&&x.broke.some(b=>on.some(k=>b.k.startsWith(k))));
+function bpPaint(p,d){const dir=$(p+"Dir").value,only=$(p+"Sig").checked,pend=p==="pb",on=[...document.querySelectorAll("#"+p+"Lvls [data-bl]")].filter(c=>c.checked).map(c=>c.dataset.bl),w=pend?0:+$("boWithin").value,okb=b=>on.some(k=>b.k.startsWith(k))&&(!w||b.by<=w);
+ let rows=(d.lists[p]||[]).filter(x=>(dir==="all"||x.dir===dir)&&(!only||x.sig)&&x.broke.some(okb));
  const f2=v=>v==null?"–":(+v).toFixed(2);
  $(p+"Body").innerHTML=rows.map(x=>{const s=x.sig,up=x.dir==="up";
-  const chips=x.broke.filter(b=>on.some(k=>b.k.startsWith(k))).map(b=>`<div><b class="${up?"up":"dn"}">${b.k}</b> ${f2(b.level)} <span class="sub">${pend?b.by.toFixed(2)+"% away":(up?"+":"−")+b.by.toFixed(2)+"% beyond"}</span></div>`).join("");
+  const chips=x.broke.filter(okb).map(b=>`<div><b class="${up?"up":"dn"}">${b.k}</b> ${f2(b.level)} <span class="sub">${pend?b.by.toFixed(2)+"% away":(up?"+":"−")+b.by.toFixed(2)+"% beyond"}</span></div>`).join("");
   const sg=s?`<b class="${s.side==="BUY"?"up":"dn"}">${s.side}</b> on ${s.tf==="5m"?"5 min":"15 min"} <span class="sub">${s.ago===0?"this candle":s.ago+" candle"+(s.ago>1?"s":"")+" ago"}, ${esc(s.time||"")}, ${esc(s.status||"")}</span><br>Entry <b>${f2(s.entry)}</b> · Stop <b>${f2(s.sl)}</b><br><span class="sub">T1 ${f2(s.t1)} · T2 ${f2(s.t2)} · T3 ${f2(s.t3)} · T4 ${f2(s.t4)}</span>`:`<span class="sub">${pend?"No signal yet. Watch it.":"No signal yet. Wait for one."}</span>`;
   return `<tr><td><b>${esc(x.symbol)}</b>${x.cash?' <span class="sub">Cash</span>':""}<br><span class="sub">${esc(x.sector||"")}</span></td><td>${x.price.toFixed(2)}<br><span class="${x.chg>=0?"up":"dn"}">${pct1(x.chg)}</span></td><td>${chips}</td><td>${sg}</td><td><button class="mini" data-boc="${esc(x.symbol)}">Chart</button></td></tr>`}).join("");
  $(p+"Empty").textContent=rows.length?"Levels come from completed daily candles: the previous trading day (PDH, PDL), the previous calendar week (PWH, PWL), the previous calendar month (PMH, PML) and the last 52 weeks (52WH, 52WL). "+(pend?"The percentage is how far the price is from the level. The smallest is the closest to breaking.":"The percentage is how far the price is beyond the level. The smallest is the freshest break."):(d.scanning?"Scanning…":"No stock matches right now.")}
 const boPaint=d=>bpPaint("bo",d),pbPaint=d=>bpPaint("pb",d);
-["bo","pb"].forEach(p=>{$(p+"Dir").onchange=$(p+"Sig").onchange=$(p+"Lvls").onchange=()=>{if(lvData)bpPaint(p,lvData)};$(p+"Body").onclick=e=>{const c=e.target.closest("[data-boc]");if(c)openChart(c.dataset.boc,"15m")}});
+["bo","pb"].forEach(p=>{$(p+"Dir").onchange=$(p+"Sig").onchange=$(p+"Lvls").onchange=(p==="bo"?$("boWithin"):{}).onchange=()=>{if(lvData)bpPaint(p,lvData)};$(p+"Body").onclick=e=>{const c=e.target.closest("[data-boc]");if(c)openChart(c.dataset.boc,"15m")}});
 $("lvTabs").onclick=e=>{const b=e.target.closest("[data-lv]");if(b){lvTab=b.dataset.lv;lvPaint();if(lvTab==="bs")btstLoad();else clearTimeout(btstTimer)}};
 $("lvNear").onchange=lvLoad;
 $("lvBody").onclick=e=>{const c=e.target.closest("[data-lvc]");if(c)openChart(c.dataset.lvc,"1d")};
