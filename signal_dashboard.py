@@ -2034,7 +2034,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22g"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-22h"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -6102,6 +6102,119 @@ def bt_movers_trades(span, data, cfg, kind="scanner"):
     return out, None
 
 
+SPR_BT_SLIP = 0.5   # points lost to the spread between buy and sell price, on every option fill in the spread backtest
+
+
+def bt_spread_run(span, data, p):
+    """The NIFTY spread autopilot over past days on NIFTY 5 minute candles. Past option prices are not available, so every leg is priced with Black-Scholes
+    at the implied volatility you enter, the right expiry and the time left; the spot, the signals, the stops and the dates are real. Returns (result, error)."""
+    N = (data.get("NIFTY") or {}).get("5m")
+    if not N or N.get("nc_df") is None:
+        return None, "NIFTY 5 minute candles were not loaded."
+    first, last, sq = OPTBOT_FIRST_ENTRY.strftime("%H:%M"), OPTBOT_LAST_ENTRY.strftime("%H:%M"), OPTBOT_SQUAREOFF.strftime("%H:%M")
+    width, cap, dte, lots = int(p["width"]), float(p["capture"]), int(p["min_dte"]), int(p["lots"])
+    vol = p["iv"] / 100.0
+    qty = lots * (bt_lot_for("NIFTY") or 75)
+    entries, skipped = {}, {}
+    for day in span:
+        sets, _, d = nc_signals(N["nc_df"], day, N.get("nc_vw"), last)
+        where = {int(t): i for i, t in enumerate(N["ts"])}
+        for s_ in sets:
+            k5 = where.get(int(d.index[s_["j"]].timestamp())) if s_["j"] is not None else None
+            if k5 is not None:
+                entries.setdefault(k5, []).append(s_)
+    first_k = next((k for k in range(N["n"]) if N["dates"][k] >= span[0]), None)
+    if first_k is None:
+        return None, "No candles for that period."
+    slip, brk, oth = SPR_BT_SLIP, p["brokerage"], p["other_pct"] / 100
+
+    def px(spot, K, right, exp_day, k, v=vol):
+        exp_dt = pd.Timestamp(f"{exp_day} 15:30", tz=IST)
+        now = pd.Timestamp(float(N["close_ts"][k]), unit="s", tz="UTC").tz_convert(IST)
+        t = max((exp_dt - now).total_seconds() / 86400.0, 0.003) / 365.0
+        return _bs_call_put(spot, K, t, v, right)
+
+    def expiry_for(day):
+        d0 = datetime.strptime(day, "%Y-%m-%d").date()
+        e = _expiry_after("NIFTY", d0)
+        while (e - d0).days < dte:
+            e = _expiry_after("NIFTY", e + timedelta(days=1))
+        return e.strftime("%Y-%m-%d")
+
+    openp, done, day_loss = [], [], {}
+    puts_ok, calls_ok = p["puts"], p["calls"]
+
+    def close(o, k, spot, why):
+        e = o["exp"]
+        short_v, hedge_v = px(spot, o["ks"], o["right"], e, k), px(spot, o["kh"], o["right"], e, k)
+        debit = max(0.0, short_v - hedge_v) + 2 * slip
+        t_out = pd.Timestamp(float(N["close_ts"][k]), unit="s", tz="UTC").tz_convert(IST)
+        pnl_gross = (o["credit"] - debit) * qty
+        turnover = (o["credit_leg_s"] + o["credit_leg_h"] + short_v + hedge_v) * qty
+        cost = 4 * brk + oth * turnover
+        done.append({"sym": "NIFTY", "t_in": o["t_in"], "t_out": max(o["t_in"], t_out), "pnl": round(pnl_gross - cost, 2), "cost": round(cost, 2), "grade": None,
+                     "label": f"NIFTY {int(o['ks'])}/{int(o['kh'])} {o['right']} {datetime.strptime(e, '%Y-%m-%d').strftime('%d %b')}", "side": -1, "qty": qty, "p_in": o["credit"], "p_out": debit,
+                     "why": why, "kind": "Bull put spread" if o["right"] == "PE" else "Bear call spread"})
+        day_loss[t_out.strftime("%Y-%m-%d")] = day_loss.get(t_out.strftime("%Y-%m-%d"), 0.0) + done[-1]["pnl"]
+
+    for k in range(first_k, N["n"]):
+        day, hm, spot = N["dates"][k], _hm(N["close_ts"][k]), float(N["c"][k])
+        for o in list(openp):
+            up = o["dir"] == 1
+            if (up and N["lo"][k] <= o["sl"]) or (not up and N["hi"][k] >= o["sl"]):
+                close(o, k, o["sl"], "NIFTY reached the stop")
+                openp.remove(o)
+                continue
+            now_v = max(0.0, px(spot, o["ks"], o["right"], o["exp"], k) - px(spot, o["kh"], o["right"], o["exp"], k))
+            if o["credit"] > 0 and (o["credit"] - now_v) >= o["credit"] * cap / 100:
+                close(o, k, spot, f"{cap:g}% of the premium collected")
+                openp.remove(o)
+            elif day > o["exp"] or (day == o["exp"] and hm >= sq):
+                close(o, k, spot, "expiry day close")
+                openp.remove(o)
+        for s_ in entries.get(k, []):
+            if not (first <= hm <= last):
+                skipped["outside the entry hours"] = skipped.get("outside the entry hours", 0) + 1
+                continue
+            up = s_["side"] == "BUY"
+            if (up and not puts_ok) or (not up and not calls_ok):
+                skipped["that side is switched off"] = skipped.get("that side is switched off", 0) + 1
+                continue
+            if len(openp) >= p["max_open"]:
+                skipped["open spreads limit reached"] = skipped.get("open spreads limit reached", 0) + 1
+                continue
+            if p["loss_limit"] and day_loss.get(day, 0.0) <= -p["loss_limit"]:
+                skipped["daily loss limit reached"] = skipped.get("daily loss limit reached", 0) + 1
+                continue
+            e = expiry_for(day)
+            ks = round(spot / 50) * 50
+            kh = ks - width if up else ks + width
+            right = "PE" if up else "CE"
+            sv, hv = px(spot, ks, right, e, k), px(spot, kh, right, e, k)
+            credit = (sv - slip) - (hv + slip)
+            if credit < width * SPR_MIN_CREDIT_PCT / 100:
+                skipped["credit too thin"] = skipped.get("credit too thin", 0) + 1
+                continue
+            openp.append({"dir": 1 if up else -1, "right": right, "ks": ks, "kh": kh, "exp": e, "sl": float(s_["sl"]), "credit": round(credit, 2), "credit_leg_s": sv, "credit_leg_h": hv,
+                          "t_in": pd.Timestamp(float(N["close_ts"][k]), unit="s", tz="UTC").tz_convert(IST)})
+    kl = N["n"] - 1
+    for o in list(openp):
+        close(o, kl, float(N["c"][kl]), "end of the data")
+    done.sort(key=lambda o: o["t_out"])
+    if not done:
+        return None, "No spread would have been opened in that period." + (" Skipped: " + ", ".join(f"{n} {w}" for w, n in skipped.items()) if skipped else "")
+    res = bt_stats(done, p)
+    res["found"] = len(done)
+    res["skipped"] = [{"why": k_, "n": v} for k_, v in skipped.items()]
+    res["problems"] = []
+    res["notes"] = [f"NIFTY spreads: sells the at-the-money option and buys the one {width} points further out, {lots} lot(s) of {qty // lots}. Option prices are modelled, not recorded: every leg uses Black-Scholes with an implied volatility of {p['iv']:g}%, the real expiry dates and time left, and {SPR_BT_SLIP:g} point lost on every fill. "
+                    "Real prices move with changing volatility and skew, so treat the result as a guide to how the idea behaves, not as a promise. Margin is not modelled and brokerage is charged on four orders per spread."]
+    res["list"] = [{"in": o["t_in"].strftime("%d %b %Y %H:%M"), "out": o["t_out"].strftime("%d %b %Y %H:%M"), "label": o["label"], "side": "SELL", "qty": o["qty"], "entry": round(o["p_in"], 2),
+                    "exit": round(o["p_out"], 2), "why": o["why"], "kind": o["kind"], "grade": None, "pnl": round(o["pnl"], 2), "equity": round(o["equity"], 2)} for o in done[-300:]][::-1]
+    res["listed_of"] = len(done)
+    return res, None
+
+
 def bt_run(params, candles, trades_in=None):
     """candles: {symbol: DataFrame}. Returns the full result. trades_in: ready-made trades (the early-mover strategy), when there are no candles to scan."""
     p = params
@@ -6155,7 +6268,7 @@ def bt_params(payload):
         if kind not in ("stock", "futures", "options"):
             raise ValueError("Choose stock, futures or options")
         strategy = str(payload.get("strategy", "confluence"))
-        if strategy not in ("signal", "movers", "confluence", "swing", "intraday"):
+        if strategy not in ("signal", "movers", "confluence", "swing", "intraday", "spread"):
             raise ValueError("Choose the Nifty confluence, the signal, the early movers or the futures swing strategy")
         if strategy == "swing":
             interval, kind = ("15m" if interval == "15m" else "1d"), "futures"
@@ -6166,6 +6279,8 @@ def bt_params(payload):
         syms = list(dict.fromkeys(syms))
         if strategy == "intraday":
             syms, interval, kind = ["F&O stocks"], ("15m" if interval == "15m" else "5m"), "stock"
+        if strategy == "spread":
+            syms, interval, kind = ["NIFTY"], "5m", "options"
         if strategy == "movers":
             syms, interval = ["F&O stocks"], "5m"   # the whole F&O list, on 5 minute candles, decided by the NIFTY trend
         if not syms:
@@ -6192,8 +6307,13 @@ def bt_params(payload):
             p["intraday"] = False
         if strategy == "swing":
             p.update(intraday=False, leverage=1)
-        if strategy in ("movers", "confluence", "intraday"):
+        if strategy in ("movers", "confluence", "intraday", "spread"):
             p["intraday"] = True
+        if strategy == "spread":
+            p.update(lots=int(num("lots", 1, 100, 1)), width=int(num("width", 100, 1500, 400)), capture=num("capture", 10, 95, 80), min_dte=int(num("min_dte", 0, 30, 1)), max_open=int(num("max_open", 1, 10, 2)),
+                     loss_limit=num("loss_limit", 0, 1e9, 15000), puts=bool(payload.get("puts", True)), calls=bool(payload.get("calls", True)), iv=num("iv", 5, 60, 15))
+            if p["width"] % 50:
+                raise ValueError("The protection distance must be in steps of 50 points")
         if strategy == "intraday":
             p["funds"] = num("funds", 1000, 1e8, 50000)
             p["max_open"] = int(num("max_open", 1, 20, 5))
@@ -6242,6 +6362,27 @@ def _bt_job(jid, user_id, p):
                 res["notes"] = [f"Intraday stocks autopilot on {p['interval'][:-1]} minute signals: each trade buys ₹{p['funds']:,.0f} x {p['leverage']:g} worth of shares, at most {p['max_open']} open at once, and everything is closed by 15:15. Brokerage, margin rules and the exchange's real fills will differ."] + res["notes"]
             else:
                 res["notes"] = [f"Uses the Autopilot 1 settings (at most {int(bot_cfg(user_id, 'scanner').get('max_trades', 3))} trades a day). The grade filter and the symbol list are not used; the timeframe is 5 minutes."] + res["notes"]
+            res["params"] = {k: (v.strftime("%H:%M") if isinstance(v, dtime) else v) for k, v in p.items()}
+            job.update(state="done", result=res)
+            return
+        if p["strategy"] == "spread":
+            job["note"] = "Downloading NIFTY 5 minute candles"
+            _, data, errors, rdays = replay_load("nifty", lambda a, b: job.update(note=f"Downloaded {a} of {b}"))
+            if not data:
+                job.update(state="error", error="No candles could be loaded. " + ("; ".join(errors[:3]) if errors else "Check the data feed."))
+                return
+            now = ist_now()
+            first = (now - timedelta(days=p["days"])).strftime("%Y-%m-%d")
+            span = [d for d in rdays[1:] if d >= first and (d < now.strftime("%Y-%m-%d") or now.strftime("%H:%M") > "15:35")]
+            if not span:
+                job.update(state="error", error="No complete trading days are loaded for that period.")
+                return
+            job["note"] = f"Replaying {len(span)} trading days"
+            res, err = bt_spread_run(span, data, p)
+            if err:
+                job.update(state="error", error=err)
+                return
+            res["problems"] = errors[:5]
             res["params"] = {k: (v.strftime("%H:%M") if isinstance(v, dtime) else v) for k, v in p.items()}
             job.update(state="done", result=res)
             return
@@ -11795,7 +11936,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="card botbox">
  <div class="ixrow"><b>Backtest</b><span class="sub">See how a strategy would have grown your funds on past candles. Results are estimates, not promises.</span></div>
  <div class="botrow">
-  <label>Strategy<select id="btStrategy"><option value="confluence" selected>NIFTY autopilot strategy</option><option value="swing">Futures swing autopilot (daily)</option><option value="signal">Signals</option><option value="movers">Stock autopilot strategy</option><option value="intraday">Intraday stocks autopilot</option></select></label>
+  <label>Strategy<select id="btStrategy"><option value="confluence" selected>NIFTY autopilot strategy</option><option value="swing">Futures swing autopilot (daily)</option><option value="signal">Signals</option><option value="movers">Stock autopilot strategy</option><option value="intraday">Intraday stocks autopilot</option><option value="spread">NIFTY option spreads autopilot</option></select></label>
   <label>Trade<select id="btKind"><option value="stock">Stocks / index (cash)</option><option value="futures">Futures</option><option value="options">Options (buying)</option></select></label>
   <label>Symbols (up to 10, comma separated)<input id="btSyms" value="NIFTY" placeholder="NIFTY, RELIANCE, TCS"></label>
   <label>Timeframe<select id="btTf"><option value="5m" selected>5 minute (last ~2 months)</option><option value="15m">15 minute (last ~2 months)</option><option value="1d">Daily (years)</option></select></label>
@@ -12607,6 +12748,7 @@ function spHtml(){return `<div class="card botbox" id="spBox">
   <span class="botpill" id="spPill"></span>
  </div>
  <div class="tkmsg" id="spMsg" role="status"></div>
+ <div class="ixrow"><b>Replay past days</b><select id="spRpDays" aria-label="Period to replay"><option value="10">Last 10 days</option><option value="20">Last 20 days</option><option value="30" selected>Last 30 days</option></select><button class="btn" id="spRp">Replay</button><span class="sub">Runs this autopilot on past NIFTY 5 minute candles with the settings above and shows each spread. Past option prices are not available, so they are modelled (set the volatility on the Backtest tab; the default is 15%).</span></div>
  <div class="ixrow"><b>Open spreads</b></div>
  <div class="wrap"><table id="spOpen"></table></div>
  <div class="ixrow"><b>Closed spreads</b><span class="sub" id="spStats"></span></div>
@@ -12631,7 +12773,7 @@ async function spCtl(action){const D=window.spD||{};const body={action,mode:$("s
  if(action==="close_all"&&!confirm(`Close ${D.open?D.open.length:0} open spread(s) now?`))return;
  if(action==="stop"&&D.open&&D.open.length&&!confirm("Stop the spread autopilot? Open spreads are still managed and closed at the target, the stop or on expiry day, but no new spreads are opened."))return;
  const d=await post("/api/sprbot",body);$("spMsg").textContent=d.error||({play:"Running.",pause:"Paused. No new spreads; open spreads are still managed.",stop:"Stopped. No new spreads; open spreads are still managed.",save:"Saved.",close_all:d.left?`${d.left} spread(s) could not be closed. Check your broker app.`:"All spreads closed."})[action]||"";spLoad()}
-function spInit(){$("botHost").insertAdjacentHTML("beforeend",spHtml());$("spSave").onclick=()=>spCtl("save");$("spPlay").onclick=()=>spCtl("play");$("spPause").onclick=()=>spCtl("pause");$("spStop").onclick=()=>spCtl("stop");$("spCloseAll").onclick=()=>spCtl("close_all")}
+function spInit(){$("botHost").insertAdjacentHTML("beforeend",spHtml());$("spSave").onclick=()=>spCtl("save");$("spPlay").onclick=()=>spCtl("play");$("spPause").onclick=()=>spCtl("pause");$("spStop").onclick=()=>spCtl("stop");$("spCloseAll").onclick=()=>spCtl("close_all");$("spRp").onclick=()=>{document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="spread";$("btStrategy").onchange();$("btDays").value=+$("spRpDays").value;window.spD=Object.assign(window.spD||{},{lots:+$("spLots").value,width:+$("spWidth").value,capture:+$("spCap").value,max_open:+$("spMax").value,min_dte:+$("spDte").value,loss_limit:+$("spLoss").value,puts:$("spPuts").checked,calls:$("spCalls").checked});btRun()}}
 function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="ixrow"><b>${t}</b><span class="sub" id="${p}State"></span></div>
  <div class="sub" id="${p}Rules" hidden></div>
@@ -12784,6 +12926,7 @@ async function btRun(){clearTimeout(btTimer);
   intraday:$("btIntra").checked,sell_ok:$("btSell").checked,min_grade:$("btGrade").value,leverage:+$("btLev").value,margin_pct:+$("btMargin").value,lot_size:+$("btLot").value||0,iv:+$("btIv").value,dte:+$("btDte").value,
   brokerage:+$("btBrk").value,other_pct:+$("btOth").value,slippage:+$("btSlip").value,entry_from:$("btFrom").value,entry_to:$("btTo").value,gap_max:+$("btGap").value};
  if(b.strategy==="intraday"&&window.btExtra)Object.assign(b,window.btExtra);
+ if(b.strategy==="spread"){const D=window.spD||{};Object.assign(b,{lots:D.lots||1,width:D.width||400,capture:D.capture||80,min_dte:D.min_dte==null?1:D.min_dte,max_open:D.max_open||2,loss_limit:D.loss_limit==null?15000:D.loss_limit,puts:D.puts!==false,calls:D.calls!==false})}
  $("btRun").disabled=true;$("btMsg").textContent="";$("btNote").textContent="Starting…";
  const d=await post("/api/backtest",b);if(d.error){$("btMsg").textContent=d.error;$("btRun").disabled=false;$("btNote").textContent="";return}
  const poll=async()=>{try{const g=await (await api("/api/backtest/"+d.id)).json();
@@ -12793,9 +12936,10 @@ async function btRun(){clearTimeout(btTimer);
  poll()}
 function initBacktest(){$("btRun").onclick=btRun;
  $("btTf").onchange=()=>{const dly=$("btTf").value==="1d";$("btDays").value=dly?730:58;$("btIntra").checked=!dly;$("btIntra").disabled=dly;$("btLev").value=dly?1:5};
- $("btStrategy").onchange=()=>{const v=$("btStrategy").value,id=v==="intraday",m=v==="movers"||id,g=m||v==="confluence",sw=v==="swing";if(sw){$("btKind").value="futures";if($("btTf").value!=="15m")$("btTf").value="1d";$("btTf").onchange();$("btDays").value=$("btTf").value==="15m"?58:1095;if(/^\s*(NIFTY)?\s*$/.test($("btSyms").value))$("btSyms").value=BT_SWING_SYMS}
+ $("btStrategy").onchange=()=>{const v=$("btStrategy").value,id=v==="intraday",spr=v==="spread",m=v==="movers"||id,g=m||v==="confluence"||spr,sw=v==="swing";if(sw){$("btKind").value="futures";if($("btTf").value!=="15m")$("btTf").value="1d";$("btTf").onchange();$("btDays").value=$("btTf").value==="15m"?58:1095;if(/^\s*(NIFTY)?\s*$/.test($("btSyms").value))$("btSyms").value=BT_SWING_SYMS}
  if(id){if($("btTf").value==="1d")$("btTf").value="5m";$("btTf").onchange();$("btDays").value=30;$("btIntra").checked=true}
- ["btKind","btTarget","btGrade","btIntra"].forEach(e_=>{const e=$(e_),l=e.closest("label");if(l)l.hidden=sw||id});{const o5=$("btTf").querySelector('option[value="5m"]'),o1=$("btTf").querySelector('option[value="1d"]');if(o5)o5.hidden=o5.disabled=sw;if(o1)o1.hidden=o1.disabled=id};if((v!=="intraday"&&g&&$("btTf").value==="1d")||((v==="movers"||v==="confluence")&&$("btTf").value!=="5m")){$("btTf").value="5m";$("btTf").onchange()}$("btSyms").disabled=m;$("btSyms").title=m?"This strategy uses the whole F&O list":"";$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true;if(!id)window.btExtra=null}}
+ if(spr){$("btTf").value="5m";$("btTf").onchange();$("btDays").value=30;$("btIntra").checked=true}
+ ["btKind","btTarget","btGrade","btIntra"].forEach(e_=>{const e=$(e_),l=e.closest("label");if(l)l.hidden=sw||id||spr});{const o5=$("btTf").querySelector('option[value="5m"]'),o1=$("btTf").querySelector('option[value="1d"]');if(o5)o5.hidden=o5.disabled=sw;if(o1)o1.hidden=o1.disabled=id};if((v!=="intraday"&&g&&$("btTf").value==="1d")||((v==="movers"||v==="confluence"||spr)&&$("btTf").value!=="5m")){$("btTf").value="5m";$("btTf").onchange()}$("btSyms").disabled=m;$("btSyms").title=m?"This strategy uses the whole F&O list":"";$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true;if(!id)window.btExtra=null}}
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
  $("scOnly").onchange=()=>{scLoad()};$("scConf").onchange=()=>{scRender()};
