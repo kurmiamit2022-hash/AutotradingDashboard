@@ -2034,7 +2034,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22k"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-22l"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2141,6 +2141,7 @@ ALERT_DDL = [
     "tfs TEXT NOT NULL DEFAULT '15m', sides TEXT NOT NULL DEFAULT 'BUY,SELL', sectors TEXT NOT NULL DEFAULT '', updated TEXT)",
     "CREATE TABLE IF NOT EXISTS alert_seen(k TEXT PRIMARY KEY, ts TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS alert_ap(user_id INTEGER PRIMARY KEY, trades TEXT, manual TEXT)",
+    "CREATE TABLE IF NOT EXISTS copy_follow(user_id INTEGER PRIMARY KEY, mode TEXT NOT NULL, scale INTEGER NOT NULL, armed_day TEXT)",
     "CREATE TABLE IF NOT EXISTS manual_sig(k TEXT PRIMARY KEY, day TEXT NOT NULL, data TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS watchlist(user_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(user_id, symbol))",
     "CREATE TABLE IF NOT EXISTS kill(scope TEXT PRIMARY KEY, day TEXT NOT NULL, reason TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, ts TEXT NOT NULL)",
@@ -2865,8 +2866,8 @@ def inr(x):
     return "₹" + f"{x:,.2f}"
 
 
-def make_order(p, u, dry=False, force=None):
-    """Check an order request against every limit. Returns (order, error, warnings, lines)."""
+def make_order(p, u, dry=False, force=None, closing=False):
+    """Check an order request against every limit. Returns (order, error, warnings, lines). closing is set only by the copy engine for an order that shuts a position it opened: size, selling and daily-count limits must not trap someone in a position."""
     kind = p.get("kind")
     symbol = str(p.get("symbol", "")).upper().strip()
     side = str(p.get("side", "")).upper()
@@ -2902,11 +2903,11 @@ def make_order(p, u, dry=False, force=None):
     except (TypeError, ValueError, OverflowError):
         return fail("Quantity must be a whole number.")
     cap = caps["max_fut_lots"] if (kind == "future" or (kind == "option" and side == "SELL")) else caps["max_qty"]
-    if qty < 1 or qty > cap:
+    if qty < 1 or (qty > cap and not closing):
         return fail(f"Quantity must be between 1 and {cap}" + (" shares." if kind == "equity" else " lots."))
     if mode == "live" and not dry and not market_open_now():
         return fail("The market is closed. Live orders are accepted 9:15 to 15:30 IST, Monday to Friday, and in special sessions an admin has opened (Admin page).")
-    if not dry and count_today(u["id"], mode) >= caps["max_orders"]:
+    if not dry and not closing and count_today(u["id"], mode) >= caps["max_orders"]:
         return fail(f"Daily limit of {caps['max_orders']} orders reached.")
 
     row, _ = row_for(symbol, tf)
@@ -2951,7 +2952,7 @@ def make_order(p, u, dry=False, force=None):
             return fail("The option contract details are not valid.")
         if right not in ("CE", "PE"):
             return fail("Option type must be CE or PE.")
-        if side == "SELL" and not caps["allow_option_selling"]:
+        if side == "SELL" and not caps["allow_option_selling"] and not closing:
             return fail("Selling options is switched off for your account.")
         if product not in ("INTRADAY", "CARRYFORWARD"):
             return fail("Product must be Intraday or Carry forward.")
@@ -2983,12 +2984,12 @@ def make_order(p, u, dry=False, force=None):
         if abs(price / ref - 1) * 100 > band:
             return fail(f"The limit price is more than {band:.0f}% away from the last price {inr(ref)}. Check it for a typo.")
     est = (price or ref) * units
-    selling_opt = kind == "option" and side == "SELL"
+    selling_opt = kind == "option" and side == "SELL" and not closing
     exposure = strike * units if selling_opt else None
     if selling_opt:
         if exposure > caps["max_fut_value"]:
             return fail(f"Selling this option puts about {inr(exposure)} of the underlying at stake, above your limit of {inr(caps['max_fut_value'])}.")
-    else:
+    elif not closing:
         value_cap = caps["max_fut_value"] if kind == "future" else caps["max_order_value"]
         if est > value_cap:
             return fail(f"This order is worth about {inr(est)}, above your limit of {inr(value_cap)} per order.")
@@ -3065,7 +3066,7 @@ def new_record(o, oid, status, variety="NORMAL", is_exit=False, note=""):
            "auto_sl": bool(o.get("auto_sl")) and not is_exit, "trail": bool(o.get("trail")) and not is_exit,
            "sl_state": None, "trail_level": 0, "trail_fail": 0, "trail_done": False,
            "is_exit": is_exit, "key": o.get("key"), "note": note,
-           "expiry": o.get("expiry"), "strike": o.get("strike"), "right": o.get("right")}
+           "expiry": o.get("expiry"), "strike": o.get("strike"), "right": o.get("right"), "lots": o.get("lots")}
     with ORDER_LOCK:
         ORDERS.append(rec)
     append_log(rec)
@@ -11140,6 +11141,187 @@ def api_backtest_get(jid: str, request: Request):
     return {"state": j["state"], "note": j.get("note"), "error": j.get("error"), "result": j.get("result")}
 
 
+COPY_LOG = collections.deque(maxlen=30)   # what the admin's copies did, newest first (kept in memory)
+COPY_DEAD = ("rejected", "cancelled", "canceled", "unknown", "failed")
+
+
+def copy_cfg(uid):
+    rows = q("SELECT mode, scale, armed_day FROM copy_follow WHERE user_id=?", (uid,))
+    r = rows[0] if rows else {"mode": "off", "scale": 100, "armed_day": None}
+    return {"mode": r["mode"] if r["mode"] in ("off", "paper", "live") else "off", "scale": int(r["scale"] or 100), "armed_day": r["armed_day"]}
+
+
+def copy_followers():
+    """Every active non-admin user who opted in to copy the admin's trades."""
+    out = []
+    for r in q("SELECT c.user_id FROM copy_follow c JOIN users u ON u.id = c.user_id WHERE c.mode <> 'off' AND u.active=1 AND u.role <> 'admin' ORDER BY c.user_id"):
+        u = user_by_id(r["user_id"])
+        if u:
+            out.append((u, copy_cfg(u["id"])))
+    return out
+
+
+def copy_net(uid, label, mode=None, copied_only=False):
+    """Net units this person holds in one instrument from their orders in this dashboard (long positive)."""
+    net = 0
+    with ORDER_LOCK:
+        for o in ORDERS:
+            if o.get("user") != uid or o.get("label") != label or str(o.get("status", "")).lower() in COPY_DEAD:
+                continue
+            if mode and o.get("mode") != mode:
+                continue
+            if copied_only and not o.get("copy"):
+                continue
+            net += o["qty"] if o["side"] == "BUY" else -o["qty"]
+    return net
+
+
+def copy_one(admin_rec, au, fu, fcfg, before):
+    """Copy one admin order to one follower. Returns (placed text, None) or (None, why it was skipped)."""
+    live_admin = admin_rec["mode"] == "live"
+    if live_admin and fcfg["mode"] == "live":
+        if fcfg["armed_day"] != ist_now().strftime("%Y-%m-%d"):
+            return None, "live copying is not switched on for today (the follower enters their PIN under Account)"
+        if user_mode(fu)[0] != "live":
+            return None, "live trading is not enabled on their account"
+        mode = "live"
+    else:
+        mode = "paper"
+    lots_admin = admin_rec.get("lots") or admin_rec["qty"]
+    per_lot = max(1, admin_rec["qty"] // max(1, lots_admin))
+    scaled = max(1, int(round(lots_admin * fcfg["scale"] / 100.0)))
+    side, label = admin_rec["side"], admin_rec["label"]
+    closing = before != 0 and ((before > 0) == (side == "SELL"))
+    if closing:
+        mine = copy_net(fu["id"], label, mode=mode, copied_only=True)
+        if mine == 0 or ((mine > 0) == (side == "BUY")):
+            return None, "they hold no copied position to close"
+        if admin_rec["qty"] >= abs(before):
+            lots = abs(mine) // per_lot
+        else:
+            lots = min(scaled, abs(mine) // per_lot)
+        if lots < 1:
+            return None, "their copied position is smaller than one lot"
+    else:
+        lots = scaled
+    p = {"kind": admin_rec["kind"], "symbol": admin_rec["symbol"], "side": side, "qty": lots, "order_type": admin_rec["order_type"], "price": admin_rec["price"] or None,
+         "product": admin_rec["product"], "expiry": admin_rec.get("expiry"), "strike": admin_rec.get("strike"), "right": admin_rec.get("right"), "auto_sl": False}
+    o, err, _, _ = make_order(p, fu, force=mode, closing=bool(closing))
+    if err:
+        return None, err
+    if o["label"] != label:
+        return None, "their contract would differ from the admin's"
+    rec, err = bot_place(fu, o)
+    if err or not rec:
+        return None, err or "the order was not placed"
+    rec.update(copy=True, copy_from=au["id"], copy_src=admin_rec["id"], copy_close=bool(closing))
+    append_log(rec)
+    qty_txt = f"{lots} lot{'s' if lots > 1 else ''}" if o["kind"] != "equity" else f"{lots} shares"
+    item = (fu["id"], f"Copied from the admin: {side} {label}", f"{'LIVE' if mode == 'live' else 'Paper'}: {'closing' if closing else 'opening'} {qty_txt}"
+            + (f" at about {o['ref']:.2f}." if o["order_type"] == "MARKET" else f" limit {o['price']:.2f}.") + "\nThis follows the admin's trade; check it in Orders.", "link", True, "copy")
+    deliver(*item) if ALERT_SYNC else ALERT_Q.put(item)
+    return f"{qty_txt} {'closed' if closing else 'opened'} ({'Live' if mode == 'live' else 'Paper'})", None
+
+
+def copy_out(au, admin_rec, again=False):
+    """Copy one of the admin's orders to every follower. Returns (results list, error)."""
+    if admin_rec.get("is_exit") or admin_rec.get("bot_exit") or str(admin_rec.get("status", "")).lower() in COPY_DEAD:
+        return None, "Only an order that was accepted and is not a stop-loss can be copied."
+    if admin_rec.get("copied") and not again:
+        return None, "This order was already copied to your followers."
+    with ORDER_LOCK:
+        before = 0
+        for o in ORDERS:
+            if o.get("user") != au["id"] or o.get("label") != admin_rec["label"] or o.get("mode") != admin_rec["mode"] or o is admin_rec or o["t"] > admin_rec["t"]:
+                continue
+            if str(o.get("status", "")).lower() in COPY_DEAD:
+                continue
+            before += o["qty"] if o["side"] == "BUY" else -o["qty"]
+    res = []
+    for fu, fcfg in copy_followers():
+        try:
+            ok, why = copy_one(admin_rec, au, fu, fcfg, before)
+        except Exception as e:
+            ok, why = None, f"error: {type(e).__name__}"
+        res.append({"user": fu["username"], "ok": bool(ok), "text": ok or why})
+    admin_rec["copied"] = True
+    admin_rec["copied_n"] = sum(1 for r in res if r["ok"])
+    COPY_LOG.appendleft({"t": ist_now().strftime("%d %b %H:%M"), "label": admin_rec["label"], "side": admin_rec["side"], "mode": admin_rec["mode"], "done": admin_rec["copied_n"], "of": len(res), "results": res})
+    append_log(admin_rec)
+    return res, None
+
+
+@app.get("/api/copy")
+def api_copy_get(request: Request):
+    u = request.state.user
+    c = copy_cfg(u["id"])
+    td = ist_now().strftime("%Y-%m-%d")
+    with ORDER_LOCK:
+        n = sum(1 for o in ORDERS if o.get("user") == u["id"] and o.get("copy") and o.get("date") == td)
+    return {**c, "armed": c["armed_day"] == td, "live_ok": user_mode(u)[0] == "live", "admin": u["role"] == "admin", "copied_today": n}
+
+
+@app.post("/api/copy")
+def api_copy_set(request: Request, payload: dict = Body(...)):
+    u = request.state.user
+    if u["role"] == "admin":
+        return {"error": "Admins are the source of copied trades, not followers."}
+    cur = copy_cfg(u["id"])
+    mode = str(payload.get("mode", cur["mode"]))
+    if mode not in ("off", "paper", "live"):
+        return {"error": "Choose Off, Paper or Live."}
+    try:
+        scale = int(float(payload.get("scale", cur["scale"])))
+    except (TypeError, ValueError):
+        return {"error": "Size must be a number."}
+    if not 10 <= scale <= 500:
+        return {"error": "Size must be between 10% and 500% of the admin's trade."}
+    armed = cur["armed_day"]
+    if mode == "live":
+        if user_mode(u)[0] != "live":
+            return {"error": "Live trading is not enabled on your account. Copy in Paper mode, or ask the admin to enable live trading and set up your broker."}
+        if not (cur["mode"] == "live" and armed == ist_now().strftime("%Y-%m-%d")):
+            err = pin_error(u, payload.get("pin"), True)
+            if err:
+                return {"error": err}
+            armed = ist_now().strftime("%Y-%m-%d")
+    else:
+        armed = None
+    x("INSERT INTO copy_follow(user_id, mode, scale, armed_day) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode, scale=excluded.scale, armed_day=excluded.armed_day", (u["id"], mode, scale, armed))
+    return {"ok": True, **copy_cfg(u["id"])}
+
+
+@app.get("/api/admin/copy")
+def api_admin_copy_get(request: Request):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    td = ist_now().strftime("%Y-%m-%d")
+    rows = []
+    for fu, c in copy_followers():
+        with ORDER_LOCK:
+            n = sum(1 for o in ORDERS if o.get("user") == fu["id"] and o.get("copy") and o.get("date") == td)
+        rows.append({"user": fu["username"], "mode": c["mode"], "scale": c["scale"], "armed": c["armed_day"] == td, "copied_today": n})
+    return {"followers": rows, "recent": list(COPY_LOG)[:15]}
+
+
+@app.post("/api/admin/copy")
+def api_admin_copy(request: Request, payload: dict = Body(...)):
+    denied = need_admin(request)
+    if denied:
+        return denied
+    au = request.state.user
+    rec = find_order(payload.get("order_id"), au["id"])
+    if not rec:
+        return {"error": "Order not found. Copy your own orders from today's list."}
+    if not copy_followers():
+        return {"error": "Nobody follows your trades yet. Users can opt in under Account, Copy the admin's trades."}
+    res, err = copy_out(au, rec, bool(payload.get("again")))
+    if err:
+        return {"error": err}
+    return {"ok": True, "results": res, "done": sum(1 for r in res if r["ok"]), "of": len(res)}
+
+
 @app.post("/api/orders/preview")
 def api_preview(request: Request, payload: dict = Body(...)):
     u = request.state.user
@@ -12304,6 +12486,13 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 </section>
 <section id="view-account" hidden>
  <div class="card"><h3>Your account</h3><div class="sub" id="acctInfo"></div></div>
+ <div class="card" id="copyCard" hidden><h3>Copy the admin's trades</h3>
+  <div class="sub">When the admin copies a trade, your account takes the same trade in your own size, and closes it when the admin closes. Your own limits still apply to every copied order, and a trade the admin makes in Paper mode is only ever copied in Paper. You can stop at any time. Copying is not advice, and you are responsible for the trades placed in your account.</div>
+  <div class="botrow"><label>Copy in<select id="cpMode"><option value="off">Off</option><option value="paper">Paper (simulated)</option><option value="live">Live (real money)</option></select></label>
+   <label>Size, % of the admin's lots<input id="cpScale" type="number" min="10" max="500" step="10" style="width:90px"></label>
+   <label id="cpPinL" hidden>Order PIN<input id="cpPin" type="password" autocomplete="off" size="8"></label>
+   <button class="btn" id="cpSave">Save</button></div>
+  <div class="sub" id="cpMsg"></div></div>
  <div class="grid2">
   <div class="card"><h3>Change password</h3>
    <label>Current password<input id="pwCur" type="password" autocomplete="current-password"></label>
@@ -12371,6 +12560,9 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="botrow"><button class="btn go" id="memGo">Check memory</button></div>
   <div class="sub" id="memNote"></div>
   <div id="memChart" style="height:230px;margin-top:8px" hidden></div><div class="sub" id="memLeg" hidden></div></div>
+ <div class="card"><h3>Copy trading</h3>
+  <div class="sub">Users who opt in under Account follow the orders you copy. Copy an order from the order ticket (tick "Also copy this order to my followers") or from the Orders list. Each follower gets their own size and limits; a Paper order of yours is only ever copied as Paper. A live follower must enter their PIN each day.</div>
+  <div class="wrap"><table id="admCopy"></table></div><div class="sub" id="admCopyRecent" style="margin-top:8px"></div></div>
  <div class="card"><h3>Everyone's orders today</h3><div class="wrap"><table id="admOrd"></table></div></div>
  <div class="card"><h3>Add a user</h3>
   <div class="grid2" style="margin-bottom:0"><label>Username<input id="nuName" autocomplete="off"></label><label>Temporary password (at least 10 characters)<input id="nuPw" type="password" autocomplete="new-password"></label></div>
@@ -12425,6 +12617,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <label class="chk"><input type="checkbox" id="tkAuto"> Place the stop-loss automatically after the fill</label>
   <label class="chk" id="tkTrailL"><input type="checkbox" id="tkTrail"> Trail it up as targets are reached</label>
  </div>
+ <label class="chk" id="tkCopyL" hidden><input type="checkbox" id="tkCopy"> Also copy this order to my followers</label>
  <div class="tkfunds" id="tkFunds" hidden></div>
  <div class="dpt" id="tkDepth" hidden></div>
  <div class="tkreview" id="tkReview" hidden></div>
@@ -13459,6 +13652,7 @@ $("tkQty").addEventListener("input",fundsPaint);
 $("tkFunds").onclick=e=>{if(e.target.id==="tkMax"&&fundsInfo&&fundsInfo.max_qty!=null){$("tkQty").value=Math.max(1,fundsInfo.max_qty);resetReview();fundsPaint()}};
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
+$("cpSave").onclick=copySave;$("cpMode").onchange=()=>{$("cpPinL").hidden=$("cpMode").value!=="live"};
 initChart();initFlash();initModes();initBot();initBacktest();initConf();initInstall();initChainGraph();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
@@ -13473,6 +13667,7 @@ $("tkPlace").onclick=async()=>{const b=$("tkPlace");b.disabled=true;
  try{const d=await post("/api/orders/confirm",{token:tkToken,pin:$("tkPin").value});
   if(d.error){$("tkMsg").textContent=d.error;return}
   $("tkMsg").textContent=`Order sent. ID ${d.order.id}, status ${d.order.status}.`+(d.order.sl?" Place the stop-loss from the Portfolio tab once it is filled.":"");
+  if(!$("tkCopyL").hidden&&$("tkCopy").checked){$("tkMsg").textContent+=" "+await copyOrder(d.order.id)}
   tkToken=null;$("tkPlace").hidden=true;$("tkConfirm").hidden=true;$("tkPin").value="";loadOrders()}
  finally{b.disabled=false}};
 $("body").onclick=e=>{const cb=e.target.closest("[data-chart]");if(cb){openChart(cb.dataset.chart);return}
@@ -13501,10 +13696,12 @@ function renderOrders(d){const t=$("ordTable");
  t.innerHTML=`<thead><tr><th>Time</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Type</th><th>Price</th><th>Status</th><th>Order ID</th><th></th></tr></thead><tbody>`+d.orders.map(o=>{
   const act=[];
   if(cancelable.has(o.status))act.push(`<button class="mini" data-cancel="${esc(o.id)}">Cancel</button>`);
+  if(me&&me.user.role==="admin"&&!o.is_exit&&!o.copy&&!["rejected","cancelled","unknown"].includes(o.status))act.push(`<button class="mini" data-copy="${esc(o.id)}">${o.copied?"Copied ("+(o.copied_n||0)+"), again":"Copy to followers"}</button>`);
   if(!o.is_exit&&(o.kind==="equity"||o.kind==="future")&&(o.sl||o.risk)&&!o.sl_order_id&&o.status==="complete")act.push(`<button class="mini" data-protect="${esc(o.id)}">Place stop-loss${o.kind==="future"?"":" "+f2(o.sl)}</button>`);
   const price=o.order_type==="LIMIT"?f2(o.price):o.is_exit?(o.note||""):o.avg_price?f2(o.avg_price):"Market";
-  return `<tr><td>${o.time}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}${o.broker&&o.broker!=="paper"?`<span class="tag">${esc((tradeInfo.broker_names||{})[o.broker]||o.broker)}</span>`:""}</td><td>${o.side}</td><td>${o.qty}</td><td>${o.order_type.replace("_"," ").toLowerCase()}</td><td>${price}</td><td title="${esc(o.note||"")}">${esc(o.status)}${o.sl_order_id?", SL placed":""}${o.auto_sl&&!o.sl_order_id?(o.sl_state==="failed"?", <b class=\"dn\">auto SL FAILED</b>":o.sl_state==="skipped"?"":", auto SL waiting"):""}${o.trail_level?", trailed x"+o.trail_level:""}</td><td>${esc(o.id)}</td><td>${act.join(" ")}</td></tr>`}).join("")+"</tbody>"}
-$("ordTable").onclick=async e=>{const c=e.target.closest("[data-cancel]"),p=e.target.closest("[data-protect]");if(!c&&!p)return;
+  return `<tr><td>${o.time}</td><td>${esc(o.label)}${o.is_exit?" (stop-loss)":""}${o.copy?'<span class="tag">Copied</span>':""}${o.broker&&o.broker!=="paper"?`<span class="tag">${esc((tradeInfo.broker_names||{})[o.broker]||o.broker)}</span>`:""}</td><td>${o.side}</td><td>${o.qty}</td><td>${o.order_type.replace("_"," ").toLowerCase()}</td><td>${price}</td><td title="${esc(o.note||"")}">${esc(o.status)}${o.sl_order_id?", SL placed":""}${o.auto_sl&&!o.sl_order_id?(o.sl_state==="failed"?", <b class=\"dn\">auto SL FAILED</b>":o.sl_state==="skipped"?"":", auto SL waiting"):""}${o.trail_level?", trailed x"+o.trail_level:""}</td><td>${esc(o.id)}</td><td>${act.join(" ")}</td></tr>`}).join("")+"</tbody>"}
+$("ordTable").onclick=async e=>{const cp=e.target.closest("[data-copy]");if(cp){if(!confirm("Copy this order to all your followers? Each follower places it in their own account, in their own size."))return;cp.disabled=true;alert(await copyOrder(cp.dataset.copy));loadOrders();return}
+ const c=e.target.closest("[data-cancel]"),p=e.target.closest("[data-protect]");if(!c&&!p)return;
  if(!confirm(c?"Cancel this order?":"Place the stop-loss order now?"))return;
  const live=tradeInfo.mode==="live",pin=live?prompt("Order PIN"):"";if(live&&pin===null)return;
  const d=await post(c?"/api/orders/cancel":"/api/orders/protect",{order_id:c?c.dataset.cancel:p.dataset.protect,pin});
@@ -13514,7 +13711,16 @@ loadTrading();
 // ── Account and admin ──
 const send=async(m,u,b)=>(await api(u,{method:m,headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)})).json();
 async function loadMe(){const d=await (await api("/api/me")).json();me=d;csrf=d.csrf;
- $("dpBanner").hidden=!d.default_password;$("who").textContent=d.user.username+(d.user.role==="admin"?" (admin)":"")+(d.build?" · build "+d.build:"");$("navAdmin").hidden=d.user.role!=="admin";renderAccount(d)}
+ $("dpBanner").hidden=!d.default_password;$("who").textContent=d.user.username+(d.user.role==="admin"?" (admin)":"")+(d.build?" · build "+d.build:"");$("navAdmin").hidden=d.user.role!=="admin";$("tkCopyL").hidden=d.user.role!=="admin";$("copyCard").hidden=d.user.role==="admin";renderAccount(d);if(d.user.role!=="admin")copyLoad()}
+const cpTxt=d=>d.mode==="off"?"You are not copying.":d.mode==="paper"?"Copying in Paper: simulated trades only.":(d.armed?"Copying live today.":"Live copying is not armed today: enter your PIN and press Save.");
+async function copyLoad(){try{const d=await (await api("/api/copy")).json();if(d.error)return;if(document.activeElement!==$("cpScale")){$("cpMode").value=d.mode;$("cpScale").value=d.scale}
+ $("cpPinL").hidden=$("cpMode").value!=="live"||(d.mode==="live"&&d.armed);$("cpMsg").textContent=cpTxt(d)+(d.copied_today?` ${d.copied_today} copied order${d.copied_today===1?"":"s"} today.`:"")+(d.mode!=="live"&&!d.live_ok?" Live copying needs live trading enabled on your account.":"")}catch(e){}}
+async function copySave(){const d=await send("POST","/api/copy",{mode:$("cpMode").value,scale:+$("cpScale").value,pin:$("cpPin").value});$("cpPin").value="";if(d.error){$("cpMsg").textContent=d.error;return}copyLoad()}
+async function admCopyLoad(){try{const d=await (await api("/api/admin/copy")).json();if(d.error)return;
+ $("admCopy").innerHTML=d.followers.length?`<thead><tr><th>Follower</th><th>Copies in</th><th>Size</th><th>Live armed today</th><th>Copied orders today</th></tr></thead><tbody>`+d.followers.map(f=>`<tr><td><b>${esc(f.user)}</b></td><td>${f.mode==="live"?"Live":"Paper"}</td><td>${f.scale}%</td><td>${f.mode==="live"?(f.armed?"Yes":"No"):"–"}</td><td>${f.copied_today}</td></tr>`).join("")+"</tbody>":'<tbody><tr><td class="empty" style="text-align:left">Nobody follows your trades yet.</td></tr></tbody>';
+ $("admCopyRecent").innerHTML=d.recent.length?"<b>Recent copies</b><br>"+d.recent.map(r=>`${esc(r.t)} ${esc(r.side)} ${esc(r.label)} (${esc(r.mode)}): ${r.done} of ${r.of} followers. `+r.results.filter(x=>!x.ok).map(x=>esc(x.user)+": "+esc(x.text)).join("; ")).join("<br>"):""}catch(e){}}
+async function copyOrder(id,again){const d=await post("/api/admin/copy",{order_id:id,again:!!again});if(d.error){if(d.error.startsWith("This order was already")&&confirm(d.error+" Copy it again?"))return copyOrder(id,true);return d.error}
+ admCopyLoad();return `Copied to ${d.done} of ${d.of} follower${d.of===1?"":"s"}.`+d.results.filter(x=>!x.ok).map(x=>` ${x.user}: ${x.text}`).join("")}
 function renderAccount(d){
  $("acctInfo").textContent=d.mode==="live"?"Live trading is enabled for your account.":d.note;
  $("recInfo").textContent=d.user.recovery_set?"You have a recovery key. If you forget your password, the Forgot password page accepts it once. Creating a new key cancels the old one.":"You have no recovery key yet, so you could not reset your own password. Create one and keep it somewhere safe.";
@@ -13650,7 +13856,7 @@ async function memCheck(){const n=$("memNote");n.textContent="Checking…";try{c
  memPlot(d);n.innerHTML=`Memory <b>${d.rss} MB</b>`+(d.limit?` of ${d.limit} MB (<b>${d.pct}%</b>)`:" (the limit is not visible here)")+`, peak ${d.peak} MB. Threads ${d.threads}. Caches dropped ${d.purges} times`+(d.last_purge?` (last at ${d.last_purge})`:"")+`.<br>`+Object.entries(d.caches).map(([k,v])=>`${esc(k)} <b>${v}</b>`).join(" · ")}catch(e){n.textContent="Could not read it."}}
 async function srcSet(w){const d=await post("/api/admin/source",{source:w});if(d.error)$("srcNote").textContent=d.error;else loadSource()}
 async function ssSet(b){const d=await post("/api/admin/session",b);if(d.error)$("ssNote").textContent=d.error;else loadSession()}
-async function loadUsers(){loadSession();loadSource();loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
+async function loadUsers(){admCopyLoad();loadSession();loadSource();loadOverview();const d=await (await api("/api/admin/users")).json();if(d.error){$("admNote").textContent=d.error;return}users=d.users;renderUsers()}
 function renderUsers(){const bn=(me&&me.broker_names)||{};
  $("usrTable").innerHTML=`<thead><tr><th>User</th><th>Role</th><th>Active</th><th>Live trading</th><th>Brokers</th><th>Order PIN</th><th></th></tr></thead><tbody>`+users.map(u=>`<tr><td><b>${esc(u.username)}</b></td><td>${u.role}</td><td><input type="checkbox" data-act="active" data-id="${u.id}" ${u.active?"checked":""} aria-label="Active"></td><td><input type="checkbox" data-act="live" data-id="${u.id}" ${u.live_allowed?"checked":""} aria-label="Live trading"></td><td>${u.brokers.map(b=>esc(bn[b]||b)).join(", ")||"–"}</td><td>${u.pin_set?"Set":"Not set"}</td><td><button class="mini" data-act="limits" data-id="${u.id}">Limits</button> <button class="mini" data-act="role" data-id="${u.id}">Make ${u.role==="admin"?"user":"admin"}</button> <button class="mini" data-act="reset" data-id="${u.id}">Reset password</button> <button class="mini" data-act="del" data-id="${u.id}">Delete</button></td></tr>`).join("")+"</tbody>"}
 $("usrTable").onchange=async e=>{const c=e.target.closest("input[data-act]");if(!c)return;
