@@ -2034,7 +2034,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22e"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-22f"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5396,6 +5396,8 @@ def bt_swing_trades(sym, df, interval, p):
         if side == -1 and not p.get("sell_ok", True):
             continue
         k0 = j + 1
+        if p.get("since") and idx[k0].strftime("%Y-%m-%d") < p["since"]:
+            continue   # before the period you asked for: only there to warm the signals up
         entry = float(a["o"][k0])
         moved = side * (entry - sig_px)
         if risk <= 0 or moved >= risk or moved <= -0.8 * risk:
@@ -5517,6 +5519,8 @@ def bt_money(trades, kind, p):
         if kind == "stock":
             risk_u = t["risk"]
             qty = int(risk_amt // risk_u) if risk_u > 0 else 0
+            if p.get("funds"):   # the Intraday autopilot: each trade buys funds x leverage worth of shares
+                qty = int(p["funds"] * p["leverage"] // S0)
             qty = min(qty, int(free * p["leverage"] // S0))
             if qty < 1:
                 skipped["not enough funds for one share"] = skipped.get("not enough funds for one share", 0) + 1
@@ -5625,16 +5629,16 @@ def bt_stats(done, p):
             "by_symbol": [{"sym": k, "trades": v["trades"], "win_rate": round(v["wins"] / v["trades"] * 100, 1), "pnl": round(v["pnl"], 2)} for k, v in sorted(by_sym.items(), key=lambda kv: -kv[1]["pnl"])]}
 
 
-def bt_movers_trades(span, data, cfg):
+def bt_movers_trades(span, data, cfg, kind="scanner"):
     """The Autopilot's early-mover rule over past days (the same engine as the Replay), as trades the backtest can size with the user's capital."""
-    rr = replay_run_range(data, "scanner", span, cfg)
+    rr = replay_run_range(data, kind, span, cfg)
     if rr.get("error"):
         return None, rr["error"]
     out = []
     for t in rr["trades"]:
         a, b = pd.Timestamp(f"{t['day']} {t['entered']}", tz=IST), pd.Timestamp(f"{t['day']} {t['exit_hhmm']}", tz=IST)
         out.append({"sym": t["symbol"], "side": 1 if t["side"] == "BUY" else -1, "t_in": a, "t_out": max(a, b), "entry": t["entry"], "exit": t["exit"], "risk": abs(t["entry"] - t["sl"]),
-                    "sl": t["sl"], "tp": t["t4"], "why": t["reason"], "kind": "early mover", "grade": None, "score": None})
+                    "sl": t["sl"], "tp": t["t4"], "why": t["reason"], "kind": "intraday" if kind == "intraday" else "early mover", "grade": None, "score": None})
     return out, None
 
 
@@ -5691,7 +5695,7 @@ def bt_params(payload):
         if kind not in ("stock", "futures", "options"):
             raise ValueError("Choose stock, futures or options")
         strategy = str(payload.get("strategy", "confluence"))
-        if strategy not in ("signal", "movers", "confluence", "swing"):
+        if strategy not in ("signal", "movers", "confluence", "swing", "intraday"):
             raise ValueError("Choose the Nifty confluence, the signal, the early movers or the futures swing strategy")
         if strategy == "swing":
             interval, kind = ("15m" if interval == "15m" else "1d"), "futures"
@@ -5700,6 +5704,8 @@ def bt_params(payload):
         raw = payload.get("symbols", "")
         syms = [s.strip().upper() for s in (raw.split(",") if isinstance(raw, str) else raw) if str(s).strip()]
         syms = list(dict.fromkeys(syms))
+        if strategy == "intraday":
+            syms, interval, kind = ["F&O stocks"], ("15m" if interval == "15m" else "5m"), "stock"
         if strategy == "movers":
             syms, interval = ["F&O stocks"], "5m"   # the whole F&O list, on 5 minute candles, decided by the NIFTY trend
         if not syms:
@@ -5707,11 +5713,11 @@ def bt_params(payload):
         mx_syms = BT_MAX_SYMBOLS_SWING if strategy == "swing" else BT_MAX_SYMBOLS
         if len(syms) > mx_syms:
             raise ValueError(f"Test at most {mx_syms} symbols at a time")
-        unknown = [s for s in syms if s not in UNIVERSE and strategy != "movers"]
+        unknown = [s for s in syms if s not in UNIVERSE and strategy not in ("movers", "intraday")]
         if unknown:
             raise ValueError("Not in the list of tracked symbols: " + ", ".join(unknown[:5]))
         mx = BT_MAX_DAYS[interval]
-        days = int(num("days", 10 if interval != "1d" else 200, mx, min(mx, 58 if interval != "1d" else (1095 if strategy == "swing" else 730))))
+        days = int(num("days", 10 if interval != "1d" else (30 if strategy == "swing" else 200), mx, min(mx, 58 if interval != "1d" else (1095 if strategy == "swing" else 730))))
         if strategy == "swing" and interval == "15m":
             days = min(days, 58)
         p = {"interval": interval, "kind": kind, "strategy": strategy, "symbols": syms, "days": days,
@@ -5726,8 +5732,11 @@ def bt_params(payload):
             p["intraday"] = False
         if strategy == "swing":
             p.update(intraday=False, leverage=1)
-        if strategy in ("movers", "confluence"):
+        if strategy in ("movers", "confluence", "intraday"):
             p["intraday"] = True
+        if strategy == "intraday":
+            p["funds"] = num("funds", 1000, 1e8, 50000)
+            p["max_open"] = int(num("max_open", 1, 20, 5))
         return p, None
     except ValueError as e:
         return None, str(e)
@@ -5749,7 +5758,7 @@ def bt_job(jid, user_id, p):
 def _bt_job(jid, user_id, p):
     job = BT_JOBS[jid]
     try:
-        if p["strategy"] == "movers":
+        if p["strategy"] in ("movers", "intraday"):
             job["note"] = "Downloading the 5 and 15 minute candles of the F&O stocks and NIFTY"
             _, data, errors, rdays = replay_load("scanner", lambda a, b: job.update(note=f"Downloaded {a} of {b}"))
             if not data:
@@ -5759,18 +5768,28 @@ def _bt_job(jid, user_id, p):
             first = (now - timedelta(days=p["days"])).strftime("%Y-%m-%d")
             span = [d for d in rdays[1:] if d >= first and (d < now.strftime("%Y-%m-%d") or now.strftime("%H:%M") > "15:35")]   # the first loaded day is warm-up for the indicator
             job["note"] = f"Replaying {len(span)} trading days"
-            tr, err = bt_movers_trades(span, data, bot_cfg(user_id, "scanner")) if span else (None, "No complete trading days are loaded for that period.")
+            if p["strategy"] == "intraday":
+                icfg = {"tf": p["interval"], "max_open": p["max_open"], "sells": fut_cfg(user_id, "intraday").get("sells", True)}
+                tr, err = bt_movers_trades(span, data, icfg, "intraday") if span else (None, "No complete trading days are loaded for that period.")
+            else:
+                tr, err = bt_movers_trades(span, data, bot_cfg(user_id, "scanner")) if span else (None, "No complete trading days are loaded for that period.")
             if err:
                 job.update(state="error", error=err)
                 return
             res = bt_run(p, {}, tr)
             res["problems"] = errors[:5] + res["problems"]
-            res["notes"] = [f"Uses the Autopilot 1 settings (at most {int(bot_cfg(user_id, 'scanner').get('max_trades', 3))} trades a day). The grade filter and the symbol list are not used; the timeframe is 5 minutes."] + res["notes"]
+            if p["strategy"] == "intraday":
+                res["notes"] = [f"Intraday stocks autopilot on {p['interval'][:-1]} minute signals: each trade buys ₹{p['funds']:,.0f} x {p['leverage']:g} worth of shares, at most {p['max_open']} open at once, and everything is closed by 15:15. Brokerage, margin rules and the exchange's real fills will differ."] + res["notes"]
+            else:
+                res["notes"] = [f"Uses the Autopilot 1 settings (at most {int(bot_cfg(user_id, 'scanner').get('max_trades', 3))} trades a day). The grade filter and the symbol list are not used; the timeframe is 5 minutes."] + res["notes"]
             res["params"] = {k: (v.strftime("%H:%M") if isinstance(v, dtime) else v) for k, v in p.items()}
             job.update(state="done", result=res)
             return
         job["note"] = "Downloading price history"
-        candles, bad = bt_fetch(p["symbols"], p["interval"], p["days"], lambda a, b: job.update(note=f"Downloaded {a} of {b} symbols"))
+        warm = 330 if (p["strategy"] == "swing" and p["interval"] == "1d") else 0   # the signals need about 150 earlier candles before the period starts
+        candles, bad = bt_fetch(p["symbols"], p["interval"], min(3650, p["days"] + warm), lambda a, b: job.update(note=f"Downloaded {a} of {b} symbols"))
+        if warm:
+            p["since"] = (ist_now() - timedelta(days=p["days"])).strftime("%Y-%m-%d")
         if not candles:
             job.update(state="error", error="The data provider returned no candles. Try again in a minute, or test fewer symbols." + ((" " + " ".join(bad[-2:])) if bad else ""))
             return
@@ -9495,6 +9514,8 @@ def replay_run(data, kind, day, cfg):
     """One day, one 5 minute step at a time. Returns the signals that qualified, the trades the autopilot would have taken, and why the others were left out."""
     if kind in BOT_INDEX:
         return replay_run_nc(data, day, cfg, BOT_INDEX[kind])
+    if kind == "intraday":
+        return replay_run_intraday(data, day, cfg)
     ent = cfg.get("entries", "both")
     max_trades = int(cfg.get("max_trades", 3))
     syms = [s for s, v in data.items() if "5m" in v and "15m" in v and not (kind == "scanner" and s == "NIFTY")]
@@ -9635,6 +9656,91 @@ def replay_run(data, kind, day, cfg):
     return {"day": day, "bot": kind, "equity": eq, "summary": summ, "trades": trades, "signals": signals, "skips": sorted(skips.items(), key=lambda x: -x[1]), "max_trades": max_trades, "entries": ent}
 
 
+def replay_run_intraday(data, day, cfg):
+    """The Intraday stocks autopilot on one past day: the stocks that lead or lag in the best and worst sectors (the same rule as the F&O stocks autopilot, re-evaluated at every
+    5 minute candle), entered on a fresh signal of the chosen timeframe in the same direction, with the signal's stop and targets, the stop moving up behind them, out when the
+    signal turns the other way or at 15:15."""
+    from bisect import bisect_right
+    tf = cfg.get("tf") if cfg.get("tf") in ("5m", "15m") else "5m"
+    max_open = max(1, int(cfg.get("max_open", 5)))
+    sells = bool(cfg.get("sells", True))
+    syms = [s for s, v in data.items() if s != "NIFTY" and "5m" in v and "15m" in v and s not in INDEX_YF]
+    steps = {}
+    for s in syms:
+        S5 = data[s]["5m"]
+        idx = [k for k in range(S5["n"]) if S5["dates"][k] == day]
+        if idx:
+            steps[s] = idx
+    if not steps:
+        return {"error": f"No candles for {day} in the data loaded."}
+    ref = max(steps, key=lambda s: len(steps[s]))
+    grid = [(data[ref]["5m"]["close_ts"][k], data[ref]["5m"]["tm"][k]) for k in steps[ref]]
+    first, last = OPTBOT_FIRST_ENTRY.strftime("%H:%M"), OPTBOT_LAST_ENTRY.strftime("%H:%M")
+    skips, skips_seen, signals, trades, pos, taken = {}, set(), [], [], {}, set()
+
+    def skip(why, key):
+        if (why, key) not in skips_seen:
+            skips_seen.add((why, key))
+            skips[why] = skips.get(why, 0) + 1
+    for T, hhmm in grid:
+        endt = _hm(T)
+        if endt < first or endt > last:
+            continue
+        for s_, tr_ in pos.items():
+            if tr_["open"] and tr_["exit_hhmm"] <= endt:
+                tr_["open"] = False
+        movers, why_none = replay_mom_cands(data, syms, day, T, endt)
+        if why_none:
+            skip(why_none, ("none", endt[:2]))
+        for m in sorted(movers, key=lambda c: c["mom"], reverse=True):
+            s, side = m["symbol"], m["g"]["side"]
+            if side == "SELL" and not sells:
+                continue
+            S5, S = data[s]["5m"], data[s][tf]
+            k5, k = bisect_right(S5["close_ts"], T) - 1, bisect_right(S["close_ts"], T) - 1
+            if k5 < 0 or k < 0 or S5["dates"][k5] != day:
+                continue
+            g = replay_state(S, k)
+            if not g or not g["open"] or g["side"] != side or g["date"] != day or g["bars_ago"] > FUT_MAX_AGE[tf] or g["hits"]:
+                continue
+            ltp = float(S5["c"][k5])
+            key = (s, tf, g["date"], g["time"], side)
+            moved = (ltp - g["entry"]) * g["dir"]
+            if not g["risk"] or moved >= g["risk"] or moved <= -0.8 * g["risk"]:
+                skip("price already a full stop-distance away or next to the stop", key)
+                continue
+            sg = {"symbol": s, "side": side, "tf": tf, "type": "fresh", "at": endt, "signal_time": f"{g['date']} {g['time']}", "price": round(ltp, 2), "sl": round(g["sl"], 2),
+                  "tps": [round(t, 2) for t in g["tps"]], "move": round(m["chg"], 2), "taken": False, "why_not": None, "ts": int(S["ts"][g["j"]]), "day": day}
+            if key in taken:
+                continue
+            signals.append(sg)
+            if s in pos and pos[s]["open"]:
+                sg["why_not"] = "already in a trade on this stock"
+                continue
+            if sum(1 for t in pos.values() if t["open"]) >= max_open:
+                sg["why_not"] = f"{max_open} positions already open"
+                continue
+            c = {"symbol": s, "tf": tf, "g": g, "px": ltp, "key": key, "etype": "fresh", "dist": 0.0, "at": endt, "chg": m["chg"], "S5": S5, "k5": k5, "sts": sg["ts"], "Stf": S}
+            tr = replay_trade(c, day)
+            tr["open"] = True
+            pos[s] = tr
+            sg["taken"] = True
+            taken.add(key)
+            trades.append(tr)
+    for tr in trades:
+        tr.pop("open", None)
+    tot = round(sum(t["r"] for t in trades), 2)
+    win = [t for t in trades if t["r"] > 0]
+    summ = {"signals": len(signals), "trades": len(trades), "wins": len(win), "losses": sum(1 for t in trades if t["r"] < 0), "flat": sum(1 for t in trades if t["r"] == 0),
+            "total_r": tot, "avg_r": round(tot / len(trades), 2) if trades else 0.0, "win_rate": round(len(win) / len(trades) * 100) if trades else 0,
+            "best": max((t["r"] for t in trades), default=0), "worst": min((t["r"] for t in trades), default=0)}
+    eq, run = [], 0.0
+    for t in trades:
+        run += t["r"]
+        eq.append(round(run, 2))
+    return {"day": day, "bot": "intraday", "equity": eq, "summary": summ, "trades": trades, "signals": signals, "skips": sorted(skips.items(), key=lambda x: -x[1]), "max_trades": max_open, "entries": tf}
+
+
 def replay_run_range(data, kind, days, cfg):
     """Several days in a row, each with its own daily trade limit. Adds the equity curve, daily results and drawdown."""
     trades, signals, skips, per_day = [], [], {}, []
@@ -9749,6 +9855,13 @@ def replay_trade(c, day):
         if g.get("tstop") and step == 0 and k - start >= g["tstop"] and (float(S["c"][k]) - entry) * dr < 0.25 * risk:
             exit_px, exit_at, why = float(S["c"][k]), ck, f"time stop ({g['tstop'] * 5} minutes without progress)"
             break
+        if c.get("Stf") is not None:   # the intraday autopilot also leaves when the signal turns the other way
+            from bisect import bisect_right
+            Stf = c["Stf"]
+            gs = replay_state(Stf, bisect_right(Stf["close_ts"], S["close_ts"][k]) - 1)
+            if gs and gs["side"] != g["side"] and gs["j"] > g["j"]:
+                exit_px, exit_at, why = float(S["c"][k]), ck, f"the {c['tf'][:-1]}-minute signal turned {gs['side']}"
+                break
         if ck >= sq:
             exit_px, exit_at, why = float(S["c"][k]), ck, "end of day"
             break
@@ -11165,7 +11278,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <div class="card botbox">
  <div class="ixrow"><b>Backtest</b><span class="sub">See how a strategy would have grown your funds on past candles. Results are estimates, not promises.</span></div>
  <div class="botrow">
-  <label>Strategy<select id="btStrategy"><option value="confluence" selected>NIFTY autopilot strategy</option><option value="swing">Futures swing autopilot (daily)</option><option value="signal">Signals</option><option value="movers">Stock autopilot strategy</option></select></label>
+  <label>Strategy<select id="btStrategy"><option value="confluence" selected>NIFTY autopilot strategy</option><option value="swing">Futures swing autopilot (daily)</option><option value="signal">Signals</option><option value="movers">Stock autopilot strategy</option><option value="intraday">Intraday stocks autopilot</option></select></label>
   <label>Trade<select id="btKind"><option value="stock">Stocks / index (cash)</option><option value="futures">Futures</option><option value="options">Options (buying)</option></select></label>
   <label>Symbols (up to 10, comma separated)<input id="btSyms" value="NIFTY" placeholder="NIFTY, RELIANCE, TCS"></label>
   <label>Timeframe<select id="btTf"><option value="5m" selected>5 minute (last ~2 months)</option><option value="15m">15 minute (last ~2 months)</option><option value="1d">Daily (years)</option></select></label>
@@ -11924,7 +12037,7 @@ function fsHtml(p,k){return `<div class="card botbox" id="${p}Box">
   <span class="botpill" id="${p}Pill"></span>
  </div>
  <div class="tkmsg" id="${p}Msg" role="status"></div>
- ${k==="swing"?`<div class="ixrow"><b>Replay past days</b><select id="${p}RpDays" aria-label="Period to replay"><option value="90">Last 3 months</option><option value="180">Last 6 months</option><option value="365">Last 1 year</option><option value="1095">Last 3 years</option></select><button class="btn" id="${p}Rp">Replay</button><span class="sub">Runs the futures strategy on past candles with your funds and shows each trade. 15 min covers about 2 months.</span></div>`:""}
+ ${k==="swing"?`<div class="ixrow"><b>Replay past days</b><select id="${p}RpDays" aria-label="Period to replay"><option value="90">Last 3 months</option><option value="180">Last 6 months</option><option value="365">Last 1 year</option><option value="1095">Last 3 years</option></select><button class="btn" id="${p}Rp">Replay</button><span class="sub">Runs the futures strategy on past candles with your funds and shows each trade. 15 min covers about 2 months.</span></div>`:`<div class="ixrow"><b>Replay past days</b><select id="${p}RpDays" aria-label="Period to replay"><option value="10">Last 10 days</option><option value="20">Last 20 days</option><option value="30" selected>Last 30 days</option><option value="58">Last 2 months</option></select><button class="btn" id="${p}Rp">Replay</button><span class="sub">Runs this autopilot on past 5 or 15 minute candles with your funds per trade and leverage, and shows each trade. Yahoo or Dhan history limits it to about 2 months.</span></div>`}
  <div class="ixrow"><b>Open positions</b></div>
  <div class="wrap"><table id="${p}Open"></table></div>
  <div class="ixrow"><b>Closed positions</b><span class="sub" id="${p}Stats"></span></div>
@@ -11951,7 +12064,7 @@ async function fsCtl(p,k,action){const D=(window.fsD||{})[p]||{};const body={act
  const d=await post("/api/futbot",body);$(p+"Msg").textContent=d.error||({play:"Running.",pause:"Paused. No new trades; open positions are still managed.",stop:"Stopped. Open positions keep their stop-loss.",save:"Saved.",close_all:d.left?`${d.left} position(s) could not be closed. Check your broker app.`:"All positions closed."})[action]||"";fsLoad(p,k)}
 function fsInit(){FS_BOTS.forEach(([p,k])=>{$("botHost").insertAdjacentHTML("beforeend",fsHtml(p,k));
  $(p+"Save").onclick=()=>fsCtl(p,k,"save");$(p+"Play").onclick=()=>fsCtl(p,k,"play");$(p+"Pause").onclick=()=>fsCtl(p,k,"pause");$(p+"Stop").onclick=()=>fsCtl(p,k,"stop");$(p+"CloseAll").onclick=()=>fsCtl(p,k,"close_all");
- if(k!=="swing")return;
+ if(k!=="swing"){$(p+"Rp").onclick=()=>{const tf=$(p+"Tf").value;document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="intraday";$("btTf").value=tf;$("btStrategy").onchange();$("btDays").value=+$(p+"RpDays").value;$("btLev").value=+$(p+"Lev").value;window.btExtra={funds:+$(p+"Funds").value,max_open:+$(p+"Max").value,sell_ok:$(p+"Sells").checked};btRun()};return}
  $(p+"Rp").onclick=()=>{const tf=$(p+"Tf").value==="15m"?"15m":"1d",d=tf==="15m"?58:+$(p+"RpDays").value;document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="swing";$("btTf").value=tf;$("btStrategy").onchange();$("btDays").value=d;btRun()}
  $(p+"Bt").onclick=()=>{document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="swing";$("btTf").value=$(p+"Tf").value==="15m"?"15m":"1d";$("btStrategy").onchange()}})}
 function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
@@ -12105,6 +12218,7 @@ async function btRun(){clearTimeout(btTimer);
  const b={strategy:$("btStrategy").value,kind:$("btKind").value,symbols:$("btSyms").value,interval:$("btTf").value,days:+$("btDays").value,capital:+$("btCap").value,risk_pct:+$("btRisk").value,target:+$("btTarget").value,
   intraday:$("btIntra").checked,sell_ok:$("btSell").checked,min_grade:$("btGrade").value,leverage:+$("btLev").value,margin_pct:+$("btMargin").value,lot_size:+$("btLot").value||0,iv:+$("btIv").value,dte:+$("btDte").value,
   brokerage:+$("btBrk").value,other_pct:+$("btOth").value,slippage:+$("btSlip").value,entry_from:$("btFrom").value,entry_to:$("btTo").value,gap_max:+$("btGap").value};
+ if(b.strategy==="intraday"&&window.btExtra)Object.assign(b,window.btExtra);
  $("btRun").disabled=true;$("btMsg").textContent="";$("btNote").textContent="Starting…";
  const d=await post("/api/backtest",b);if(d.error){$("btMsg").textContent=d.error;$("btRun").disabled=false;$("btNote").textContent="";return}
  const poll=async()=>{try{const g=await (await api("/api/backtest/"+d.id)).json();
@@ -12114,7 +12228,9 @@ async function btRun(){clearTimeout(btTimer);
  poll()}
 function initBacktest(){$("btRun").onclick=btRun;
  $("btTf").onchange=()=>{const dly=$("btTf").value==="1d";$("btDays").value=dly?730:58;$("btIntra").checked=!dly;$("btIntra").disabled=dly;$("btLev").value=dly?1:5};
- $("btStrategy").onchange=()=>{const v=$("btStrategy").value,m=v==="movers",g=m||v==="confluence",sw=v==="swing";if(sw){$("btKind").value="futures";if($("btTf").value!=="15m")$("btTf").value="1d";$("btTf").onchange();$("btDays").value=$("btTf").value==="15m"?58:1095;if(/^\s*(NIFTY)?\s*$/.test($("btSyms").value))$("btSyms").value=BT_SWING_SYMS}["btKind","btTarget","btGrade","btIntra"].forEach(id=>{const e=$(id),l=e.closest("label");if(l)l.hidden=sw});{const o5=$("btTf").querySelector('option[value="5m"]');if(o5)o5.hidden=o5.disabled=sw};if((g&&$("btTf").value==="1d")||((m||v==="confluence")&&$("btTf").value!=="5m")){$("btTf").value="5m";$("btTf").onchange()}$("btSyms").disabled=m;$("btSyms").title=m?"The early-mover strategy uses the whole F&O list":"";$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true}}
+ $("btStrategy").onchange=()=>{const v=$("btStrategy").value,id=v==="intraday",m=v==="movers"||id,g=m||v==="confluence",sw=v==="swing";if(sw){$("btKind").value="futures";if($("btTf").value!=="15m")$("btTf").value="1d";$("btTf").onchange();$("btDays").value=$("btTf").value==="15m"?58:1095;if(/^\s*(NIFTY)?\s*$/.test($("btSyms").value))$("btSyms").value=BT_SWING_SYMS}
+ if(id){if($("btTf").value==="1d")$("btTf").value="5m";$("btTf").onchange();$("btDays").value=30;$("btIntra").checked=true}
+ ["btKind","btTarget","btGrade","btIntra"].forEach(e_=>{const e=$(e_),l=e.closest("label");if(l)l.hidden=sw||id});{const o5=$("btTf").querySelector('option[value="5m"]'),o1=$("btTf").querySelector('option[value="1d"]');if(o5)o5.hidden=o5.disabled=sw;if(o1)o1.hidden=o1.disabled=id};if((v!=="intraday"&&g&&$("btTf").value==="1d")||((v==="movers"||v==="confluence")&&$("btTf").value!=="5m")){$("btTf").value="5m";$("btTf").onchange()}$("btSyms").disabled=m;$("btSyms").title=m?"This strategy uses the whole F&O list":"";$("btIntra").disabled=g||$("btTf").value==="1d";if(g)$("btIntra").checked=true;if(!id)window.btExtra=null}}
 function initScanner(){
  $("scTfs").onclick=e=>{const b=e.target.closest("button");if(b){scTf=b.dataset.t;try{localStorage.setItem("scTf",scTf)}catch(x){}scData=null;scPaint();scLoad()}};
  $("scOnly").onchange=()=>{scLoad()};$("scConf").onchange=()=>{scRender()};
