@@ -2034,7 +2034,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22l"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-22m"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -11180,7 +11180,7 @@ def copy_one(admin_rec, au, fu, fcfg, before):
     """Copy one admin order to one follower. Returns (placed text, None) or (None, why it was skipped)."""
     live_admin = admin_rec["mode"] == "live"
     if live_admin and fcfg["mode"] == "live":
-        if fcfg["armed_day"] != ist_now().strftime("%Y-%m-%d"):
+        if fcfg["armed_day"] not in (ist_now().strftime("%Y-%m-%d"), "always"):
             return None, "live copying is not switched on for today (the follower enters their PIN under Account)"
         if user_mode(fu)[0] != "live":
             return None, "live trading is not enabled on their account"
@@ -11258,7 +11258,7 @@ def api_copy_get(request: Request):
     td = ist_now().strftime("%Y-%m-%d")
     with ORDER_LOCK:
         n = sum(1 for o in ORDERS if o.get("user") == u["id"] and o.get("copy") and o.get("date") == td)
-    return {**c, "armed": c["armed_day"] == td, "live_ok": user_mode(u)[0] == "live", "admin": u["role"] == "admin", "copied_today": n}
+    return {**c, "armed": c["armed_day"] in (td, "always"), "standing": c["armed_day"] == "always", "live_ok": user_mode(u)[0] == "live", "admin": u["role"] == "admin", "copied_today": n}
 
 
 @app.post("/api/copy")
@@ -11280,11 +11280,12 @@ def api_copy_set(request: Request, payload: dict = Body(...)):
     if mode == "live":
         if user_mode(u)[0] != "live":
             return {"error": "Live trading is not enabled on your account. Copy in Paper mode, or ask the admin to enable live trading and set up your broker."}
-        if not (cur["mode"] == "live" and armed == ist_now().strftime("%Y-%m-%d")):
+        standing = bool(payload.get("standing"))
+        if not (cur["mode"] == "live" and ((armed == "always") == standing) and armed in (ist_now().strftime("%Y-%m-%d"), "always")):
             err = pin_error(u, payload.get("pin"), True)
             if err:
                 return {"error": err}
-            armed = ist_now().strftime("%Y-%m-%d")
+            armed = "always" if standing else ist_now().strftime("%Y-%m-%d")
     else:
         armed = None
     x("INSERT INTO copy_follow(user_id, mode, scale, armed_day) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode, scale=excluded.scale, armed_day=excluded.armed_day", (u["id"], mode, scale, armed))
@@ -11301,7 +11302,7 @@ def api_admin_copy_get(request: Request):
     for fu, c in copy_followers():
         with ORDER_LOCK:
             n = sum(1 for o in ORDERS if o.get("user") == fu["id"] and o.get("copy") and o.get("date") == td)
-        rows.append({"user": fu["username"], "mode": c["mode"], "scale": c["scale"], "armed": c["armed_day"] == td, "copied_today": n})
+        rows.append({"user": fu["username"], "mode": c["mode"], "scale": c["scale"], "armed": c["armed_day"] in (td, "always"), "standing": c["armed_day"] == "always", "copied_today": n})
     return {"followers": rows, "recent": list(COPY_LOG)[:15]}
 
 
@@ -12491,6 +12492,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="botrow"><label>Copy in<select id="cpMode"><option value="off">Off</option><option value="paper">Paper (simulated)</option><option value="live">Live (real money)</option></select></label>
    <label>Size, % of the admin's lots<input id="cpScale" type="number" min="10" max="500" step="10" style="width:90px"></label>
    <label id="cpPinL" hidden>Order PIN<input id="cpPin" type="password" autocomplete="off" size="8"></label>
+   <label class="chk" id="cpStandL" hidden><input type="checkbox" id="cpStand"> Keep live copying on every day, without entering my PIN daily</label>
    <button class="btn" id="cpSave">Save</button></div>
   <div class="sub" id="cpMsg"></div></div>
  <div class="grid2">
@@ -12561,7 +12563,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="sub" id="memNote"></div>
   <div id="memChart" style="height:230px;margin-top:8px" hidden></div><div class="sub" id="memLeg" hidden></div></div>
  <div class="card"><h3>Copy trading</h3>
-  <div class="sub">Users who opt in under Account follow the orders you copy. Copy an order from the order ticket (tick "Also copy this order to my followers") or from the Orders list. Each follower gets their own size and limits; a Paper order of yours is only ever copied as Paper. A live follower must enter their PIN each day.</div>
+  <div class="sub">Users who opt in under Account follow the orders you copy. Copy an order from the order ticket (tick "Also copy this order to my followers") or from the Orders list. Each follower gets their own size and limits; a Paper order of yours is only ever copied as Paper. A live follower either enters their PIN each day or, once, chooses to keep live copying on every day. Only the follower can switch that on, from their own login, with their PIN.</div>
   <div class="wrap"><table id="admCopy"></table></div><div class="sub" id="admCopyRecent" style="margin-top:8px"></div></div>
  <div class="card"><h3>Everyone's orders today</h3><div class="wrap"><table id="admOrd"></table></div></div>
  <div class="card"><h3>Add a user</h3>
@@ -13652,7 +13654,7 @@ $("tkQty").addEventListener("input",fundsPaint);
 $("tkFunds").onclick=e=>{if(e.target.id==="tkMax"&&fundsInfo&&fundsInfo.max_qty!=null){$("tkQty").value=Math.max(1,fundsInfo.max_qty);resetReview();fundsPaint()}};
 $("tkType").addEventListener("change",()=>{$("tkPrice").disabled=$("tkType").value!=="LIMIT"});
 $("tkClose").onclick=()=>$("ticket").close();
-$("cpSave").onclick=copySave;$("cpMode").onchange=()=>{$("cpPinL").hidden=$("cpMode").value!=="live"};
+$("cpSave").onclick=copySave;$("cpMode").onchange=()=>{$("cpPinL").hidden=$("cpMode").value!=="live";$("cpStandL").hidden=$("cpMode").value!=="live"};$("cpStand").onchange=()=>{$("cpPinL").hidden=false};
 initChart();initFlash();initModes();initBot();initBacktest();initConf();initInstall();initChainGraph();
 $("tkReviewBtn").onclick=async()=>{
  const body={kind:tk.kind,symbol:tk.symbol,side:$("tkSide").value,qty:+$("tkQty").value,order_type:$("tkType").value,price:$("tkPrice").value===""?null:+$("tkPrice").value,product:$("tkProd").value,broker:$("tkBrokerL").hidden?"":$("tkBroker").value,tf:(tk.tf||(tk.kind==="option"?optTf():tf))||"",expiry:tk.expiry,strike:tk.strike,right:tk.right,auto_sl:!$("tkAutoBox").hidden&&$("tkAuto").checked,trail:!$("tkAutoBox").hidden&&$("tkAuto").checked&&$("tkTrail").checked};
@@ -13712,12 +13714,12 @@ loadTrading();
 const send=async(m,u,b)=>(await api(u,{method:m,headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)})).json();
 async function loadMe(){const d=await (await api("/api/me")).json();me=d;csrf=d.csrf;
  $("dpBanner").hidden=!d.default_password;$("who").textContent=d.user.username+(d.user.role==="admin"?" (admin)":"")+(d.build?" · build "+d.build:"");$("navAdmin").hidden=d.user.role!=="admin";$("tkCopyL").hidden=d.user.role!=="admin";$("copyCard").hidden=d.user.role==="admin";renderAccount(d);if(d.user.role!=="admin")copyLoad()}
-const cpTxt=d=>d.mode==="off"?"You are not copying.":d.mode==="paper"?"Copying in Paper: simulated trades only.":(d.armed?"Copying live today.":"Live copying is not armed today: enter your PIN and press Save.");
+const cpTxt=d=>d.mode==="off"?"You are not copying.":d.mode==="paper"?"Copying in Paper: simulated trades only.":(d.standing?"Copying live every day until you switch it off. Real orders are placed in your account without asking again.":d.armed?"Copying live today.":"Live copying is not armed today: enter your PIN and press Save.");
 async function copyLoad(){try{const d=await (await api("/api/copy")).json();if(d.error)return;if(document.activeElement!==$("cpScale")){$("cpMode").value=d.mode;$("cpScale").value=d.scale}
- $("cpPinL").hidden=$("cpMode").value!=="live"||(d.mode==="live"&&d.armed);$("cpMsg").textContent=cpTxt(d)+(d.copied_today?` ${d.copied_today} copied order${d.copied_today===1?"":"s"} today.`:"")+(d.mode!=="live"&&!d.live_ok?" Live copying needs live trading enabled on your account.":"")}catch(e){}}
-async function copySave(){const d=await send("POST","/api/copy",{mode:$("cpMode").value,scale:+$("cpScale").value,pin:$("cpPin").value});$("cpPin").value="";if(d.error){$("cpMsg").textContent=d.error;return}copyLoad()}
+ $("cpStandL").hidden=$("cpMode").value!=="live";if(document.activeElement!==$("cpStand"))$("cpStand").checked=!!d.standing;$("cpPinL").hidden=$("cpMode").value!=="live"||(d.mode==="live"&&d.armed&&!!d.standing===$("cpStand").checked);$("cpMsg").textContent=cpTxt(d)+(d.copied_today?` ${d.copied_today} copied order${d.copied_today===1?"":"s"} today.`:"")+(d.mode!=="live"&&!d.live_ok?" Live copying needs live trading enabled on your account.":"")}catch(e){}}
+async function copySave(){const d=await send("POST","/api/copy",{mode:$("cpMode").value,scale:+$("cpScale").value,pin:$("cpPin").value,standing:$("cpStand").checked});$("cpPin").value="";if(d.error){$("cpMsg").textContent=d.error;return}copyLoad()}
 async function admCopyLoad(){try{const d=await (await api("/api/admin/copy")).json();if(d.error)return;
- $("admCopy").innerHTML=d.followers.length?`<thead><tr><th>Follower</th><th>Copies in</th><th>Size</th><th>Live armed today</th><th>Copied orders today</th></tr></thead><tbody>`+d.followers.map(f=>`<tr><td><b>${esc(f.user)}</b></td><td>${f.mode==="live"?"Live":"Paper"}</td><td>${f.scale}%</td><td>${f.mode==="live"?(f.armed?"Yes":"No"):"–"}</td><td>${f.copied_today}</td></tr>`).join("")+"</tbody>":'<tbody><tr><td class="empty" style="text-align:left">Nobody follows your trades yet.</td></tr></tbody>';
+ $("admCopy").innerHTML=d.followers.length?`<thead><tr><th>Follower</th><th>Copies in</th><th>Size</th><th>Live armed today</th><th>Copied orders today</th></tr></thead><tbody>`+d.followers.map(f=>`<tr><td><b>${esc(f.user)}</b></td><td>${f.mode==="live"?"Live":"Paper"}</td><td>${f.scale}%</td><td>${f.mode==="live"?(f.standing?"Every day":f.armed?"Yes":"No"):"–"}</td><td>${f.copied_today}</td></tr>`).join("")+"</tbody>":'<tbody><tr><td class="empty" style="text-align:left">Nobody follows your trades yet.</td></tr></tbody>';
  $("admCopyRecent").innerHTML=d.recent.length?"<b>Recent copies</b><br>"+d.recent.map(r=>`${esc(r.t)} ${esc(r.side)} ${esc(r.label)} (${esc(r.mode)}): ${r.done} of ${r.of} followers. `+r.results.filter(x=>!x.ok).map(x=>esc(x.user)+": "+esc(x.text)).join("; ")).join("<br>"):""}catch(e){}}
 async function copyOrder(id,again){const d=await post("/api/admin/copy",{order_id:id,again:!!again});if(d.error){if(d.error.startsWith("This order was already")&&confirm(d.error+" Copy it again?"))return copyOrder(id,true);return d.error}
  admCopyLoad();return `Copied to ${d.done} of ${d.of} follower${d.of===1?"":"s"}.`+d.results.filter(x=>!x.ok).map(x=>` ${x.user}: ${x.text}`).join("")}
