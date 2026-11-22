@@ -2034,7 +2034,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22f"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-22g"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3409,6 +3409,10 @@ def autopilot_loop():
         except Exception as e:
             AUTO["error"] = f"swing {type(e).__name__}: {str(e)[:100]}"
         try:
+            sprbot_once()
+        except Exception as e:
+            AUTO["error"] = f"spread {type(e).__name__}: {str(e)[:100]}"
+        try:
             if time.time() - AUTO.get("purged", 0) > 3600:
                 AUTO["purged"] = time.time()
                 x("DELETE FROM sessions WHERE expires<?", (time.time(),))
@@ -3521,6 +3525,7 @@ def watchdog_loop():
 def start_engine():
     bot_restore()
     fut_restore()
+    spr_restore()
     engine_start("watchdog", watchdog_loop)
     engine_start("mem_loop", mem_loop)
     engine_start("autopilot_loop", autopilot_loop)
@@ -4478,7 +4483,7 @@ def bot_restore():
         return
     for r in rows:
         try:
-            if r["kind"] in ("swing", "intraday"):
+            if r["kind"] in ("swing", "intraday", "spread"):
                 continue   # the swing autopilot is restored by fut_restore
             rec = json.loads(r["data"])
             uid, kind = int(r["user_id"]), bot_kind(r["kind"])
@@ -4983,6 +4988,461 @@ def fut_apply(u, payload, mode):
     if tf != cfg.get("tf", "1d") and cfg["mode"] != "off":
         return "Stop the autopilot before changing the timeframe."
     cfg.update(tf=tf, lots=lots, max_open=mo, loss_limit=ll, funds=funds, leverage=lev, sells=bool(payload.get("sells", cfg["sells"])), indices=False if intra else bool(payload.get("indices", cfg["indices"])))
+    return None
+
+
+# ── NIFTY credit-spread autopilot: on a fresh NIFTY signal it sells the at-the-money option on the side the market is expected to hold (a PUT after a BUY signal, a CALL after a SELL signal)
+#    and buys the same kind of option SPR width points further out as protection, so the most it can lose is fixed. It keeps the spread until the stop is hit, most of the premium has been
+#    collected, or expiry day 15:15, so a move in its favour and a market that does not move both pay (the sold option loses value either way). Hedge first, then the sale, so it is never naked. ──
+SPR_DEFAULTS = {"mode": "off", "paused": False, "last_mode": "paper", "lots": 1, "max_open": 2, "loss_limit": 15000.0, "armed_day": None, "width": 400, "capture": 80.0, "min_dte": 1,
+                "puts": True, "calls": True}
+SPR_KEYS = tuple(SPR_DEFAULTS)
+SPR = {}
+SPR_LOG = []
+SPR_SAVED = {}
+SPR_MIN_CREDIT_PCT = float(os.getenv("SPR_MIN_CREDIT_PCT", "8"))   # the net credit must be at least this share of the width, or the trade is not worth its risk
+SPR_WAIT = 180   # seconds a live leg may stay unfilled before the autopilot gives up on it
+SPR_TERMINAL = ("complete", "cancelled", "rejected", "expired")
+
+
+def spr_cfg(uid):
+    return SPR.setdefault(uid, dict(SPR_DEFAULTS))
+
+
+def spr_log(uid, text):
+    SPR_LOG.append({"uid": uid, "t": ist_now().strftime("%d %b %H:%M:%S"), "text": text})
+    del SPR_LOG[:-300]
+
+
+def spr_positions(uid, open_only=True):
+    with ORDER_LOCK:
+        return [o for o in ORDERS if o.get("user") == uid and o.get("sp") and o.get("sp_role") == "hedge" and not o.get("is_exit")
+                and (not open_only or o.get("sp_state") in ("entering", "open", "closing"))]
+
+
+def spr_pnl(m):
+    if m.get("sp_state") != "closed" or m.get("sp_credit") is None or m.get("sp_exit_debit") is None:
+        return None
+    return round((m["sp_credit"] - m["sp_exit_debit"]) * m["qty"], 2)
+
+
+def spr_day_pnl(uid):
+    td = ist_now().strftime("%Y-%m-%d")
+    return sum(spr_pnl(m) or 0 for m in spr_positions(uid, open_only=False) if m.get("sp_closed_date") == td)
+
+
+def spr_persist():
+    for uid, cfg in list(SPR.items()):
+        try:
+            rec = {k: cfg.get(k) for k in SPR_KEYS}
+            rec.update(live_pref=MODE_PREF.get(uid) == "live")
+            txt = json.dumps(rec, sort_keys=True)
+            if SPR_SAVED.get(uid) == txt:
+                continue
+            x("DELETE FROM botcfg WHERE user_id=? AND kind=?", (uid, "spread"))
+            x("INSERT INTO botcfg(user_id, kind, data) VALUES(?,?,?)", (uid, "spread", txt))
+            SPR_SAVED[uid] = txt
+        except Exception:
+            pass
+
+
+def spr_restore():
+    """After a restart: bring each spread autopilot back as it was. A live one still needs today's PIN before it takes new trades; open spreads keep being managed."""
+    today = ist_now().strftime("%Y-%m-%d")
+    try:
+        rows = q("SELECT user_id, data FROM botcfg WHERE kind=?", ("spread",))
+    except Exception:
+        return
+    for r in rows:
+        try:
+            rec = json.loads(r["data"])
+            uid = int(r["user_id"])
+            u = user_by_id(uid)
+            if not u:
+                continue
+            cfg = spr_cfg(uid)
+            cfg.update({k: rec[k] for k in SPR_KEYS if rec.get(k) is not None})
+            if cfg["mode"] == "live" and rec.get("armed_day") == today and rec.get("live_pref") and not live_blocker(u):
+                MODE_PREF[uid] = "live"
+            SPR_SAVED[uid] = json.dumps(rec, sort_keys=True)
+            spr_log(uid, f"Spread autopilot restored after a server restart ({cfg['mode'].upper()}{', paused' if cfg.get('paused') else ''}).")
+        except Exception:
+            pass
+
+
+def spr_leg_ltp(ch, strike, right):
+    leg = next((r.get(right.lower()) for r in (ch or {}).get("rows", []) if r["strike"] == strike), None)
+    return (leg or {}).get("ltp")
+
+
+def spr_chain(u, cfg):
+    """The option chain of the expiry to use: the nearest one that is at least min_dte days away."""
+    ch = chain_for("NIFTY", None, u)
+    if not ch or not ch.get("rows") or not ch.get("expiry"):
+        return None
+    today = ist_now().date()
+
+    def days(e):
+        try:
+            return (datetime.strptime(e, EXPIRY_FMT).date() - today).days
+        except Exception:
+            return -1
+    if days(ch["expiry"]) >= cfg["min_dte"]:
+        return ch
+    for e in ch.get("expiries") or []:
+        if days(e) >= cfg["min_dte"]:
+            alt = chain_for("NIFTY", e, u)
+            return alt if alt and alt.get("rows") else None
+    return None
+
+
+def spr_order(u, cfg, m_or_none, side, strike, right, expiry, price):
+    p = {"kind": "option", "symbol": "NIFTY", "side": side, "qty": cfg["lots"], "order_type": "LIMIT", "price": price, "product": "CARRYFORWARD", "tf": "5m",
+         "expiry": expiry, "strike": strike, "right": right}
+    return make_order(p, u, force=cfg["mode"])
+
+
+def spr_candidates(u, cfg, why):
+    rows = auto_rows("nifty", "5m")
+    r5 = next(iter(rows or []), None)
+    if not r5:
+        why.append("no NIFTY price yet")
+        return []
+    today = ist_now().strftime("%Y-%m-%d")
+    notes = []
+    cands = nc_live_candidates(u, "spread", float(r5.get("ltp") or r5["close"]), today, lambda label, text: notes.append(f"{label}: {text}"), False, False, "NIFTY")
+    why.extend(notes)
+    done = {m.get("sp_sigkey") for m in spr_positions(u["id"], open_only=False)}
+    day_key = lambda c: f"{today} {c['sigkey']}"
+    out = []
+    for c in cands:
+        if day_key(c) in done:
+            continue
+        if (c["side"] == "BUY" and not cfg["puts"]) or (c["side"] == "SELL" and not cfg["calls"]):
+            continue
+        out.append(c)
+    return out
+
+
+def spr_enter(u, cfg, c):
+    """Hedge first, then the sale. Returns "skip", "done", "changed" or "stop"."""
+    uid, mode, side = u["id"], cfg["mode"], c["side"]
+    right = "PE" if side == "BUY" else "CE"
+    ch = spr_chain(u, cfg)
+    if not ch:
+        spr_log(uid, "No option chain for a usable expiry, so no spread was opened.")
+        return "skip"
+    strikes = sorted(r["strike"] for r in ch["rows"])
+    spot = c["px"]
+    atm = min(strikes, key=lambda k: abs(k - spot))
+    hedge_k = atm - cfg["width"] if right == "PE" else atm + cfg["width"]
+    sp, hp = spr_leg_ltp(ch, atm, right), spr_leg_ltp(ch, hedge_k, right)
+    if hedge_k not in strikes or not sp or not hp:
+        spr_log(uid, f"No price for the {int(atm)} / {int(hedge_k)} {right} pair, so no spread was opened.")
+        return "skip"
+    credit = sp - hp
+    if credit < SPR_MIN_CREDIT_PCT / 100 * cfg["width"]:
+        spr_log(uid, f"{int(atm)} {right} less {int(hedge_k)} pays only {credit:.1f} points, under {SPR_MIN_CREDIT_PCT:g}% of the {cfg['width']} width. Skipped.")
+        AUTO_SEEN[c["key"]] = True
+        return "skip"
+    lim_h = round(round(hp * 1.01 / 0.05) * 0.05, 2)
+    order, err, _, _ = spr_order(u, cfg, None, "BUY", hedge_k, right, ch["expiry"], lim_h)
+    if err:
+        spr_log(uid, f"Hedge {int(hedge_k)} {right}: {err}")
+        AUTO_SEEN[c["key"]] = True
+        return "skip"
+    if order["mode"] != mode:
+        spr_log(uid, "Your trading mode changed, so no order was sent.")
+        return "changed"
+    rec, err = bot_place(u, order)
+    if err:
+        spr_log(uid, f"Hedge {int(hedge_k)} {right}: {err}")
+        notify_user(uid, "Spread autopilot order failed", err)
+        if err.startswith("UNSURE"):
+            cfg["mode"] = "off"
+        return "stop"
+    AUTO_SEEN[c["key"]] = True
+    lv = c["levels"]
+    rec.update(sp=True, sp_role="hedge", sp_state="entering", sp_kind="Bull put spread" if side == "BUY" else "Bear call spread", sp_dir=side, sp_right=right, sp_expiry=ch["expiry"],
+               sp_short_k=atm, sp_hedge_k=hedge_k, sp_width=cfg["width"], sp_under=spot, sp_sl=lv["sl"], sp_t1=lv["tp1"], sp_sigkey=f"{ist_now().strftime('%Y-%m-%d')} {c['sigkey']}", sp_t_in=time.time(), sp_short_id=None,
+               sp_credit=None, sp_exit_debit=None, sp_reason=None, sp_closed_date=None, sp_cap=cfg["capture"])
+    append_log(rec)
+    spr_log(uid, f"{'LIVE' if mode == 'live' else 'Paper'} {rec['sp_kind']}: bought the {int(hedge_k)} {right} as protection at about {lim_h:.2f}; the {int(atm)} {right} is sold once it fills. NIFTY {spot:.0f}, stop {lv['sl']:.0f}.")
+    spr_step(u, cfg, rec)
+    return "done"
+
+
+def spr_leg_rec(m, key):
+    return find_order(m.get(key), m["user"]) if m.get(key) else None
+
+
+def spr_step(u, cfg, m):
+    """Move an entering or closing spread forward one stage. Called every cycle; a stage that needs a fill waits for it."""
+    uid, st = u["id"], m.get("sp_state")
+    if st == "entering":
+        if m["status"] in ("rejected", "cancelled", "expired", "unknown"):
+            m.update(sp_state="closed", sp_reason="the protection leg was not filled", sp_closed_date=ist_now().strftime("%Y-%m-%d"), sp_credit=0.0, sp_exit_debit=0.0)
+            append_log(m)
+            spr_log(uid, f"{m['label']}: the protection leg was {m['status']}, so nothing was opened.")
+            return
+        if m["mode"] == "live" and m["status"] != "complete":
+            if time.time() - m["sp_t_in"] > SPR_WAIT and not m.get("sp_warned"):
+                m["sp_warned"] = True
+                notify_user(uid, "Spread autopilot: protection leg not filled", f"{m['label']} is still open after {SPR_WAIT // 60} minutes, so the sale was not placed. Check your broker app.")
+            return
+        if not m.get("sp_short_id"):
+            ch = chain_for("NIFTY", m["sp_expiry"], u)
+            ltp = spr_leg_ltp(ch, m["sp_short_k"], m["sp_right"])
+            if not ltp:
+                return
+            lim = round(round(ltp * 0.99 / 0.05) * 0.05, 2)
+            order, err, _, _ = spr_order(u, {**cfg, "mode": m["mode"]}, m, "SELL", m["sp_short_k"], m["sp_right"], m["sp_expiry"], lim)
+            if err:
+                spr_log(uid, f"Sale of the {int(m['sp_short_k'])} {m['sp_right']}: {err}. The protection is being sold again.")
+                return spr_exit(u, m, "the sale could not be placed", short_leg=False)
+            rec, err = bot_place(u, order)
+            if err:
+                spr_log(uid, f"Sale of the {int(m['sp_short_k'])} {m['sp_right']}: {err}")
+                notify_user(uid, "SPREAD AUTOPILOT SALE FAILED", f"{err}\nYou hold only the protective option {m['label']}. Check your broker app.")
+                if err.startswith("UNSURE"):
+                    cfg["mode"] = "off"
+                    return
+                return spr_exit(u, m, "the sale failed", short_leg=False)
+            rec.update(sp=True, sp_role="short", sp_master=m["id"])
+            append_log(rec)
+            m["sp_short_id"] = rec["id"]
+            append_log(m)
+        sh = spr_leg_rec(m, "sp_short_id")
+        if not sh:
+            return
+        if sh["status"] in ("rejected", "cancelled", "expired", "unknown"):
+            spr_log(uid, f"The sale of the {int(m['sp_short_k'])} {m['sp_right']} was {sh['status']}. The protection is being sold again.")
+            return spr_exit(u, m, "the sale was not filled", short_leg=False)
+        if sh["status"] != "complete":
+            if time.time() - m["sp_t_in"] > 2 * SPR_WAIT and not m.get("sp_warned2"):
+                m["sp_warned2"] = True
+                notify_user(uid, "Spread autopilot: sale not filled", f"The {int(m['sp_short_k'])} {m['sp_right']} sale is still open. You hold the protective option only. Check your broker app.")
+            return
+        m["sp_credit"] = round((sh.get("avg_price") or 0) - (m.get("avg_price") or 0), 2)
+        m["sp_state"] = "open"
+        append_log(m)
+        spr_log(uid, f"{m['sp_kind']} is open: sold {int(m['sp_short_k'])} {m['sp_right']} at {sh.get('avg_price') or 0:.2f}, bought {int(m['sp_hedge_k'])} at {m.get('avg_price') or 0:.2f}, net credit {m['sp_credit']:.2f} a unit "
+                    f"({m['sp_credit'] * m['qty']:,.0f} in all), most it can lose {(m['sp_width'] - m['sp_credit']) * m['qty']:,.0f}.")
+        notify_user(uid, f"Spread autopilot: {m['sp_kind']}", f"NIFTY {int(m['sp_short_k'])} / {int(m['sp_hedge_k'])} {m['sp_right']}, credit {m['sp_credit']:.2f}, {m['mode']}.")
+    elif st == "closing":
+        spr_exit(u, m, m.get("sp_reason") or "closing", resume=True)
+
+
+def spr_exit(u, m, reason, short_leg=True, resume=False):
+    """Close a spread: buy the sold option back first, then sell the protection. A live leg that has not filled is waited for."""
+    uid = u["id"]
+    if m.get("sp_state") not in ("entering", "open", "closing"):
+        return
+    if not resume:
+        if m["mode"] == "live" and m["status"] != "complete":
+            return
+        m.update(sp_state="closing", sp_reason=reason)
+        append_log(m)
+    ch = None
+    try:
+        ch = chain_for("NIFTY", m["sp_expiry"], u)
+    except Exception:
+        pass
+    sh = spr_leg_rec(m, "sp_short_id") if m.get("sp_short_id") else None
+    if sh and short_leg and not m.get("sp_sx_id"):
+        if m["mode"] == "live" and sh["status"] != "complete":
+            return
+        ltp = spr_leg_ltp(ch, m["sp_short_k"], m["sp_right"])
+        if not ltp:
+            if not m.get("sp_warned"):
+                m["sp_warned"] = True
+                notify_user(uid, "Spread autopilot cannot price a leg", f"{m['label']}: exit wanted ({reason}) but no price is available. Close it yourself if needed.")
+            return
+        lim = round(round(ltp * 1.02 / 0.05) * 0.05, 2)
+        eo = {**sh, "side": "BUY", "order_type": "LIMIT", "price": lim, "ref": ltp, "key": None, "sl": None, "risk": None, "auto_sl": False, "trail": False}
+        for k in [k for k in eo if k.startswith("sp")] + ["avg_price", "filled", "status", "id", "time", "date", "t"]:
+            eo.pop(k, None)
+        rec, err = bot_place(u, eo, entry_rec=sh, exit_px=ltp)
+        if err:
+            notify_user(uid, f"SPREAD AUTOPILOT EXIT FAILED: {m['label']}", f"{err}\nThe sold option may still be open. Check your broker app now.")
+            spr_log(uid, f"Buy-back of the {int(m['sp_short_k'])} {m['sp_right']} failed: {err}")
+            if err.startswith("UNSURE"):
+                m["sp_state"] = "closing"
+                m["sp_sx_id"] = "UNKNOWN"
+                spr_cfg(uid)["mode"] = "off"
+            return
+        m["sp_sx_id"] = rec["id"]
+        append_log(m)
+    if sh and short_leg:
+        sx = spr_leg_rec(m, "sp_sx_id")
+        if m["mode"] == "live" and (not sx or sx["status"] != "complete"):
+            return
+    if m["mode"] == "live" and m["status"] != "complete":
+        return
+    if not m.get("sp_hx_id"):
+        hp = spr_leg_ltp(ch, m["sp_hedge_k"], m["sp_right"])
+        if not hp:
+            return
+        lim = round(round(hp * 0.98 / 0.05) * 0.05, 2)
+        eo = {**m, "side": "SELL", "order_type": "LIMIT", "price": lim, "ref": hp, "key": None, "sl": None, "risk": None, "auto_sl": False, "trail": False}
+        for k in [k for k in eo if k.startswith("sp")] + ["avg_price", "filled", "status", "id", "time", "date", "t"]:
+            eo.pop(k, None)
+        rec, err = bot_place(u, eo, entry_rec=m, exit_px=hp)
+        if err:
+            notify_user(uid, f"SPREAD AUTOPILOT EXIT FAILED: {m['label']}", f"{err}\nThe protective option may still be open. Check your broker app now.")
+            spr_log(uid, f"Sale of the protection {int(m['sp_hedge_k'])} {m['sp_right']} failed: {err}")
+            return
+        m["sp_hx_id"] = rec["id"]
+        append_log(m)
+    hx = spr_leg_rec(m, "sp_hx_id")
+    if m["mode"] == "live" and (not hx or hx["status"] != "complete"):
+        return
+    sx = spr_leg_rec(m, "sp_sx_id") if m.get("sp_sx_id") else None
+    sx_px = (sx or {}).get("avg_price") or 0.0
+    hx_px = (hx or {}).get("avg_price") or 0.0
+    m["sp_exit_debit"] = round(sx_px - hx_px, 2)
+    if m.get("sp_credit") is None:
+        sh_px = (sh or {}).get("avg_price") or 0.0
+        m["sp_credit"] = round(sh_px - (m.get("avg_price") or 0), 2)
+    m.update(sp_state="closed", sp_closed_date=ist_now().strftime("%Y-%m-%d"))
+    append_log(m)
+    pnl = spr_pnl(m)
+    spr_log(uid, f"Closed {m['sp_kind']} {int(m['sp_short_k'])}/{int(m['sp_hedge_k'])} {m['sp_right']} ({m['sp_reason']})" + (f", profit/loss {pnl:+,.0f}." if pnl is not None else "."))
+    notify_user(uid, "Spread autopilot closed a spread", f"{m['sp_reason']}" + (f", profit/loss {pnl:+,.0f}." if pnl is not None else "."))
+
+
+def spr_manage(u, m, cfg):
+    if m.get("sp_state") in ("entering", "closing"):
+        return spr_step(u, cfg, m)
+    if m.get("sp_state") != "open":
+        return
+    ch = None
+    try:
+        ch = chain_for("NIFTY", m["sp_expiry"], u)
+    except Exception:
+        pass
+    sp, hp = spr_leg_ltp(ch, m["sp_short_k"], m["sp_right"]), spr_leg_ltp(ch, m["sp_hedge_k"], m["sp_right"])
+    if sp is not None and hp is not None:
+        m["sp_now"] = round(sp - hp, 2)
+    now = ist_now()
+    row, _ = row_for("NIFTY", "5m")
+    px = live_price(row) if row else None
+    up = m["sp_dir"] == "BUY"
+    if px and ((up and px <= m["sp_sl"]) or (not up and px >= m["sp_sl"])):
+        return spr_exit(u, m, "NIFTY reached the stop")
+    credit, nowd = m.get("sp_credit"), m.get("sp_now")
+    if credit and nowd is not None and (credit - nowd) >= credit * m.get("sp_cap", cfg["capture"]) / 100:
+        return spr_exit(u, m, f"{m.get('sp_cap', cfg['capture']):g}% of the premium collected")
+    try:
+        left = (datetime.strptime(m["sp_expiry"], EXPIRY_FMT).date() - now.date()).days
+    except Exception:
+        left = None
+    if left is not None and (left < 0 or (left == 0 and now.time() >= OPTBOT_SQUAREOFF)):
+        return spr_exit(u, m, "expiry day close")
+
+
+def sprbot_once():
+    if not market_open_now():
+        return
+    today, now_t = ist_now().strftime("%Y-%m-%d"), ist_now().time()
+    spr_persist()
+    uids = {uid for uid, c in SPR.items() if c["mode"] != "off"} | {o["user"] for o in list(ORDERS) if o.get("sp") and o.get("sp_role") == "hedge" and o.get("sp_state") in ("entering", "open", "closing")}
+    for uid in uids:
+        u = user_by_id(uid)
+        if not u:
+            continue
+        cfg = spr_cfg(uid)
+        try:
+            if cfg["mode"] == "live" and cfg["armed_day"] == today and user_mode(u)[0] != "live" and not live_blocker(u):
+                MODE_PREF[uid] = "live"
+            opened = spr_positions(uid)
+            if any(o["mode"] == "live" for o in opened):
+                sync_status(u)
+            for m in opened:
+                spr_manage(u, m, cfg)
+            if cfg["mode"] == "off" or cfg.get("paused") or not (OPTBOT_FIRST_ENTRY <= now_t <= OPTBOT_LAST_ENTRY):
+                continue
+            if cfg["mode"] == "live" and (cfg["armed_day"] != today or user_mode(u)[0] != "live"):
+                if cfg.get("warned_day") != today:
+                    cfg["warned_day"] = today
+                    spr_log(uid, "Live spread autopilot is not armed today, so it takes no new trades. Open spreads are still managed. Press Play and enter your PIN.")
+                    notify_user(uid, "Spread autopilot needs your PIN", "Live trading needs your PIN each day before new trades. Open spreads are still managed.")
+                continue
+            if cfg["loss_limit"] and spr_day_pnl(uid) <= -cfg["loss_limit"]:
+                if cfg.get("loss_day") != today:
+                    cfg["loss_day"] = today
+                    spr_log(uid, f"Today's loss limit of {cfg['loss_limit']:,.0f} was reached. No new spreads today.")
+                    notify_user(uid, "Spread autopilot: loss limit", f"The daily loss limit of {cfg['loss_limit']:,.0f} was reached. No new spreads today.")
+                continue
+            if len(spr_positions(uid)) >= cfg["max_open"]:
+                continue
+            cfg["last_scan"] = now_t.strftime("%H:%M:%S")
+            why = []
+            cands = spr_candidates(u, cfg, why)
+            if why and not cands:
+                text = "No spread: " + "; ".join(why[:5])
+                if cfg.get("diag") != text:
+                    cfg["diag"] = text
+            elif cands:
+                cfg["diag"] = None
+            for c in cands:
+                if len(spr_positions(uid)) >= cfg["max_open"]:
+                    break
+                if spr_enter(u, cfg, c) == "stop":
+                    break
+        except Exception as e:
+            spr_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}")
+
+
+def spr_view(u):
+    uid, today = u["id"], ist_now().strftime("%Y-%m-%d")
+    cfg = spr_cfg(uid)
+    openp, closed = [], []
+    for m in sorted(spr_positions(uid, open_only=False), key=lambda o: o.get("sp_t_in") or 0, reverse=True):
+        base = {"kind": m.get("sp_kind"), "right": m.get("sp_right"), "short": m.get("sp_short_k"), "hedge": m.get("sp_hedge_k"), "qty": m["qty"], "mode": m["mode"], "expiry": m.get("sp_expiry"),
+                "date": m.get("date"), "credit": m.get("sp_credit")}
+        if m.get("sp_state") == "closed":
+            closed.append({**base, "pnl": spr_pnl(m), "why": m.get("sp_reason"), "closed": m.get("sp_closed_date")})
+        else:
+            cr, nw = m.get("sp_credit"), m.get("sp_now")
+            openp.append({**base, "state": m.get("sp_state"), "now": nw, "stop": m.get("sp_sl"), "pnl": round((cr - nw) * m["qty"], 2) if cr is not None and nw is not None else None,
+                          "max_loss": round((m["sp_width"] - cr) * m["qty"], 2) if cr is not None else None})
+    wins = [c for c in closed if (c["pnl"] or 0) > 0]
+    n = len([c for c in closed if c["pnl"] is not None])
+    state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
+    return {"mode": cfg["mode"], "choice": cfg["last_mode"], "state": state, "lots": cfg["lots"], "max_open": cfg["max_open"], "loss_limit": cfg["loss_limit"], "width": cfg["width"],
+            "capture": cfg["capture"], "min_dte": cfg["min_dte"], "puts": cfg["puts"], "calls": cfg["calls"], "armed": cfg["mode"] == "live" and cfg["armed_day"] == today,
+            "last_scan": cfg.get("last_scan"), "diag": cfg.get("diag"), "open": openp, "closed": closed[:40],
+            "stats": {"trades": n, "win_rate": round(len(wins) / n * 100, 1) if n else None, "pnl": round(sum(c["pnl"] or 0 for c in closed), 2), "today": round(spr_day_pnl(uid), 2)},
+            "log": [l for l in reversed(SPR_LOG) if l["uid"] == uid][:12]}
+
+
+def spr_apply(u, payload, mode):
+    """Check the settings and, for Live, the PIN. Returns an error text or None. Applies nothing until everything passes."""
+    cfg = spr_cfg(u["id"])
+    cap = u["caps"]["max_fut_lots"]
+    try:
+        lots, mo, ll = int(payload.get("lots", cfg["lots"])), int(payload.get("max_open", cfg["max_open"])), float(payload.get("loss_limit", cfg["loss_limit"]))
+        width, capture, dte = int(payload.get("width", cfg["width"])), float(payload.get("capture", cfg["capture"])), int(payload.get("min_dte", cfg["min_dte"]))
+    except (TypeError, ValueError):
+        return "Lots, open spreads, protection distance, profit target, days to expiry and the loss limit must be numbers."
+    if not (1 <= lots <= cap) or not (1 <= mo <= 10) or ll < 0:
+        return f"Use 1 to {cap} lots, 1 to 10 open spreads, and a loss limit of 0 or more."
+    if not (100 <= width <= 1500) or width % 50:
+        return "The protection distance must be between 100 and 1500 points, in steps of 50."
+    if not (10 <= capture <= 95) or not (0 <= dte <= 30):
+        return "The profit target must be 10 to 95 percent of the premium, and days to expiry 0 to 30."
+    if not u["caps"].get("allow_option_selling"):
+        return "Selling options is switched off for your account."
+    if mode == "live" and (cfg["mode"] != "live" or cfg["armed_day"] != ist_now().strftime("%Y-%m-%d")):
+        why = live_blocker(u) or (None if user_mode(u)[0] == "live" else "Switch your account to Live with the toggle at the top first.")
+        if why:
+            return why
+        err = pin_error(u, payload.get("pin"), True)
+        if err:
+            return err
+        cfg["armed_day"] = ist_now().strftime("%Y-%m-%d")
+    cfg.update(lots=lots, max_open=mo, loss_limit=ll, width=width, capture=capture, min_dte=dte, puts=bool(payload.get("puts", cfg["puts"])), calls=bool(payload.get("calls", cfg["calls"])))
     return None
 
 
@@ -8885,6 +9345,10 @@ def kill_pause_bots(uid, why):
             fc["paused"] = True
             _FK.set(fk)
             fut_log(uid, "Paused by the kill switch: " + why)
+    sc = spr_cfg(uid)
+    if sc["mode"] != "off" and not sc["paused"]:
+        sc["paused"] = True
+        spr_log(uid, "Paused by the kill switch: " + why)
     for kind in BOT_KINDS:
         cfg = bot_cfg(uid, kind)
         if cfg["mode"] != "off" and not cfg["paused"]:
@@ -8898,6 +9362,12 @@ def kill_trip(uid, reason, auto=False, exit_bots=False):
     if exit_bots:
         u = user_by_id(uid)
         if u:
+            for m in spr_positions(uid):
+                try:
+                    if m.get("sp_state") == "open":
+                        spr_exit(u, m, "kill switch")
+                except Exception as e:
+                    print("kill switch spread exit:", e, flush=True)
             for kind in BOT_KINDS:
                 for pos in bot_positions(uid, kind=kind):
                     try:
@@ -10097,6 +10567,53 @@ def api_futbot_set(request: Request, payload: dict = Body(...)):
         return {"error": "Unknown action."}
     fut_persist()
     return {"ok": True, **fut_view(u)}
+
+
+@app.get("/api/sprbot")
+def api_sprbot(request: Request):
+    return spr_view(request.state.user)
+
+
+@app.post("/api/sprbot")
+def api_sprbot_set(request: Request, payload: dict = Body(...)):
+    """save, play (Paper or Live), pause, stop (no new spreads; open ones are still managed) and close_all (close every open spread now)."""
+    u = request.state.user
+    cfg = spr_cfg(u["id"])
+    action = str(payload.get("action", ""))
+    if action == "play":
+        mode = str(payload.get("mode") or cfg["mode"])
+        if mode not in ("paper", "live"):
+            return {"error": "Choose Paper or Live, then press Play."}
+        if cfg["mode"] != "off" and mode != cfg["mode"]:
+            return {"error": f"The spread autopilot is running in {cfg['mode'].title()} mode. Press Stop before changing mode."}
+        err = spr_apply(u, payload, mode)
+        if err:
+            return {"error": err}
+        cfg.update(mode=mode, paused=False, last_mode=mode)
+        spr_log(u["id"], f"Play: spread autopilot running in {mode.upper()} mode, {cfg['lots']} lot(s), protection {cfg['width']} points away, up to {cfg['max_open']} open.")
+    elif action == "pause":
+        if cfg["mode"] == "off":
+            return {"error": "The spread autopilot is not running."}
+        cfg["paused"] = True
+        spr_log(u["id"], "Paused: no new spreads. Open spreads are still managed.")
+    elif action == "stop":
+        cfg.update(mode="off", paused=False)
+        spr_log(u["id"], "Stopped: no new spreads. Open spreads are still managed until they are closed.")
+    elif action == "close_all":
+        for m in spr_positions(u["id"]):
+            if m.get("sp_state") == "open":
+                spr_exit(u, m, "closed by you")
+        left = len([m for m in spr_positions(u["id"]) if m.get("sp_state") in ("entering", "open", "closing")])
+        spr_persist()
+        return {"ok": True, "left": left, **spr_view(u)}
+    elif action == "save":
+        err = spr_apply(u, payload, cfg["mode"])
+        if err:
+            return {"error": err}
+    else:
+        return {"error": "Unknown action."}
+    spr_persist()
+    return {"ok": True, **spr_view(u)}
 
 
 @app.get("/api/optbot")
@@ -11996,7 +12513,7 @@ function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
    <td>${esc(r.sector||"–")}</td>${sc}<td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
 let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: F&O stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY"},sbot:{kind:"sensex",title:"Autopilot 3: SENSEX"}};
-const AP_TABS=[["botBox","F&O stocks"],["nbotBox","NIFTY"],["sbotBox","SENSEX"],["fsBox","Futures swing"],["isBox","Intraday"]];
+const AP_TABS=[["botBox","F&O stocks"],["nbotBox","NIFTY"],["sbotBox","SENSEX"],["fsBox","Futures swing"],["isBox","Intraday"],["spBox","NIFTY spreads"]];
 function apTab(id){if(!AP_TABS.some(t=>t[0]===id))id=AP_TABS[0][0];AP_TABS.forEach(([b])=>{const e=$(b);if(e)e.hidden=b!==id});document.querySelectorAll("#apTabs [data-aptab]").forEach(x=>{const on=x.dataset.aptab===id;x.classList.toggle("go",on);x.setAttribute("aria-selected",on)});try{localStorage.setItem("apTab",id)}catch(e){}}
 window.sigSort={};
 const SIG_RANK={taken:1,open:2,passed:4,earlier:5};
@@ -12067,6 +12584,54 @@ function fsInit(){FS_BOTS.forEach(([p,k])=>{$("botHost").insertAdjacentHTML("bef
  if(k!=="swing"){$(p+"Rp").onclick=()=>{const tf=$(p+"Tf").value;document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="intraday";$("btTf").value=tf;$("btStrategy").onchange();$("btDays").value=+$(p+"RpDays").value;$("btLev").value=+$(p+"Lev").value;window.btExtra={funds:+$(p+"Funds").value,max_open:+$(p+"Max").value,sell_ok:$(p+"Sells").checked};btRun()};return}
  $(p+"Rp").onclick=()=>{const tf=$(p+"Tf").value==="15m"?"15m":"1d",d=tf==="15m"?58:+$(p+"RpDays").value;document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="swing";$("btTf").value=tf;$("btStrategy").onchange();$("btDays").value=d;btRun()}
  $(p+"Bt").onclick=()=>{document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="swing";$("btTf").value=$(p+"Tf").value==="15m"?"15m":"1d";$("btStrategy").onchange()}})}
+function spHtml(){return `<div class="card botbox" id="spBox">
+ <div class="ixrow"><b>Autopilot 6: NIFTY option spreads</b><span class="sub" id="spState"></span></div>
+ <div class="sub">On a NIFTY signal it sells the at-the-money option on the signal's side (a put on a buy signal, a call on a sell signal) and buys a protective option the distance below you choose further out. It earns the premium as time passes and when NIFTY moves your way, and the most it can lose is fixed. Spreads are held from day to day and closed at the profit target, at the stop, or on expiry day.</div>
+ <div class="botrow">
+  <label>Mode<select id="spMode"><option value="paper">Paper</option><option value="live">Live</option></select></label>
+  <label>Lots each<input id="spLots" type="number" min="1" step="1"></label>
+  <label>Protection distance (points)<input id="spWidth" type="number" min="100" max="1500" step="50"></label>
+  <label>Profit target (% of premium)<input id="spCap" type="number" min="10" max="95" step="5"></label>
+  <label>Open spreads at most<input id="spMax" type="number" min="1" max="10" step="1"></label>
+  <label>Min days to expiry<input id="spDte" type="number" min="0" max="30" step="1"></label>
+  <label>Stop for the day at a loss of ₹<input id="spLoss" type="number" min="0" step="1000"></label>
+  <label class="chk"><input type="checkbox" id="spPuts"> Sell puts on buy signals</label>
+  <label class="chk"><input type="checkbox" id="spCalls"> Sell calls on sell signals</label>
+  <button class="btn" id="spSave">Save settings</button>
+ </div>
+ <div class="botctl">
+  <button class="btn go" id="spPlay">▶ Play</button>
+  <button class="btn" id="spPause">⏸ Pause</button>
+  <button class="btn" id="spStop" title="No new spreads. Open spreads are still managed">■ Stop</button>
+  <button class="btn stop" id="spCloseAll">Close all spreads</button>
+  <span class="botpill" id="spPill"></span>
+ </div>
+ <div class="tkmsg" id="spMsg" role="status"></div>
+ <div class="ixrow"><b>Open spreads</b></div>
+ <div class="wrap"><table id="spOpen"></table></div>
+ <div class="ixrow"><b>Closed spreads</b><span class="sub" id="spStats"></span></div>
+ <div class="wrap"><table id="spClosed"></table></div>
+ <div class="sub" id="spLog"></div>
+</div>`}
+async function spLoad(){try{const d=await (await api("/api/sprbot")).json();window.spD=d;
+ const ae=document.activeElement&&document.activeElement.id;
+ if(!["Mode","Lots","Width","Cap","Max","Dte","Loss","Puts","Calls"].map(x=>"sp"+x).includes(ae)){$("spMode").value=d.mode==="off"?d.choice:d.mode;$("spLots").value=d.lots;$("spWidth").value=d.width;$("spCap").value=d.capture;$("spMax").value=d.max_open;$("spDte").value=d.min_dte;$("spLoss").value=d.loss_limit;$("spPuts").checked=d.puts;$("spCalls").checked=d.calls}
+ const s=d.stats,inr=v=>v==null?"–":`${v>=0?"+":"-"}₹${Math.abs(v).toLocaleString("en-IN",{maximumFractionDigits:0})}`;
+ $("spState").textContent=(d.mode==="off"?"":d.mode==="live"?"LIVE, real money":"Paper, simulated")+(d.last_scan&&d.mode!=="off"?` · last check ${d.last_scan}`:"")+` · today ${inr(s.today)}`;
+ const pill=$("spPill");pill.className="botpill "+d.state+(d.mode==="live"?" live":"");pill.textContent=d.state==="running"?"Running":d.state==="paused"?"Paused":"Stopped";
+ $("spPlay").disabled=d.state==="running";$("spPause").disabled=d.state!=="running";$("spStop").disabled=d.state==="stopped";$("spMode").disabled=d.state!=="stopped";$("spCloseAll").disabled=!d.open.length;
+ const f2=v=>v==null?"–":(+v).toFixed(2),pc=v=>v==null?"–":`<span class="${v>0?"up":v<0?"dn":""}">${inr(v)}</span>`;
+ const stl={entering:"Opening",open:"Open",closing:"Closing"};
+ $("spOpen").innerHTML=d.open.length?`<thead><tr><th>Spread</th><th>Sold / bought</th><th>Expiry</th><th>Qty</th><th>Credit</th><th>Now</th><th>P&amp;L</th><th>Most it can lose</th><th>NIFTY stop</th><th>Status</th><th>Mode</th></tr></thead><tbody>`+d.open.map(t=>`<tr><td><b>${esc(t.kind||"")}</b></td><td>${t.short} / ${t.hedge} ${esc(t.right||"")}</td><td>${esc(t.expiry||"")}</td><td>${t.qty}</td><td>${f2(t.credit)}</td><td>${f2(t.now)}</td><td>${pc(t.pnl)}</td><td>${t.max_loss==null?"–":"₹"+Math.round(t.max_loss).toLocaleString("en-IN")}</td><td>${f2(t.stop)}</td><td>${stl[t.state]||esc(t.state||"")}</td><td>${t.mode==="live"?"Live":"Paper"}</td></tr>`).join("")+"</tbody>":'<tbody><tr><td class="sub">No open spreads.</td></tr></tbody>';
+ $("spClosed").innerHTML=d.closed.length?`<thead><tr><th>Closed</th><th>Spread</th><th>Sold / bought</th><th>Credit</th><th>P&amp;L</th><th>Reason</th></tr></thead><tbody>`+d.closed.map(t=>`<tr><td>${esc(t.closed||"")}</td><td>${esc(t.kind||"")}</td><td>${t.short} / ${t.hedge} ${esc(t.right||"")}</td><td>${f2(t.credit)}</td><td>${pc(t.pnl)}</td><td>${esc(t.why||"")}</td></tr>`).join("")+"</tbody>":"";
+ $("spStats").textContent=s.trades?`${s.trades} closed · ${s.win_rate}% winners · total ${inr(s.pnl)}`:"No closed spreads yet.";
+ $("spLog").innerHTML=(d.diag&&d.mode!=="off"?`<i>${esc(d.diag)}</i><br>`:"")+d.log.slice(0,6).map(l=>`${esc(l.t)} ${esc(l.text)}`).join("<br>")}catch(e){}}
+async function spCtl(action){const D=window.spD||{};const body={action,mode:$("spMode").value,lots:+$("spLots").value,width:+$("spWidth").value,capture:+$("spCap").value,max_open:+$("spMax").value,min_dte:+$("spDte").value,loss_limit:+$("spLoss").value,puts:$("spPuts").checked,calls:$("spCalls").checked};
+ if(action==="play"&&body.mode==="live"&&!(D.mode==="live"&&D.armed)){const pin=prompt("Order PIN, to arm this live autopilot for today");if(pin===null)return;body.pin=pin}
+ if(action==="close_all"&&!confirm(`Close ${D.open?D.open.length:0} open spread(s) now?`))return;
+ if(action==="stop"&&D.open&&D.open.length&&!confirm("Stop the spread autopilot? Open spreads are still managed and closed at the target, the stop or on expiry day, but no new spreads are opened."))return;
+ const d=await post("/api/sprbot",body);$("spMsg").textContent=d.error||({play:"Running.",pause:"Paused. No new spreads; open spreads are still managed.",stop:"Stopped. No new spreads; open spreads are still managed.",save:"Saved.",close_all:d.left?`${d.left} spread(s) could not be closed. Check your broker app.`:"All spreads closed."})[action]||"";spLoad()}
+function spInit(){$("botHost").insertAdjacentHTML("beforeend",spHtml());$("spSave").onclick=()=>spCtl("save");$("spPlay").onclick=()=>spCtl("play");$("spPause").onclick=()=>spCtl("pause");$("spStop").onclick=()=>spCtl("stop");$("spCloseAll").onclick=()=>spCtl("close_all")}
 function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="ixrow"><b>${t}</b><span class="sub" id="${p}State"></span></div>
  <div class="sub" id="${p}Rules" hidden></div>
@@ -12107,7 +12672,7 @@ async function botLoad(){clearTimeout(botTimer);if(mode!=="autopilot")return;
   sigPaint(p);
   $(p+"Sig").parentElement.hidden=false;
   $(p+"Log").innerHTML=d.log.slice(0,6).map(l=>`${l.t} ${esc(l.text)}`).join("<br>")}catch(e){}}
- FS_BOTS.forEach(([p,k])=>fsLoad(p,k));botTimer=setTimeout(botLoad,8000)}
+ FS_BOTS.forEach(([p,k])=>fsLoad(p,k));spLoad();botTimer=setTimeout(botLoad,8000)}
 async function botCtl(p,action,extra){const D=window.botD[p]||{};const body={action,bot:BOTS[p].kind,mode:$(p+"Mode").value,entries:$(p+"Ent").value,min_grade:$(p+"Grade").value,max_trades:+$(p+"Max").value,lots:+$(p+"Lots").value,loss_limit:+$(p+"Loss").value,...extra};
  if(action==="play"&&body.mode==="live"&&!(D.mode==="live"&&D.armed)){const pin=prompt("Order PIN, to arm this live autopilot for today");if(pin===null)return;body.pin=pin}
  if(action==="stop"&&!confirm(D.open?`Stop this autopilot and sell ${D.open} open position(s) now?`:"Stop this autopilot?"))return;
@@ -12176,7 +12741,7 @@ async function atmOption(sy,right,tf,m,what){m.textContent=`Loading the ${sy} op
  }catch(e){m.textContent="Could not load the option chain."}}
 async function apOption(b,p,what){b.disabled=true;try{await atmOption(b.dataset.s,b.dataset.r,b.dataset.tf,$(p+"Msg"),what)}finally{b.disabled=false}}
 function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
- for(const p in BOTS){rpDays(p);for(const k of ["RCap","RFee"])$(p+k).onchange=()=>{const l=window.rpLast&&window.rpLast[p];if(l)rpShow(p,l)};$(p+"RRun").onclick=()=>rpRun(p);$(p+"Past").onchange=()=>botLoad();$(p+"SecF").onchange=()=>sigPaint(p);$(p+"Old").onchange=()=>botLoad();$(p+"Sig").onclick=e=>{const h=e.target.closest("th[data-sk]");if(h){const k=h.dataset.sk,o=window.sigSort[p];window.sigSort[p]=o&&o.k===k?(o.d===1?{k,d:-1}:null):{k,d:1};sigPaint(p);return}const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}fsInit();
+ for(const p in BOTS){rpDays(p);for(const k of ["RCap","RFee"])$(p+k).onchange=()=>{const l=window.rpLast&&window.rpLast[p];if(l)rpShow(p,l)};$(p+"RRun").onclick=()=>rpRun(p);$(p+"Past").onchange=()=>botLoad();$(p+"SecF").onchange=()=>sigPaint(p);$(p+"Old").onchange=()=>botLoad();$(p+"Sig").onclick=e=>{const h=e.target.closest("th[data-sk]");if(h){const k=h.dataset.sk,o=window.sigSort[p];window.sigSort[p]=o&&o.k===k?(o.d===1?{k,d:-1}:null):{k,d:1};sigPaint(p);return}const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}fsInit();spInit();
  $("apTabs").innerHTML=AP_TABS.map(([b,t])=>`<button class="btn" role="tab" data-aptab="${b}">${t}</button>`).join("");$("apTabs").onclick=e=>{const x=e.target.closest("[data-aptab]");if(x)apTab(x.dataset.aptab)};let sv=null;try{sv=localStorage.getItem("apTab")}catch(e){}apTab(sv)}
 function confBadge(r){const c=r&&r.conf;if(!c)return "";return `<span class="cg cg${c.g}" title="Grade ${c.g}, score ${c.s} of 100">${c.g}<small> ${c.s}</small></span>`}
 let btTimer=null;
