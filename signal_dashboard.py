@@ -2034,7 +2034,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22i"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-22j"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -4931,6 +4931,43 @@ def _futbot_kind(kind, today, now_t):
             fut_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}")
 
 
+FUT_MANUAL_AGE = {"1d": 3, "15m": 6, "5m": 6}
+
+
+def fut_signals(u, cfg):
+    """Signals still alive on this autopilot's timeframe, with levels and a suggested size, for placing by hand. The intraday list is limited to the stocks the autopilot would trade."""
+    tf, intra = cfg.get("tf", "1d"), cfg.get("kind") == "intraday"
+    today = ist_now().strftime("%Y-%m-%d")
+    movers = {}
+    if intra:
+        movers, _ = id_movers()
+    held = {o["symbol"] for o in fut_positions(u["id"], open_only=True)}
+    out = []
+    for r in fut_rows(not intra, tf):
+        sym, side = r["symbol"], r.get("side")
+        if side not in ("BUY", "SELL") or r.get("sl_hit") or not (r.get("entry") and r.get("sl") and r.get("signal_date")) or r.get("bars_ago") is None:
+            continue
+        if r["bars_ago"] > FUT_MANUAL_AGE[tf] or (tf != "1d" and r["signal_date"] != today) or (r.get("hits") or 0) >= 4:
+            continue
+        if intra and (movers.get(sym) or {}).get("side") != side:
+            continue
+        px = float(live_price(r))
+        risk, sgn = abs(r["entry"] - r["sl"]), (1 if side == "BUY" else -1)
+        moved = (px - r["entry"]) * sgn
+        if intra:
+            size = int(min(cfg["funds"] * cfg["leverage"] / px, u["caps"]["max_qty"], u["caps"]["max_order_value"] / px)) if px else 0
+            size_txt = f"{size} shares" if size else "–"
+        else:
+            lot = bt_lot_for(sym)
+            size_txt = f"{lot} per lot" if lot else "–"
+        status = "Taken by the autopilot" if sym in held else ("T%d hit" % r["hits"] if r.get("hits") else "Open")
+        out.append({"symbol": sym, "sector": r.get("sector") or sector_of(sym), "side": side, "date": r["signal_date"], "time": r.get("signal_time") or "", "ago": r["bars_ago"], "entry": r["entry"], "sl": r["sl"],
+                    "t": [r.get("tp1"), r.get("tp2"), r.get("tp3"), r.get("tp4")], "price": round(px, 2), "chg": r.get("ltp_chg", r.get("chg")), "size": size_txt, "tf": tf,
+                    "fresh": bool(r["bars_ago"] <= FUT_MAX_AGE[tf] and not r.get("hits") and 0 > moved - risk and moved > -0.8 * risk), "status": status})
+    out.sort(key=lambda x: (x["ago"], x["symbol"]))
+    return out[:60]
+
+
 def fut_view(u):
     uid, today = u["id"], ist_now().strftime("%Y-%m-%d")
     cfg = fut_cfg(uid)
@@ -4954,7 +4991,7 @@ def fut_view(u):
     return {"mode": cfg["mode"], "choice": cfg["last_mode"], "state": state, "lots": cfg["lots"], "max_open": cfg["max_open"], "loss_limit": cfg["loss_limit"], "sells": cfg["sells"], "tf": cfg.get("tf", "1d"), "funds": cfg.get("funds"), "leverage": cfg.get("leverage"),
             "indices": cfg["indices"], "armed": cfg["mode"] == "live" and cfg["armed_day"] == today, "last_scan": cfg.get("last_scan"), "open": openp, "closed": closed[:40],
             "stats": {"trades": n, "win_rate": round(len(wins) / n * 100, 1) if n else None, "pnl": round(sum(c["pnl"] or 0 for c in closed), 2), "today": round(fut_day_pnl(uid), 2)},
-            "kind": cfg.get("kind", "swing"), "diag": cfg.get("diag"),
+            "kind": cfg.get("kind", "swing"), "diag": cfg.get("diag"), "signals": fut_signals(u, cfg),
             "log": [l for l in reversed(FUT_LOG) if l["uid"] == uid and l.get("bot", "swing") == cfg.get("kind", "swing")][:12]}
 
 
@@ -5408,6 +5445,38 @@ def sprbot_once():
             spr_log(uid, f"Error: {type(e).__name__}: {str(e)[:100]}")
 
 
+def spr_signal(u, cfg):
+    """The latest NIFTY 15 minute swing signal with the spread it would open at today's prices, for placing by hand."""
+    r = spr_row15()
+    if not r or r.get("side") not in ("BUY", "SELL") or not (r.get("entry") and r.get("sl")):
+        return None
+    side = r["side"]
+    right = "PE" if side == "BUY" else "CE"
+    px = float(live_price(r))
+    risk, sgn = abs(r["entry"] - r["sl"]), (1 if side == "BUY" else -1)
+    moved = (px - r["entry"]) * sgn
+    today = ist_now().strftime("%Y-%m-%d")
+    alive = not r.get("sl_hit") and (r.get("hits") or 0) < 4
+    fresh = bool(alive and r.get("signal") in ("BUY", "SELL") and r["bars_ago"] is not None and r["bars_ago"] <= FUT_MAX_AGE["15m"] and r["signal_date"] == today and not r.get("hits") and moved < risk and moved > -0.8 * risk)
+    out = {"side": side, "right": right, "date": r.get("signal_date"), "time": r.get("signal_time") or "", "entry": r["entry"], "sl": r["sl"], "price": round(px, 2), "alive": alive, "fresh": fresh,
+           "status": "Open" if alive and not r.get("hits") else ("T%d hit" % r["hits"] if alive else "Stop hit")}
+    try:
+        ch = spr_chain(u, cfg)
+        if ch:
+            strikes = sorted(x["strike"] for x in ch["rows"])
+            atm = min(strikes, key=lambda k: abs(k - px))
+            hk = atm - cfg["width"] if right == "PE" else atm + cfg["width"]
+            sp_, hp_ = spr_leg_ltp(ch, atm, right), spr_leg_ltp(ch, hk, right)
+            if sp_ and hp_ and hk in strikes:
+                lot = bt_lot_for("NIFTY") or 75
+                cr = round(sp_ - hp_, 2)
+                out.update(expiry=ch["expiry"], sell_k=atm, buy_k=hk, sell_px=sp_, buy_px=hp_, credit=cr, lot=lot, max_loss=round((cfg["width"] - cr) * lot, 2), target=round(cr * (1 - cfg["capture"] / 100), 2),
+                           thin=bool(cr < cfg["width"] * SPR_MIN_CREDIT_PCT / 100))
+    except Exception:
+        pass
+    return out
+
+
 def spr_view(u):
     uid, today = u["id"], ist_now().strftime("%Y-%m-%d")
     cfg = spr_cfg(uid)
@@ -5426,7 +5495,7 @@ def spr_view(u):
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
     return {"mode": cfg["mode"], "choice": cfg["last_mode"], "state": state, "lots": cfg["lots"], "max_open": cfg["max_open"], "loss_limit": cfg["loss_limit"], "width": cfg["width"],
             "capture": cfg["capture"], "min_dte": cfg["min_dte"], "puts": cfg["puts"], "calls": cfg["calls"], "armed": cfg["mode"] == "live" and cfg["armed_day"] == today,
-            "last_scan": cfg.get("last_scan"), "diag": cfg.get("diag"), "open": openp, "closed": closed[:40],
+            "last_scan": cfg.get("last_scan"), "diag": cfg.get("diag"), "open": openp, "closed": closed[:40], "signal": spr_signal(u, cfg),
             "stats": {"trades": n, "win_rate": round(len(wins) / n * 100, 1) if n else None, "pnl": round(sum(c["pnl"] or 0 for c in closed), 2), "today": round(spr_day_pnl(uid), 2)},
             "log": [l for l in reversed(SPR_LOG) if l["uid"] == uid][:12]}
 
@@ -12733,6 +12802,8 @@ function fsHtml(p,k){return `<div class="card botbox" id="${p}Box">
  </div>
  <div class="tkmsg" id="${p}Msg" role="status"></div>
  ${k==="swing"?`<div class="ixrow"><b>Replay past days</b><select id="${p}RpDays" aria-label="Period to replay"><option value="90">Last 3 months</option><option value="180">Last 6 months</option><option value="365">Last 1 year</option><option value="1095">Last 3 years</option></select><button class="btn" id="${p}Rp">Replay</button><span class="sub">Runs the futures strategy on past candles with your funds and shows each trade. 15 min covers about 2 months.</span></div>`:`<div class="ixrow"><b>Replay past days</b><select id="${p}RpDays" aria-label="Period to replay"><option value="10">Last 10 days</option><option value="20">Last 20 days</option><option value="30" selected>Last 30 days</option><option value="58">Last 2 months</option></select><button class="btn" id="${p}Rp">Replay</button><span class="sub">Runs this autopilot on past 5 or 15 minute candles with your funds per trade and leverage, and shows each trade. Yahoo or Dhan history limits it to about 2 months.</span></div>`}
+ <div class="ixrow"><b>Signals for manual trades</b><span class="sub" id="${p}SigN"></span></div>
+ <div class="wrap"><table id="${p}Sig"></table></div>
  <div class="ixrow"><b>Open positions</b></div>
  <div class="wrap"><table id="${p}Open"></table></div>
  <div class="ixrow"><b>Closed positions</b><span class="sub" id="${p}Stats"></span></div>
@@ -12751,6 +12822,8 @@ async function fsLoad(p,k){try{const d=await (await api("/api/futbot?bot="+k)).j
  $(p+"Closed").innerHTML=d.closed.length?`<thead><tr><th>Closed</th><th>${k==="swing"?"Futures":"Stock"}</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Reason</th></tr></thead><tbody>`+d.closed.map(t=>`<tr><td>${esc(t.closed||"")}</td><td>${esc(t.label)}</td><td class="${t.side==="BUY"?"up":"dn"}">${t.side}</td><td>${f2(t.entry)}</td><td>${f2(t.exit)}</td><td>${pc(t.pnl)}</td><td>${esc(t.why||"")}</td></tr>`).join("")+"</tbody>":"";
  $(p+"Stats").textContent=s.trades?`${s.trades} closed · ${s.win_rate}% winners · total ${s.pnl>=0?"+":"-"}₹${Math.abs(s.pnl).toLocaleString("en-IN")}`:"No closed positions yet.";
  if(!d.open.length)$(p+"Open").innerHTML='<tbody><tr><td class="sub">No open positions.</td></tr></tbody>';
+ {const sg=d.signals||[],hm=t=>t==null?"–":(+t).toFixed(2);$(p+"SigN").textContent=sg.length?`${sg.length} alive on ${d.tf==="1d"?"the daily":d.tf.slice(0,-1)+" minute"} chart${k==="intraday"?" (gainers and losers of the leading and lagging sectors)":""}. Green = still worth taking.`:"";
+ $(p+"Sig").innerHTML=sg.length?`<thead><tr><th>${k==="swing"?"Futures":"Stock"}</th><th>Sector</th><th>Side</th><th>Signal</th><th>Entry</th><th>Stop</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Price</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>`+sg.map(x=>`<tr class="${x.fresh?"":"past"}"><td><b>${esc(x.symbol)}</b></td><td class="sub">${esc(x.sector||"")}</td><td class="${x.side==="BUY"?"up":"dn"}">${x.side}</td><td>${esc(x.date.slice(5))} ${esc(x.time)}</td><td>${hm(x.entry)}</td><td>${hm(x.sl)}</td>${x.t.map(v=>`<td>${hm(v)}</td>`).join("")}<td>${hm(x.price)}</td><td>${esc(x.size)}</td><td>${x.fresh?'<span class="up">Take</span>':esc(x.status)}${x.status==="Taken by the autopilot"?" · autopilot":""}</td><td class="act"><button class="mini" data-fchart="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button></td></tr>`).join("")+"</tbody>":'<tbody><tr><td class="sub">No live signals right now.</td></tr></tbody>'}
  $(p+"Log").innerHTML=(d.diag&&d.mode!=="off"?`<i>No new trades: ${esc(d.diag)}</i><br>`:"")+d.log.slice(0,6).map(l=>`${esc(l.t)} ${esc(l.text)}`).join("<br>")}catch(e){}}
 async function fsCtl(p,k,action){const D=(window.fsD||{})[p]||{};const body={action,bot:k,mode:$(p+"Mode").value,tf:$(p+"Tf").value,...(k==="swing"?{lots:+$(p+"Lots").value,indices:$(p+"Idx").checked}:{funds:+$(p+"Funds").value,leverage:+$(p+"Lev").value}),max_open:+$(p+"Max").value,loss_limit:+$(p+"Loss").value,sells:$(p+"Sells").checked};
  if(action==="play"&&body.mode==="live"&&!(D.mode==="live"&&D.armed)){const pin=prompt("Order PIN, to arm this live autopilot for today");if(pin===null)return;body.pin=pin}
@@ -12758,7 +12831,7 @@ async function fsCtl(p,k,action){const D=(window.fsD||{})[p]||{};const body={act
  if(action==="stop"&&D.open&&D.open.length&&!confirm((k==="swing"?"Stop the swing autopilot? Open positions stay open with their stop-loss, but it will no longer close them on a signal.":"Stop the intraday autopilot? Open positions keep their stop-loss and are still closed at the end of the day, but it will no longer close them on a signal.")))return;
  const d=await post("/api/futbot",body);$(p+"Msg").textContent=d.error||({play:"Running.",pause:"Paused. No new trades; open positions are still managed.",stop:"Stopped. Open positions keep their stop-loss.",save:"Saved.",close_all:d.left?`${d.left} position(s) could not be closed. Check your broker app.`:"All positions closed."})[action]||"";fsLoad(p,k)}
 function fsInit(){FS_BOTS.forEach(([p,k])=>{$("botHost").insertAdjacentHTML("beforeend",fsHtml(p,k));
- $(p+"Save").onclick=()=>fsCtl(p,k,"save");$(p+"Play").onclick=()=>fsCtl(p,k,"play");$(p+"Pause").onclick=()=>fsCtl(p,k,"pause");$(p+"Stop").onclick=()=>fsCtl(p,k,"stop");$(p+"CloseAll").onclick=()=>fsCtl(p,k,"close_all");
+ $(p+"Sig").onclick=e=>{const b=e.target.closest("[data-fchart]");if(b)openChart(b.dataset.fchart,b.dataset.tf)};$(p+"Save").onclick=()=>fsCtl(p,k,"save");$(p+"Play").onclick=()=>fsCtl(p,k,"play");$(p+"Pause").onclick=()=>fsCtl(p,k,"pause");$(p+"Stop").onclick=()=>fsCtl(p,k,"stop");$(p+"CloseAll").onclick=()=>fsCtl(p,k,"close_all");
  if(k!=="swing"){$(p+"Rp").onclick=()=>{const tf=$(p+"Tf").value;document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="intraday";$("btTf").value=tf;$("btStrategy").onchange();$("btDays").value=+$(p+"RpDays").value;$("btLev").value=+$(p+"Lev").value;window.btExtra={funds:+$(p+"Funds").value,max_open:+$(p+"Max").value,sell_ok:$(p+"Sells").checked};btRun()};return}
  $(p+"Rp").onclick=()=>{const tf=$(p+"Tf").value==="15m"?"15m":"1d",d=tf==="15m"?58:+$(p+"RpDays").value;document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="swing";$("btTf").value=tf;$("btStrategy").onchange();$("btDays").value=d;btRun()}
  $(p+"Bt").onclick=()=>{document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="swing";$("btTf").value=$(p+"Tf").value==="15m"?"15m":"1d";$("btStrategy").onchange()}})}
@@ -12786,6 +12859,8 @@ function spHtml(){return `<div class="card botbox" id="spBox">
  </div>
  <div class="tkmsg" id="spMsg" role="status"></div>
  <div class="ixrow"><b>Replay past days</b><select id="spRpDays" aria-label="Period to replay"><option value="10">Last 10 days</option><option value="20">Last 20 days</option><option value="30" selected>Last 30 days</option></select><button class="btn" id="spRp">Replay</button><span class="sub">Runs this autopilot on past NIFTY 5 minute candles with the settings above and shows each spread. Past option prices are not available, so they are modelled (set the volatility on the Backtest tab; the default is 15%).</span></div>
+ <div class="ixrow"><b>Signal for a manual spread</b><span class="sub" id="spSigN"></span></div>
+ <div class="wrap"><table id="spSig"></table></div>
  <div class="ixrow"><b>Open spreads</b></div>
  <div class="wrap"><table id="spOpen"></table></div>
  <div class="ixrow"><b>Closed spreads</b><span class="sub" id="spStats"></span></div>
@@ -12804,6 +12879,8 @@ async function spLoad(){try{const d=await (await api("/api/sprbot")).json();wind
  $("spOpen").innerHTML=d.open.length?`<thead><tr><th>Spread</th><th>Sold / bought</th><th>Expiry</th><th>Qty</th><th>Credit</th><th>Now</th><th>P&amp;L</th><th>Most it can lose</th><th>NIFTY stop</th><th>Status</th><th>Mode</th></tr></thead><tbody>`+d.open.map(t=>`<tr><td><b>${esc(t.kind||"")}</b></td><td>${t.short} / ${t.hedge} ${esc(t.right||"")}</td><td>${esc(t.expiry||"")}</td><td>${t.qty}</td><td>${f2(t.credit)}</td><td>${f2(t.now)}</td><td>${pc(t.pnl)}</td><td>${t.max_loss==null?"–":"₹"+Math.round(t.max_loss).toLocaleString("en-IN")}</td><td>${f2(t.stop)}</td><td>${stl[t.state]||esc(t.state||"")}</td><td>${t.mode==="live"?"Live":"Paper"}</td></tr>`).join("")+"</tbody>":'<tbody><tr><td class="sub">No open spreads.</td></tr></tbody>';
  $("spClosed").innerHTML=d.closed.length?`<thead><tr><th>Closed</th><th>Spread</th><th>Sold / bought</th><th>Credit</th><th>P&amp;L</th><th>Reason</th></tr></thead><tbody>`+d.closed.map(t=>`<tr><td>${esc(t.closed||"")}</td><td>${esc(t.kind||"")}</td><td>${t.short} / ${t.hedge} ${esc(t.right||"")}</td><td>${f2(t.credit)}</td><td>${pc(t.pnl)}</td><td>${esc(t.why||"")}</td></tr>`).join("")+"</tbody>":"";
  $("spStats").textContent=s.trades?`${s.trades} closed · ${s.win_rate}% winners · total ${inr(s.pnl)}`:"No closed spreads yet.";
+ {const g=d.signal,hm=t=>t==null?"–":(+t).toFixed(2);$("spSigN").textContent=g?(g.fresh?"Fresh: the autopilot would take it now.":g.alive?"Older, but still alive.":"The stop was hit."):"";
+ $("spSig").innerHTML=g?`<thead><tr><th>NIFTY 15 min signal</th><th>Signal</th><th>Entry</th><th>Stop</th><th>NIFTY now</th><th>Sell</th><th>Buy (protection)</th><th>Expiry</th><th>Credit</th><th>Lot</th><th>Most it can lose</th><th>Take profit when it costs</th></tr></thead><tbody><tr class="${g.fresh?"":"past"}"><td class="${g.side==="BUY"?"up":"dn"}"><b>${g.side}</b> → sell ${g.right==="PE"?"puts":"calls"}</td><td>${esc((g.date||"").slice(5))} ${esc(g.time)}</td><td>${hm(g.entry)}</td><td>${hm(g.sl)}</td><td>${hm(g.price)}</td>${g.sell_k?`<td>${g.sell_k} ${g.right} @ ${hm(g.sell_px)}</td><td>${g.buy_k} ${g.right} @ ${hm(g.buy_px)}</td><td>${esc(g.expiry)}</td><td>${hm(g.credit)}${g.thin?' <span class="sub">(thin)</span>':""}</td><td>${g.lot}</td><td>₹${Math.round(g.max_loss).toLocaleString("en-IN")}</td><td>${hm(g.target)}</td>`:'<td colspan="7" class="sub">Option prices are not available right now.</td>'}</tr></tbody>`:'<tbody><tr><td class="sub">No NIFTY 15 minute signal yet.</td></tr></tbody>'}
  $("spLog").innerHTML=(d.diag&&d.mode!=="off"?`<i>${esc(d.diag)}</i><br>`:"")+d.log.slice(0,6).map(l=>`${esc(l.t)} ${esc(l.text)}`).join("<br>")}catch(e){}}
 async function spCtl(action){const D=window.spD||{};const body={action,mode:$("spMode").value,lots:+$("spLots").value,width:+$("spWidth").value,capture:+$("spCap").value,max_open:+$("spMax").value,min_dte:+$("spDte").value,loss_limit:+$("spLoss").value,puts:$("spPuts").checked,calls:$("spCalls").checked};
  if(action==="play"&&body.mode==="live"&&!(D.mode==="live"&&D.armed)){const pin=prompt("Order PIN, to arm this live autopilot for today");if(pin===null)return;body.pin=pin}
