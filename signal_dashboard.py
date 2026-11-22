@@ -2034,7 +2034,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22j"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-22k"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2140,6 +2140,7 @@ ALERT_DDL = [
     "CREATE TABLE IF NOT EXISTS alerts(user_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, telegram_chat TEXT, ntfy_topic TEXT, "
     "tfs TEXT NOT NULL DEFAULT '15m', sides TEXT NOT NULL DEFAULT 'BUY,SELL', sectors TEXT NOT NULL DEFAULT '', updated TEXT)",
     "CREATE TABLE IF NOT EXISTS alert_seen(k TEXT PRIMARY KEY, ts TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS alert_ap(user_id INTEGER PRIMARY KEY, trades TEXT, manual TEXT)",
     "CREATE TABLE IF NOT EXISTS manual_sig(k TEXT PRIMARY KEY, day TEXT NOT NULL, data TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS watchlist(user_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(user_id, symbol))",
     "CREATE TABLE IF NOT EXISTS kill(scope TEXT PRIMARY KEY, day TEXT NOT NULL, reason TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, ts TEXT NOT NULL)",
@@ -3413,6 +3414,10 @@ def autopilot_loop():
         except Exception as e:
             AUTO["error"] = f"spread {type(e).__name__}: {str(e)[:100]}"
         try:
+            alert_manual_tick()
+        except Exception as e:
+            AUTO["error"] = f"alerts {type(e).__name__}: {str(e)[:100]}"
+        try:
             if time.time() - AUTO.get("purged", 0) > 3600:
                 AUTO["purged"] = time.time()
                 x("DELETE FROM sessions WHERE expires<?", (time.time(),))
@@ -4111,7 +4116,8 @@ def bot_buy(u, cfg, c, mode, strategy="scanner", skip_expiry_day=False, etype="f
     append_log(rec)
     bot_log(u["id"], f"{'LIVE' if mode == 'live' else 'Paper'} BUY {rec['label']} at about {limit:.2f}: {c['symbol']} {c['px']:.2f}. "
                      f"{c['symbol']} stop {lv['sl']:.2f}, T1 {lv['tp1']:.2f}, T2 {lv['tp2']:.2f}, T3 {lv['tp3']:.2f}, T4 {lv['tp4']:.2f}.", bot=strategy)
-    notify_user(u["id"], f"Autopilot bought {rec['label']}", f"{mode} order at about {limit:.2f}. {c['symbol']} stop {lv['sl']:.2f}, final target {lv['tp4']:.2f}.")
+    ap_notify(u["id"], bot_kind(strategy), "entry", f"{ALERT_BOT_NAME.get(bot_kind(strategy), 'Options')} bought {rec['label']}",
+              f"{'LIVE' if mode == 'live' else 'Paper'} order for {rec['qty']} at about {limit:.2f} ({c.get('tf', '5m')} signal {c.get('time') or ''}).\n{c['symbol']} {c['px']:.2f}   Stop {lv['sl']:.2f}\nT1 {lv['tp1']:.2f}   T2 {lv['tp2']:.2f}   T3 {lv['tp3']:.2f}   T4 {lv['tp4']:.2f}")
     return "done"
 
 
@@ -4414,7 +4420,8 @@ def bot_exit(u, pos, reason):
     append_log(pos)
     pnl = bot_pnl(pos)
     bot_log(u["id"], f"Sold {pos['label']} at about {limit:.2f} ({reason})" + (f", profit/loss {pnl:+.0f}." if pnl is not None else "."), bot=bot_kind(pos.get("bot_strategy")))
-    notify_user(u["id"], f"Autopilot sold {pos['label']}", f"{reason}. Sold at about {limit:.2f}.")
+    ap_notify(u["id"], bot_kind(pos.get("bot_strategy")), "exit", f"{ALERT_BOT_NAME.get(bot_kind(pos.get('bot_strategy')), 'Options')} sold {pos['label']}",
+              f"{reason}.\nSold at about {limit:.2f}" + (f", profit/loss {pnl:+,.0f}." if pnl is not None else "."))
 
 
 def bot_manage(u, pos):
@@ -4782,7 +4789,9 @@ def fut_enter(u, cfg, r, roll=None):
         roll["fbot_rolled"] = True
         append_log(roll)
     fut_log(uid, f"{'LIVE' if mode == 'live' else 'Paper'} {side} {rec['label']}, {f'{qty} shares' if intra else str(cfg['lots']) + ' lot(s)'}" + (" (rolled into the next month)." if roll else f", {tf[:-1] + '-minute' if tf != '1d' else 'daily'} signal of {r['signal_date']}" + (f" {r['signal_time']}." if tf != "1d" and r.get("signal_time") else ".")))
-    notify_user(uid, f"{fname()}: {side} {sym}{'' if intra else ' futures'}", f"{rec['label']}, {f'{qty} shares' if intra else str(cfg['lots']) + ' lot(s)'}, {'live' if mode == 'live' else 'paper'}. A stop-loss is placed once it fills.")
+    ap_notify(uid, cfg.get("kind", "swing"), "entry", f"{ALERT_BOT_NAME[cfg.get('kind', 'swing')]}: {side} {sym}{'' if intra else ' futures'}",
+              f"{rec['label']}, {f'{qty} shares' if intra else str(cfg['lots']) + ' lot(s)'}, {'LIVE' if mode == 'live' else 'Paper'} ({'daily' if tf == '1d' else tf[:-1] + ' minute'} signal {r['signal_date']} {r.get('signal_time') or ''}).\n"
+              f"Signal entry {r['entry']:.2f}   Stop {r['sl']:.2f}   Price now {float(live_price(r)):.2f}\nA stop-loss is placed once it fills.")
     return "done"
 
 
@@ -4793,7 +4802,8 @@ def fut_done(u, pos, px, reason, exit_rec=None, roll=False):
     append_log(pos)
     pnl = fut_pnl(pos)
     fut_log(u["id"], f"Closed {pos['label']} at about {px:.2f} ({reason})" + (f", profit/loss {pnl:+,.0f}." if pnl is not None else "."))
-    notify_user(u["id"], f"{fname()} closed {pos['symbol']}", f"{reason}. About {px:.2f}" + (f", profit/loss {pnl:+,.0f}." if pnl is not None else "."))
+    ap_notify(u["id"], pos.get("fbot_kind") or _FK.get(), "exit", f"{ALERT_BOT_NAME.get(pos.get('fbot_kind') or _FK.get(), fname())} closed {pos['symbol']}",
+              f"{reason}.\nAbout {px:.2f}" + (f", profit/loss {pnl:+,.0f}." if pnl is not None else "."))
 
 
 def fut_exit(u, pos, reason, roll=False):
@@ -5276,7 +5286,9 @@ def spr_step(u, cfg, m):
         append_log(m)
         spr_log(uid, f"{m['sp_kind']} is open: sold {int(m['sp_short_k'])} {m['sp_right']} at {sh.get('avg_price') or 0:.2f}, bought {int(m['sp_hedge_k'])} at {m.get('avg_price') or 0:.2f}, net credit {m['sp_credit']:.2f} a unit "
                     f"({m['sp_credit'] * m['qty']:,.0f} in all), most it can lose {(m['sp_width'] - m['sp_credit']) * m['qty']:,.0f}.")
-        notify_user(uid, f"Spread autopilot: {m['sp_kind']}", f"NIFTY {int(m['sp_short_k'])} / {int(m['sp_hedge_k'])} {m['sp_right']}, credit {m['sp_credit']:.2f}, {m['mode']}.")
+        ap_notify(uid, "spread", "entry", f"NIFTY spreads: opened a {m['sp_kind'].lower()}",
+                  f"{'LIVE' if m['mode'] == 'live' else 'Paper'}: sold {int(m['sp_short_k'])} {m['sp_right']}, bought {int(m['sp_hedge_k'])} {m['sp_right']}, expiry {m['sp_expiry']}, {m['qty']} qty.\n"
+                  f"Credit {m['sp_credit']:.2f} a unit, most it can lose {(m['sp_width'] - m['sp_credit']) * m['qty']:,.0f}.\nNIFTY {m.get('sp_under') or 0:.0f}   Stop {m.get('sp_sl') or 0:.0f}")
     elif st == "closing":
         spr_exit(u, m, m.get("sp_reason") or "closing", resume=True)
 
@@ -5356,7 +5368,8 @@ def spr_exit(u, m, reason, short_leg=True, resume=False):
     append_log(m)
     pnl = spr_pnl(m)
     spr_log(uid, f"Closed {m['sp_kind']} {int(m['sp_short_k'])}/{int(m['sp_hedge_k'])} {m['sp_right']} ({m['sp_reason']})" + (f", profit/loss {pnl:+,.0f}." if pnl is not None else "."))
-    notify_user(uid, "Spread autopilot closed a spread", f"{m['sp_reason']}" + (f", profit/loss {pnl:+,.0f}." if pnl is not None else "."))
+    ap_notify(uid, "spread", "exit", f"NIFTY spreads: closed {int(m['sp_short_k'])}/{int(m['sp_hedge_k'])} {m['sp_right']}",
+              f"{m['sp_reason']}." + (f"\nProfit/loss {pnl:+,.0f}." if pnl is not None else ""))
 
 
 def spr_manage(u, m, cfg):
@@ -6680,12 +6693,37 @@ def send_ntfy(topic, title, text, tag):
         return False, f"ntfy could not be reached: {type(e).__name__}"
 
 
-def deliver(uid, title, text, tag, force=False):
-    """Send one message to every channel the person set up. Returns {channel: result text}."""
+ALERT_BOTS = [("scanner", "F&O stock options"), ("nifty", "NIFTY options"), ("sensex", "SENSEX options"), ("swing", "Futures swing"), ("intraday", "Intraday stocks"), ("spread", "NIFTY spreads")]
+ALERT_BOT_IDS = [b for b, _ in ALERT_BOTS]
+ALERT_BOT_NAME = dict(ALERT_BOTS)
+ALERT_LOG = {}              # user id -> the last 40 messages: shown in the dashboard even when no channel is linked
+
+
+def ap_prefs(uid):
+    """Which autopilots tell this person about the trades they take, and which about signals for manual trades. No saved choice: all trades, no manual signals."""
+    rows = q("SELECT trades, manual FROM alert_ap WHERE user_id=?", (uid,))
+    if not rows:
+        return {"trades": list(ALERT_BOT_IDS), "manual": []}
+    pick = lambda v: [b for b in str(v or "").split(",") if b in ALERT_BOT_IDS]
+    return {"trades": pick(rows[0]["trades"]), "manual": pick(rows[0]["manual"])}
+
+
+def ap_save(uid, trades=None, manual=None):
+    cur = ap_prefs(uid)
+    tr = cur["trades"] if trades is None else [b for b in ALERT_BOT_IDS if b in trades]
+    mn = cur["manual"] if manual is None else [b for b in ALERT_BOT_IDS if b in manual]
+    x("INSERT INTO alert_ap(user_id, trades, manual) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET trades=excluded.trades, manual=excluded.manual", (uid, ",".join(tr), ",".join(mn)))
+
+
+def deliver(uid, title, text, tag, force=False, kind=""):
+    """Send one message to every channel the person set up and keep it in the recent list. Returns {channel: result text}."""
     now = time.time()
     sent = [t for t in ALERT_STATE["sent"].get(uid, []) if now - t < 3600]
     ALERT_STATE["sent"][uid] = sent
+    stamp = ist_now().strftime("%d %b %H:%M")
+    log = ALERT_LOG.setdefault(uid, collections.deque(maxlen=40))
     if len(sent) >= ALERT_HOURLY_CAP and not force:
+        log.appendleft({"t": stamp, "kind": kind, "title": title, "text": text, "res": "not sent: hourly limit reached"})
         return {"limit": "hourly limit reached"}
     pr = alert_row(uid)
     out = {}
@@ -6696,7 +6734,9 @@ def deliver(uid, title, text, tag, force=False):
     if out:
         sent.append(now)
         bad = [v for v in out.values() if v != "sent"]
-        ALERT_STATE["last"][uid] = (ist_now().strftime("%d %b %H:%M") + (" sent" if not bad else " problem: " + "; ".join(bad)))
+        ALERT_STATE["last"][uid] = (stamp + (" sent" if not bad else " problem: " + "; ".join(bad)))
+    log.appendleft({"t": stamp, "kind": kind, "title": title, "text": text,
+                    "res": ("sent" if all(v == "sent" for v in out.values()) else "problem: " + "; ".join(v for v in out.values() if v != "sent")) if out else "shown here only: no Telegram or ntfy set up"})
     return out
 
 
@@ -6710,8 +6750,22 @@ def alert_worker():
 
 
 def notify_user(uid, title, text):
-    """Important messages (a stop-loss that was not placed) bypass the hourly limit."""
-    item = (uid, title, text, "warning", True)
+    """Important messages (a stop-loss that was not placed, an order that failed) bypass the hourly limit and the choices below."""
+    item = (uid, title, text, "warning", True, "problem")
+    if ALERT_SYNC:
+        deliver(*item)
+    else:
+        ALERT_Q.put(item)
+
+
+def ap_notify(uid, bot, kind, title, text):
+    """A trade an autopilot took or closed (kind "entry" or "exit"). Sent when the person kept that autopilot ticked under Trades it takes."""
+    try:
+        if bot not in ap_prefs(uid)["trades"]:
+            return
+    except Exception:
+        return
+    item = (uid, title, text, "green_circle" if kind == "entry" else "checkered_flag", True, kind)
     if ALERT_SYNC:
         deliver(*item)
     else:
@@ -6720,9 +6774,9 @@ def notify_user(uid, title, text):
 
 def queue_alert(uid, title, text, tag):
     if ALERT_SYNC:
-        deliver(uid, title, text, tag)
+        deliver(uid, title, text, tag, kind="market")
     else:
-        ALERT_Q.put((uid, title, text, tag))
+        ALERT_Q.put((uid, title, text, tag, False, "market"))
 
 
 def _n(v):
@@ -6775,6 +6829,88 @@ def check_alerts(interval, rows):
     return count
 
 
+ALERT_MANUAL = {"last": 0.0}
+ALERT_MANUAL_EVERY = 30      # seconds between looks at the signal lists for manual trades
+ALERT_MANUAL_DIGEST = 4      # more new signals than this from one autopilot at once go out as one summary
+
+
+def _lv(v):
+    return "–" if v is None else f"{float(v):,.2f}"
+
+
+def manual_items(u, bot):
+    """[(key, title, text)] of the signals for manual trades that are fresh and not already taken by this autopilot."""
+    uid, nm = u["id"], ALERT_BOT_NAME[bot]
+    out = []
+    if bot in BOT_KINDS:
+        for r in manual_signals(u, bot):
+            if r.get("status") != "open" or r.get("taken"):
+                continue
+            key = f"{r['tf']}|{r['symbol']}|{r.get('time') or ''}|{r['side']}"
+            out.append((key, f"{nm}: {r['side']} {r['symbol']}",
+                        f"Buy an at-the-money {r['right']} option on {r['symbol']} ({TF_NAMES.get(r['tf'], r['tf'])} signal {r.get('time') or ''}).\n"
+                        f"{r['symbol']} {_lv(r['px'])}   Stop {_lv(r['sl'])}\nT1 {_lv(r['t1'])}   T2 {_lv(r['t2'])}   T3 {_lv(r['t3'])}   T4 {_lv(r['t4'])}"
+                        + (f"\n{r['sector']}" if r.get("sector") else "")))
+    elif bot in FUTK:
+        tok = _FK.set(bot)
+        try:
+            cfg = fut_cfg(uid, bot)
+            sigs = fut_signals(u, cfg)
+        finally:
+            _FK.reset(tok)
+        for g in sigs:
+            if not g["fresh"] or g["status"] != "Open":
+                continue
+            key = f"{g['tf']}|{g['symbol']}|{g['date']}|{g['time']}|{g['side']}"
+            out.append((key, f"{nm}: {g['side']} {g['symbol']}",
+                        f"{g['side']} {g['symbol']}{' futures' if bot == 'swing' else ''} ({'daily' if g['tf'] == '1d' else g['tf'][:-1] + ' minute'} signal {g['date']} {g['time']}).\n"
+                        f"Entry {_lv(g['entry'])}   Stop {_lv(g['sl'])}   Price now {_lv(g['price'])}\nT1 {_lv(g['t'][0])}   T2 {_lv(g['t'][1])}   T3 {_lv(g['t'][2])}   T4 {_lv(g['t'][3])}\nSize: {g['size']}"))
+    elif bot == "spread":
+        g = spr_signal(u, spr_cfg(uid))
+        if g and g["fresh"]:
+            key = f"{g['date']}|{g['time']}|{g['side']}"
+            legs = (f"Sell {int(g['sell_k'])} {g['right']} at {_lv(g['sell_px'])}, buy {int(g['buy_k'])} {g['right']} at {_lv(g['buy_px'])}, expiry {g['expiry']}.\n"
+                    f"Credit {_lv(g['credit'])} a unit (lot {g['lot']}), most it can lose {g['max_loss']:,.0f}. Buy it back at {_lv(g['target'])} to take the profit target.") if g.get("sell_k") else "Option prices are not available right now."
+            out.append((key, f"{nm}: sell {'puts' if g['right'] == 'PE' else 'calls'}",
+                        f"NIFTY 15 minute {g['side']} signal {g['date']} {g['time']}.\nNIFTY {_lv(g['price'])}   Stop {_lv(g['sl'])}\n{legs}"))
+    return out
+
+
+def alert_manual_tick():
+    """Tells people about new signals for manual trades from the autopilots they ticked, each only once."""
+    if time.time() - ALERT_MANUAL["last"] < ALERT_MANUAL_EVERY or not market_open_now():
+        return 0
+    ALERT_MANUAL["last"] = time.time()
+    sent = 0
+    for row in q("SELECT a.user_id, a.manual FROM alert_ap a JOIN users u ON u.id = a.user_id WHERE u.active=1 AND a.manual IS NOT NULL AND a.manual <> ''"):
+        uid = row["user_id"]
+        u = user_by_id(uid)
+        if not u:
+            continue
+        for bot in [b for b in str(row["manual"]).split(",") if b in ALERT_BOT_IDS]:
+            try:
+                items = manual_items(u, bot)
+            except Exception as e:
+                print("manual alerts:", bot, type(e).__name__, e, flush=True)
+                continue
+            new = []
+            for key, title, text in items:
+                k = f"mn|{uid}|{bot}|{key}"
+                if not q("SELECT 1 FROM alert_seen WHERE k=?", (k,)):
+                    x("INSERT INTO alert_seen(k, ts) VALUES(?,?) ON CONFLICT(k) DO NOTHING", (k, ist_now().isoformat()))
+                    new.append((title, text))
+            if len(new) > ALERT_MANUAL_DIGEST:
+                item = (uid, f"{ALERT_BOT_NAME[bot]}: {len(new)} new signals", "\n".join(t for t, _ in new[:25]), "chart_with_upwards_trend", True, "manual")
+                deliver(*item) if ALERT_SYNC else ALERT_Q.put(item)
+                sent += 1
+            else:
+                for title, text in new:
+                    item = (uid, title, text + "\nReview it on the dashboard before placing any order.", "bell", True, "manual")
+                    deliver(*item) if ALERT_SYNC else ALERT_Q.put(item)
+                    sent += 1
+    return sent
+
+
 def handle_tg_update(upd):
     msg = upd.get("message") or {}
     chat = msg.get("chat") or {}
@@ -6790,9 +6926,9 @@ def handle_tg_update(upd):
             x("UPDATE alerts SET telegram_chat=? WHERE user_id=?", (str(chat["id"]), ent[0]))
             reply = "Linked. New signal alerts will arrive in this chat. You can change what you receive in the dashboard under Account."
         else:
-            reply = "That link code is wrong or has expired. Create a new one in the dashboard under Account, Signal alerts."
+            reply = "That link code is wrong or has expired. Create a new one in the dashboard under Account, Alerts."
     elif text.startswith("/start"):
-        reply = "Open the dashboard, go to Account, Signal alerts, and press Link Telegram. It gives you a link that connects this chat."
+        reply = "Open the dashboard, go to Account, Alerts, and press Link Telegram. It gives you a link that connects this chat."
     if reply:
         send_telegram(chat["id"], reply)
 
@@ -7159,8 +7295,11 @@ def api_alerts(request: Request):
     u = request.state.user
     pr = alert_row(u["id"])
     chat = pr.pop("telegram_chat")
+    ap = ap_prefs(u["id"])
     return {**pr, "telegram_linked": bool(chat), "telegram_configured": bool(TELEGRAM_BOT_TOKEN), "bot": TG["name"],
-            "ntfy_server": NTFY_SERVER, "sector_names": sector_names(), "tf_names": TF_NAMES, "last": ALERT_STATE["last"].get(u["id"])}
+            "ntfy_server": NTFY_SERVER, "sector_names": sector_names(), "tf_names": TF_NAMES, "last": ALERT_STATE["last"].get(u["id"]),
+            "bots": [{"id": b, "name": n, "trades": b in ap["trades"], "manual": b in ap["manual"]} for b, n in ALERT_BOTS],
+            "recent": list(ALERT_LOG.get(u["id"], []))[:30]}
 
 
 @app.put("/api/alerts")
@@ -7175,12 +7314,14 @@ def api_alerts_save(request: Request, payload: dict = Body(...)):
         return {"error": "The ntfy topic must be 6 to 64 letters, digits, dashes or underscores."}
     enabled = bool(payload.get("enabled"))
     if enabled and not tfs:
-        return {"error": "Pick at least one timeframe."}
+        return {"error": "Pick at least one timeframe for the market signals, or untick Send me market signals."}
     if enabled and not sides:
-        return {"error": "Pick BUY, SELL or both."}
+        return {"error": "Pick BUY, SELL or both for the market signals."}
     ensure_alert_row(u["id"])
     x("UPDATE alerts SET enabled=?, ntfy_topic=?, tfs=?, sides=?, sectors=?, updated=? WHERE user_id=?",
       (int(enabled), topic or None, ",".join(tfs), ",".join(sides), ",".join(sectors), ist_now().isoformat(), u["id"]))
+    if "ap_trades" in payload or "ap_manual" in payload:
+        ap_save(u["id"], payload.get("ap_trades") if isinstance(payload.get("ap_trades"), list) else None, payload.get("ap_manual") if isinstance(payload.get("ap_manual"), list) else None)
     return {"ok": True}
 
 
@@ -7217,7 +7358,7 @@ def api_alert_test(request: Request):
     if time.time() - ALERT_STATE["test"].get(u["id"], 0) < 10:
         return {"error": "Wait a few seconds before sending another test."}
     ALERT_STATE["test"][u["id"]] = time.time()
-    out = deliver(u["id"], "Test alert", "If you can read this, signal alerts will reach you here.", "white_check_mark", force=True)
+    out = deliver(u["id"], "Test alert", "If you can read this, alerts will reach you here.", "white_check_mark", force=True, kind="test")
     if not out:
         return {"error": "Nothing is set up yet. Link Telegram or enter an ntfy topic, save, then test again."}
     return {"ok": all(v == "sent" for v in out.values()), "results": out}
@@ -11828,7 +11969,7 @@ td.act{white-space:nowrap}
 #ordTable{min-width:760px}#ordTable th,#ordTable td{text-align:left}
 .tag{font-size:11px;color:var(--mute);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-left:6px;font-weight:400}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:14px}
-.card h3{margin:0 0 8px;font-size:17px}.card h4{margin:0 0 8px;font-size:15px}
+.card h3{margin:0 0 8px;font-size:17px}.card h4{margin:0 0 8px;font-size:15px}.card h4.alh{margin:18px 0 6px}
 .card label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute);margin-bottom:8px}
 .card input,.card select{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 9px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -12178,14 +12319,9 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
   <div class="sub" style="margin-bottom:8px" id="recInfo"></div>
   <label>Your account password<input id="recPw" type="password" autocomplete="current-password"></label>
   <div class="tkbtns"><span class="sub" id="recMsg"></span><button class="btn" id="recBtn">Create a new recovery key</button></div></div>
- <div class="card" id="alertCard"><h3>Signal alerts</h3>
-  <div class="sub" style="margin-bottom:10px">Get a message on your phone when a new BUY or SELL signal appears, so you do not have to watch the screen. Messages say what the indicator saw. They are not advice, so review each one before trading.</div>
-  <label class="chk"><input type="checkbox" id="alOn"> Send me alerts</label>
-  <div class="grid2">
-   <div><b class="sub">Timeframes</b><div id="alTf" class="chks"></div>
-    <b class="sub">Signals</b><div id="alSide" class="chks"><label class="chk"><input type="checkbox" value="BUY"> Buy</label><label class="chk"><input type="checkbox" value="SELL"> Sell</label></div></div>
-   <div><b class="sub">Sectors <span style="font-weight:400">(none ticked means all)</span></b><div id="alSec" class="chks sec"></div></div>
-  </div>
+ <div class="card" id="alertCard"><h3>Alerts</h3>
+  <div class="sub" style="margin-bottom:10px">Get a message on your phone for what your autopilots do and for signals you may want to trade by hand, so you do not have to watch the screen. Messages report what happened or what a signal shows. They are not advice, so review each one before trading. Problems (an order that failed, a missing stop-loss, a PIN needed) are always sent.</div>
+  <h4 class="alh">Where to send them</h4>
   <div class="grid2">
    <div class="bcard"><h4>Telegram <span class="tag" id="alTgTag"></span></h4>
     <div class="sub" id="alTgInfo"></div>
@@ -12195,7 +12331,19 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
     <label>Topic<input id="alNtfy" autocomplete="off" placeholder="e.g. amit-signals-7f3k9x"></label>
     <div class="tkbtns"><button class="mini" id="alRand">Make a random topic</button></div></div>
   </div>
-  <div class="tkbtns"><span class="sub" id="alMsg"></span><button class="btn ghost" id="alTest">Send a test</button><button class="btn" id="alSave">Save alerts</button></div></div>
+  <h4 class="alh">Autopilot alerts</h4>
+  <div class="sub">Trades it takes: a message when the autopilot opens or closes a trade, with the result. Signals for manual trades: a message when a new signal that fits that autopilot's rules appears, whether or not the autopilot is running. A signal the autopilot already took is not repeated.</div>
+  <div class="wrap"><table id="alAp"></table></div>
+  <h4 class="alh">Market signals</h4>
+  <label class="chk"><input type="checkbox" id="alOn"> Send me an alert for every new BUY or SELL signal in the market</label>
+  <div class="grid2">
+   <div><b class="sub">Timeframes</b><div id="alTf" class="chks"></div>
+    <b class="sub">Signals</b><div id="alSide" class="chks"><label class="chk"><input type="checkbox" value="BUY"> Buy</label><label class="chk"><input type="checkbox" value="SELL"> Sell</label></div></div>
+   <div><b class="sub">Sectors <span style="font-weight:400">(none ticked means all)</span></b><div id="alSec" class="chks sec"></div></div>
+  </div>
+  <div class="tkbtns"><span class="sub" id="alMsg"></span><button class="btn ghost" id="alTest">Send a test</button><button class="btn" id="alSave">Save alerts</button></div>
+  <h4 class="alh">Recent alerts <span class="sub" style="font-weight:400">since the server last started</span></h4>
+  <div class="wrap"><table id="alRecent"></table></div></div>
  <div class="card"><h3>Broker accounts</h3>
   <div class="note" style="margin:0 0 6px">Your broker details are stored encrypted on this server and are never shown again. Brokers accept API orders only from a static IP registered to your own client account, so register this server's IP with your broker. Sharing one IP between different clients is restricted: check your broker's rules.</div>
   <div id="brokerCards"></div></div>
@@ -13558,13 +13706,17 @@ async function loadAlerts(){const d=await (await api("/api/alerts")).json();if(d
  $("alTf").innerHTML=Object.entries(d.tf_names).map(([k,v])=>`<label class="chk"><input type="checkbox" value="${k}" ${d.tfs.includes(k)?"checked":""}> ${esc(v)}</label>`).join("");
  document.querySelectorAll("#alSide input").forEach(i=>i.checked=d.sides.includes(i.value));
  $("alSec").innerHTML=d.sector_names.map(n=>`<label class="chk"><input type="checkbox" value="${esc(n)}" ${d.sectors.includes(n)?"checked":""}> ${esc(n)}</label>`).join("");
+ if(!document.querySelector("#alAp input:focus"))$("alAp").innerHTML=`<thead><tr><th>Autopilot</th><th>Trades it takes</th><th>Signals for manual trades</th></tr></thead><tbody>`+d.bots.map(b=>`<tr><td><b>${esc(b.name)}</b></td><td style="text-align:center"><input type="checkbox" data-bot="${b.id}" data-k="trades" ${b.trades?"checked":""} aria-label="Trades ${esc(b.name)} takes"></td><td style="text-align:center"><input type="checkbox" data-bot="${b.id}" data-k="manual" ${b.manual?"checked":""} aria-label="Signals for manual trades, ${esc(b.name)}"></td></tr>`).join("")+"</tbody>";
+ const kn={entry:"Trade opened",exit:"Trade closed",manual:"Manual signal",problem:"Problem",market:"Market signal",test:"Test"};
+ $("alRecent").innerHTML=d.recent.length?`<thead><tr><th>Time</th><th>Type</th><th>Message</th><th>Delivery</th></tr></thead><tbody>`+d.recent.map(r=>`<tr><td>${esc(r.t)}</td><td class="sub">${esc(kn[r.kind]||r.kind||"")}</td><td style="text-align:left"><b>${esc(r.title)}</b><div class="sub" style="white-space:pre-line">${esc(r.text)}</div></td><td class="sub">${esc(r.res)}</td></tr>`).join("")+"</tbody>":'<tbody><tr><td class="sub">Nothing sent yet.</td></tr></tbody>';
  if(document.activeElement!==$("alNtfy"))$("alNtfy").value=d.ntfy_topic||"";
  $("alTgTag").textContent=!d.telegram_configured?"Not set up on this server":d.telegram_linked?"Linked":"Not linked";
  $("alTgInfo").textContent=d.telegram_configured?(d.telegram_linked?"Alerts go to your Telegram chat.":"Press Link Telegram, open the link it gives you and press Start in Telegram."):"The admin has not set TELEGRAM_BOT_TOKEN, so only ntfy works for now.";
  $("alTgLink").hidden=!d.telegram_configured||d.telegram_linked;$("alTgUnlink").hidden=!d.telegram_linked;
  if(d.last)$("alMsg").textContent="Last alert: "+d.last;
  if(d.telegram_linked&&alTimer){clearInterval(alTimer);alTimer=null}}
-const alBody=()=>({enabled:$("alOn").checked,tfs:[...document.querySelectorAll("#alTf input:checked")].map(i=>i.value),sides:[...document.querySelectorAll("#alSide input:checked")].map(i=>i.value),sectors:[...document.querySelectorAll("#alSec input:checked")].map(i=>i.value),ntfy_topic:$("alNtfy").value.trim()});
+const alBody=()=>({enabled:$("alOn").checked,tfs:[...document.querySelectorAll("#alTf input:checked")].map(i=>i.value),sides:[...document.querySelectorAll("#alSide input:checked")].map(i=>i.value),sectors:[...document.querySelectorAll("#alSec input:checked")].map(i=>i.value),ntfy_topic:$("alNtfy").value.trim(),
+ ap_trades:[...document.querySelectorAll('#alAp input[data-k="trades"]:checked')].map(i=>i.dataset.bot),ap_manual:[...document.querySelectorAll('#alAp input[data-k="manual"]:checked')].map(i=>i.dataset.bot)});
 $("alSave").onclick=async()=>{const d=await send("PUT","/api/alerts",alBody());$("alMsg").textContent=d.error||"Saved.";loadAlerts()};
 $("alTest").onclick=async()=>{const s=await send("PUT","/api/alerts",alBody());if(s.error){$("alMsg").textContent=s.error;return}
  const d=await send("POST","/api/alerts/test",{});$("alMsg").textContent=d.error||Object.entries(d.results).map(([k,v])=>k+": "+v).join(" · ")};
