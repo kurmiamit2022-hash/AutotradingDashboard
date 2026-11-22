@@ -2034,7 +2034,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22h"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-22i"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -5102,26 +5102,37 @@ def spr_order(u, cfg, m_or_none, side, strike, right, expiry, price):
     return make_order(p, u, force=cfg["mode"])
 
 
+def spr_row15():
+    """NIFTY's row on the 15 minute swing signals."""
+    return next((r for r in fut_rows(True, "15m") if r["symbol"] == "NIFTY"), None)
+
+
 def spr_candidates(u, cfg, why):
-    rows = auto_rows("nifty", "5m")
-    r5 = next(iter(rows or []), None)
-    if not r5:
-        why.append("no NIFTY price yet")
+    """The NIFTY swing signal on the 15 minute chart, while it is fresh and has not run away from its stop."""
+    r = spr_row15()
+    if not r:
+        why.append("no NIFTY 15 minute signal data yet")
         return []
     today = ist_now().strftime("%Y-%m-%d")
-    notes = []
-    cands = nc_live_candidates(u, "spread", float(r5.get("ltp") or r5["close"]), today, lambda label, text: notes.append(f"{label}: {text}"), False, False, "NIFTY")
-    why.extend(notes)
-    done = {m.get("sp_sigkey") for m in spr_positions(u["id"], open_only=False)}
-    day_key = lambda c: f"{today} {c['sigkey']}"
-    out = []
-    for c in cands:
-        if day_key(c) in done:
-            continue
-        if (c["side"] == "BUY" and not cfg["puts"]) or (c["side"] == "SELL" and not cfg["calls"]):
-            continue
-        out.append(c)
-    return out
+    side = r.get("side")
+    if r.get("signal") not in ("BUY", "SELL") or side not in ("BUY", "SELL") or r.get("sl_hit") or not (r.get("entry") and r.get("sl") and r.get("signal_date")):
+        why.append("no fresh NIFTY 15 minute signal")
+        return []
+    if r["bars_ago"] is None or r["bars_ago"] > FUT_MAX_AGE["15m"] or r.get("hits") or r["signal_date"] != today:
+        why.append("the latest NIFTY 15 minute signal is not fresh")
+        return []
+    px, risk, sgn = float(live_price(r)), abs(r["entry"] - r["sl"]), (1 if side == "BUY" else -1)
+    moved = (px - r["entry"]) * sgn
+    if not risk or moved >= risk or moved <= -0.8 * risk:
+        why.append("NIFTY has already moved too far from the signal")
+        return []
+    if (side == "BUY" and not cfg["puts"]) or (side == "SELL" and not cfg["calls"]):
+        why.append(f"{'puts' if side == 'BUY' else 'calls'} are switched off")
+        return []
+    skey = f"NIFTY|{r['signal_date']}|{r.get('signal_time') or ''}|{side}"
+    if f"{today} {skey}" in {m.get("sp_sigkey") for m in spr_positions(u["id"], open_only=False)}:
+        return []
+    return [{"symbol": "NIFTY", "side": side, "px": px, "levels": {"sl": float(r["sl"]), "tp1": float(r.get("tp1") or 0)}, "tf": "15m", "key": skey, "sigkey": skey, "time": r.get("signal_time")}]
 
 
 def spr_enter(u, cfg, c):
@@ -5330,6 +5341,9 @@ def spr_manage(u, m, cfg):
     up = m["sp_dir"] == "BUY"
     if px and ((up and px <= m["sp_sl"]) or (not up and px >= m["sp_sl"])):
         return spr_exit(u, m, "NIFTY reached the stop")
+    r15 = spr_row15()
+    if r15 and r15.get("side") in ("BUY", "SELL") and r15["side"] != m["sp_dir"] and m.get("sp_sigkey") and f"{r15['signal_date']}|{r15.get('signal_time') or ''}" not in m["sp_sigkey"]:
+        return spr_exit(u, m, "the 15 minute signal turned")
     credit, nowd = m.get("sp_credit"), m.get("sp_now")
     if credit and nowd is not None and (credit - nowd) >= credit * m.get("sp_cap", cfg["capture"]) / 100:
         return spr_exit(u, m, f"{m.get('sp_cap', cfg['capture']):g}% of the premium collected")
@@ -6109,20 +6123,33 @@ def bt_spread_run(span, data, p):
     """The NIFTY spread autopilot over past days on NIFTY 5 minute candles. Past option prices are not available, so every leg is priced with Black-Scholes
     at the implied volatility you enter, the right expiry and the time left; the spot, the signals, the stops and the dates are real. Returns (result, error)."""
     N = (data.get("NIFTY") or {}).get("5m")
-    if not N or N.get("nc_df") is None:
-        return None, "NIFTY 5 minute candles were not loaded."
+    F = (data.get("NIFTY") or {}).get("15m")
+    if not N or not F or F.get("df") is None:
+        return None, "NIFTY 5 and 15 minute candles were not loaded."
     first, last, sq = OPTBOT_FIRST_ENTRY.strftime("%H:%M"), OPTBOT_LAST_ENTRY.strftime("%H:%M"), OPTBOT_SQUAREOFF.strftime("%H:%M")
     width, cap, dte, lots = int(p["width"]), float(p["capture"]), int(p["min_dte"]), int(p["lots"])
     vol = p["iv"] / 100.0
     qty = lots * (bt_lot_for("NIFTY") or 75)
-    entries, skipped = {}, {}
-    for day in span:
-        sets, _, d = nc_signals(N["nc_df"], day, N.get("nc_vw"), last)
-        where = {int(t): i for i, t in enumerate(N["ts"])}
-        for s_ in sets:
-            k5 = where.get(int(d.index[s_["j"]].timestamp())) if s_["j"] is not None else None
-            if k5 is not None:
-                entries.setdefault(k5, []).append(s_)
+    entries, rev, skipped = {}, {}, {}
+    df15 = bt_norm(F["df"]) if F["df"].index.tz is None else F["df"]
+    if CONFIRMED_ONLY:
+        df15 = drop_forming(df15, "15m")
+    a15, idx15 = bt_arrays(df15), df15.index
+    where = {int(t): i for i, t in enumerate(N["close_ts"])}
+    for j in np.nonzero(a15["buy"] | a15["sell"])[0]:
+        j = int(j)
+        side, sig_px, risk = bt_levels(a15, j)
+        k5 = where.get(int(idx15[j].timestamp()) + 900)   # the 5 minute candle that closes together with the 15 minute signal candle
+        if k5 is None:
+            continue
+        rev.setdefault(k5, set()).add(side)
+        day = idx15[j].strftime("%Y-%m-%d")
+        if day not in span or risk <= 0:
+            continue
+        k_in = k5 + 1 if k5 + 1 < N["n"] else None   # the autopilot acts on the first check after the signal candle has closed
+        if k_in is None or N["dates"][k_in] != day:
+            continue
+        entries.setdefault(k_in, []).append({"side": "BUY" if side == 1 else "SELL", "dir": side, "sig": sig_px, "sl": sig_px - side * risk, "risk": risk})
     first_k = next((k for k in range(N["n"]) if N["dates"][k] >= span[0]), None)
     if first_k is None:
         return None, "No candles for that period."
@@ -6165,6 +6192,10 @@ def bt_spread_run(span, data, p):
                 close(o, k, o["sl"], "NIFTY reached the stop")
                 openp.remove(o)
                 continue
+            if k in rev and (-o["dir"]) in rev[k] and k > o["k_in"]:
+                close(o, k, spot, "the 15 minute signal turned")
+                openp.remove(o)
+                continue
             now_v = max(0.0, px(spot, o["ks"], o["right"], o["exp"], k) - px(spot, o["kh"], o["right"], o["exp"], k))
             if o["credit"] > 0 and (o["credit"] - now_v) >= o["credit"] * cap / 100:
                 close(o, k, spot, f"{cap:g}% of the premium collected")
@@ -6173,6 +6204,10 @@ def bt_spread_run(span, data, p):
                 close(o, k, spot, "expiry day close")
                 openp.remove(o)
         for s_ in entries.get(k, []):
+            moved = (spot - s_["sig"]) * s_["dir"]
+            if moved >= s_["risk"] or moved <= -0.8 * s_["risk"]:
+                skipped["NIFTY had moved too far from the signal"] = skipped.get("NIFTY had moved too far from the signal", 0) + 1
+                continue
             if not (first <= hm <= last):
                 skipped["outside the entry hours"] = skipped.get("outside the entry hours", 0) + 1
                 continue
@@ -6195,7 +6230,7 @@ def bt_spread_run(span, data, p):
             if credit < width * SPR_MIN_CREDIT_PCT / 100:
                 skipped["credit too thin"] = skipped.get("credit too thin", 0) + 1
                 continue
-            openp.append({"dir": 1 if up else -1, "right": right, "ks": ks, "kh": kh, "exp": e, "sl": float(s_["sl"]), "credit": round(credit, 2), "credit_leg_s": sv, "credit_leg_h": hv,
+            openp.append({"dir": 1 if up else -1, "right": right, "ks": ks, "kh": kh, "exp": e, "sl": float(s_["sl"]), "k_in": k, "credit": round(credit, 2), "credit_leg_s": sv, "credit_leg_h": hv,
                           "t_in": pd.Timestamp(float(N["close_ts"][k]), unit="s", tz="UTC").tz_convert(IST)})
     kl = N["n"] - 1
     for o in list(openp):
@@ -6207,7 +6242,7 @@ def bt_spread_run(span, data, p):
     res["found"] = len(done)
     res["skipped"] = [{"why": k_, "n": v} for k_, v in skipped.items()]
     res["problems"] = []
-    res["notes"] = [f"NIFTY spreads: sells the at-the-money option and buys the one {width} points further out, {lots} lot(s) of {qty // lots}. Option prices are modelled, not recorded: every leg uses Black-Scholes with an implied volatility of {p['iv']:g}%, the real expiry dates and time left, and {SPR_BT_SLIP:g} point lost on every fill. "
+    res["notes"] = [f"NIFTY spreads on the 15 minute swing signals: sells the at-the-money option and buys the one {width} points further out, {lots} lot(s) of {qty // lots}. Option prices are modelled, not recorded: every leg uses Black-Scholes with an implied volatility of {p['iv']:g}%, the real expiry dates and time left, and {SPR_BT_SLIP:g} point lost on every fill. "
                     "Real prices move with changing volatility and skew, so treat the result as a guide to how the idea behaves, not as a promise. Margin is not modelled and brokerage is charged on four orders per spread."]
     res["list"] = [{"in": o["t_in"].strftime("%d %b %Y %H:%M"), "out": o["t_out"].strftime("%d %b %Y %H:%M"), "label": o["label"], "side": "SELL", "qty": o["qty"], "entry": round(o["p_in"], 2),
                     "exit": round(o["p_out"], 2), "why": o["why"], "kind": o["kind"], "grade": None, "pnl": round(o["pnl"], 2), "equity": round(o["equity"], 2)} for o in done[-300:]][::-1]
@@ -10004,6 +10039,8 @@ def replay_load(kind, set_progress):
                 errors.append(f"{sname} {tf}: {e}")
                 continue
             if S:
+                if kind in BOT_INDEX and sname == BOT_INDEX[kind] and tf == "15m":
+                    S["df"] = df
                 if kind in BOT_INDEX and sname == BOT_INDEX[kind] and tf == "5m":
                     S["nc_df"] = df
                     try:
@@ -12727,7 +12764,7 @@ function fsInit(){FS_BOTS.forEach(([p,k])=>{$("botHost").insertAdjacentHTML("bef
  $(p+"Bt").onclick=()=>{document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="swing";$("btTf").value=$(p+"Tf").value==="15m"?"15m":"1d";$("btStrategy").onchange()}})}
 function spHtml(){return `<div class="card botbox" id="spBox">
  <div class="ixrow"><b>Autopilot 6: NIFTY option spreads</b><span class="sub" id="spState"></span></div>
- <div class="sub">On a NIFTY signal it sells the at-the-money option on the signal's side (a put on a buy signal, a call on a sell signal) and buys a protective option the distance below you choose further out. It earns the premium as time passes and when NIFTY moves your way, and the most it can lose is fixed. Spreads are held from day to day and closed at the profit target, at the stop, or on expiry day.</div>
+ <div class="sub">On a NIFTY 15 minute swing signal it sells the at-the-money option on the signal's side (a put on a buy signal, a call on a sell signal) and buys a protective option the distance below you choose further out. It earns the premium as time passes and when NIFTY moves your way, and the most it can lose is fixed. Spreads are held from day to day and closed at the profit target, at the stop, when the 15 minute signal turns, or on expiry day.</div>
  <div class="botrow">
   <label>Mode<select id="spMode"><option value="paper">Paper</option><option value="live">Live</option></select></label>
   <label>Lots each<input id="spLots" type="number" min="1" step="1"></label>
