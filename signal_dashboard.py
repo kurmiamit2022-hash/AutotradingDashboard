@@ -2033,7 +2033,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22b"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-22d"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -3665,16 +3665,18 @@ OPTBOT_SKIP = {}   # (user id, symbol) -> time until which a stock that could no
 OPTBOT_DEFAULTS = {"mode": "off", "strategy": "scanner", "paused": False, "last_mode": "paper", "max_trades": 3, "lots": 1, "loss_limit": 3000.0, "armed_day": None, "entries": "both", "min_grade": "any"}
 
 
-BOT_KINDS = ("scanner", "nifty")
+BOT_KINDS = ("scanner", "nifty", "sensex")
+BOT_INDEX = {"nifty": "NIFTY", "sensex": "SENSEX"}   # the autopilots that trade one index
+BOT_TITLE = {"scanner": "F&O stocks", "nifty": "NIFTY", "sensex": "SENSEX"}
 
 
 def bot_kind(v):
-    return "nifty" if v == "nifty" else "scanner"
+    return v if v in ("nifty", "sensex") else "scanner"
 
 
 def bot_cfg(uid, kind="scanner"):
     kind = bot_kind(kind)
-    return OPTBOT.setdefault((uid, kind), dict(OPTBOT_DEFAULTS, strategy=kind, **({"max_trades": 3} if kind == "nifty" else {})))
+    return OPTBOT.setdefault((uid, kind), dict(OPTBOT_DEFAULTS, strategy=kind, **({"max_trades": 3} if kind in BOT_INDEX else {})))
 
 
 def bot_log(uid, text, bot=None):
@@ -3785,9 +3787,9 @@ AUTO_RULES = ("Buys an at-the-money CE (BUY signal) or PE (SELL signal) when the
 
 def auto_rows(kind, tf):
     """The rows this autopilot may trade on one timeframe, with live prices and grades. None when there is no data yet."""
-    if kind == "nifty":
+    if kind in BOT_INDEX:
         ensure_fresh(tf)
-        names = ["NIFTY"]
+        names = [BOT_INDEX[kind]]
     else:
         ensure_fresh(tf)
         with LOCK:
@@ -3926,7 +3928,7 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False, old_view=Fa
     AUTO_MOVES[kind] = {r["symbol"]: (r.get("ltp_chg", r.get("chg")), r.get("sector")) for r in (tfrows.get("5m") or [])}
     zones = {tf: {r["symbol"]: r.get("side") for r in (tfrows[tf] or []) if (r.get("signal") or "–") != "–" and not r.get("sl_hit")} for tf in AUTO_TFS}   # who is in a BUY or SELL zone on each chart
     for tf in AUTO_TFS:
-        if tf not in AUTO_ENTRY_TFS or (kind == "scanner" and AUTO_MOM and not AUTO_OLD_RULES and not old_view) or kind == "nifty":   # the stock autopilot trades early movers only; the Nifty one its confluence setups
+        if tf not in AUTO_ENTRY_TFS or (kind == "scanner" and AUTO_MOM and not AUTO_OLD_RULES and not old_view) or kind in BOT_INDEX:   # the stock autopilot trades early movers only; the Nifty one its confluence setups
             continue
         rows = tfrows[tf]
         other = "15m" if tf == "5m" else "5m"
@@ -4009,15 +4011,15 @@ def auto_candidates(u, cfg, kind, why=None, manual=False, day=False, old_view=Fa
                         "note": (f"fresh {tf} {side} signal at {r.get('signal_time')}" if fresh else f"{side} signal from {sdate} still open, back near its trend line on {tf}")
                                 + (f", grade {g} ({cf.get('s')})" if g else "")})
     out.sort(key=lambda c: (c["etype"] != "fresh", -(c["score"] or 0), c["dist"]))
-    if kind == "nifty":
+    if kind in BOT_INDEX:
         r5 = next(iter(tfrows.get("5m") or []), None)
         if r5:
             try:
-                out += nc_live_candidates(u, kind, float(r5.get("ltp") or r5["close"]), today, no, manual, day)
+                out += nc_live_candidates(u, kind, float(r5.get("ltp") or r5["close"]), today, no, manual, day, BOT_INDEX[kind])
             except Exception as e:
-                no("NIFTY", f"confluence setups could not be checked ({type(e).__name__})")
+                no(BOT_INDEX[kind], f"confluence setups could not be checked ({type(e).__name__})")
         else:
-            no("NIFTY", "no live price yet")
+            no(BOT_INDEX[kind], "no live price yet")
     try:
         have = {(c["symbol"], c["side"]) for c in out}
         extra = [c for c in mom_candidates(u, cfg, kind, tfrows.get("5m"), today, no, manual, day) if (c["symbol"], c["side"]) not in have]
@@ -4044,7 +4046,7 @@ def auto_enter(u, cfg, kind):
             continue
         if any(p["symbol"] == c["symbol"] for p in bot_positions(u["id"], kind=kind)):
             continue   # one open trade on a stock at a time
-        r = bot_buy(u, cfg, c, mode, strategy=kind, skip_expiry_day=(kind == "nifty"), etype=c["etype"])
+        r = bot_buy(u, cfg, c, mode, strategy=kind, skip_expiry_day=(kind in BOT_INDEX), etype=c["etype"])
         if r == "skip":
             continue
         AUTO_SEEN[c["key"]] = True
@@ -4293,38 +4295,38 @@ def nc_walk(o, h, l, c, idx, j, side, entry, sl, tps, tstop_bars, sq):
     return n - 1, float(c[n - 1]), "end of data"
 
 
-def nc_live_data():
-    """NIFTY 5 minute candles (closed ones) and the futures candles for VWAP, cached for 40 seconds."""
-    hit = NC_CACHE.get("d")
+def nc_live_data(name="NIFTY"):
+    """The index's 5 minute candles (closed ones) and the futures candles for VWAP, cached for 40 seconds."""
+    hit = NC_CACHE.get(name)
     if hit and time.time() - hit[0] < 40:
         return hit[1], hit[2]
     df, vw = None, None
     if use_dhan():
-        frames, _ = dhan_frames(["NIFTY"], "5m", 7)
-        df = frames.get("NIFTY")
+        frames, _ = dhan_frames([name], "5m", 7)
+        df = frames.get(name)
         try:
-            vw = dhan_candles("NIFTY", "5m", 7, fut=True)
+            vw = dhan_candles(name, "5m", 7, fut=True)
         except Exception:
             vw = None
     else:
-        df = yahoo_frames(["NIFTY"], "5m", 7).get("NIFTY")
+        df = yahoo_frames([name], "5m", 7).get(name)
     if df is not None and not df.empty:
         df = drop_forming(bt_norm(df), "5m")
         if vw is not None and len(vw):
             vw = bt_norm(vw)
-    NC_CACHE["d"] = (time.time(), df, vw)
+    NC_CACHE[name] = (time.time(), df, vw)
     return df, vw
 
 
-def nc_live_candidates(u, kind, px, today, no, manual=False, day=False):
-    """The confluence setups that can be bought right now. px = NIFTY's live price."""
+def nc_live_candidates(u, kind, px, today, no, manual=False, day=False, name="NIFTY"):
+    """The confluence setups that can be bought right now. px = the index's live price."""
     try:
-        df, vw = nc_live_data()
+        df, vw = nc_live_data(name)
     except Exception as e:
-        no("NIFTY", f"candles could not be read ({type(e).__name__})")
+        no(name, f"candles could not be read ({type(e).__name__})")
         return []
     if df is None or df.empty:
-        no("NIFTY", "no 5 minute candles yet")
+        no(name, "no 5 minute candles yet")
         return []
     setups, whys, d = nc_signals(df, today, vw)
     if d.attrs.get("vwap_proxy"):
@@ -4343,24 +4345,24 @@ def nc_live_candidates(u, kind, px, today, no, manual=False, day=False):
             passed = "the break of the signal candle did not come in time"
         elif s["j"] is None and not ((px >= s["entry"]) if up else (px <= s["entry"])):
             if not day:
-                no("NIFTY", f"{s['side']} {s['name']}: waiting for a break of {s['entry']:.2f}")
+                no(name, f"{s['side']} {s['name']}: waiting for a break of {s['entry']:.2f}")
                 continue
             passed = "waiting for the break"
         elif not (s["sl"] < px < s["tps"][0] if up else s["tps"][0] < px < s["sl"]):
             passed = "the price is already past T1 or the stop"
         if passed and not day:
-            no("NIFTY", f"{s['side']} {s['name']}: {passed}")
+            no(name, f"{s['side']} {s['name']}: {passed}")
             continue
         skey = f"5m {s['time']} {s['side']} {s['trigger']}"
-        key = (u["id"], kind, "NIFTY", "5m", f"{s['time']} {s['trigger']}", s["side"])
+        key = (u["id"], kind, name, "5m", f"{s['time']} {s['trigger']}", s["side"])
         with ORDER_LOCK:
-            done = any(o_.get("user") == u["id"] and o_.get("bot") and o_["symbol"] == "NIFTY" and o_.get("date") == today and o_.get("bot_sigkey") == skey for o_ in ORDERS)
+            done = any(o_.get("user") == u["id"] and o_.get("bot") and o_["symbol"] == name and o_.get("date") == today and o_.get("bot_sigkey") == skey for o_ in ORDERS)
         if done:
             AUTO_SEEN[key] = True
         if (AUTO_SEEN.get(key) or done) and not manual:
             continue
         lv = {"sl": s["sl"], "tp1": s["tps"][0], "tp2": s["tps"][1], "tp3": s["tps"][2], "tp4": s["tps"][3]}
-        out.append({"symbol": "NIFTY", "side": s["side"], "px": px, "levels": lv, "tf": "5m", "etype": "fresh", "grade": None, "score": None, "dist": 0.0, "key": key, "sigkey": skey,
+        out.append({"symbol": name, "side": s["side"], "px": px, "levels": lv, "tf": "5m", "etype": "fresh", "grade": None, "score": None, "dist": 0.0, "key": key, "sigkey": skey,
                     "taken": bool(done), "time": s["time"], "status": "taken" if done else "passed" if passed else "open", "reason": passed, "tstop": NC_TSTOP_MIN,
                     "note": f"{s['trigger']} {s['side']} {s['name']} at {s['time']}, RSI {s['rsi']:.0f}"})
     return out
@@ -5786,7 +5788,7 @@ def api_history_autopilot(request: Request, days: int = 0):
     """The Autopilot's own trades (today's and earlier days), summed up by how they were entered, by day and one by one."""
     u = request.state.user
     rows = []
-    for kind in ("scanner", "nifty"):
+    for kind in BOT_KINDS:
         for t in bot_view(u, kind).get("trades", []):
             rows.append({**{k: t.get(k) for k in ("date", "time", "label", "mode", "entry", "exit", "pnl", "reason", "state", "etype")}, "bot": kind})
     if days and days > 0:
@@ -9152,7 +9154,7 @@ def bot_view(u, kind="scanner", old=False):
     state = "stopped" if cfg["mode"] == "off" else "paused" if cfg.get("paused") else "running"
     return {"mode": cfg["mode"], "state": state, "choice": cfg["last_mode"], "strategy": kind, "bot": kind, "entries": cfg.get("entries", "both"), "min_grade": cfg.get("min_grade", "any"), "open": len(bot_positions(u["id"], kind=kind)), "max_trades": cfg["max_trades"], "lots": cfg["lots"], "loss_limit": cfg["loss_limit"], "live_blocker": why,
             "armed": cfg["armed_day"] == today, "trades": trades, "pnl": pnl, "last_scan": cfg.get("last_scan"), "market_open": market_open_now(),
-            "rules": bot_rules(kind), "old_rules": kind != "nifty" and (AUTO_OLD_RULES or not AUTO_MOM),
+            "rules": bot_rules(kind), "old_rules": kind == "scanner" and (AUTO_OLD_RULES or not AUTO_MOM),
             "signals": [{**sg_, "reason": None, "note": ""} for sg_ in manual_signals(u, kind, old)],
             "log": [l for l in OPTBOT_LOG if l["uid"] == u["id"] and (l.get("bot") in (None, kind))][-25:][::-1]}
 
@@ -9259,7 +9261,7 @@ def replay_fetch(names, tf, progress):
 
 
 def replay_names(kind):
-    return ["NIFTY"] if kind == "nifty" else [s for s in UNIVERSE if s not in INDICES and s not in SCANNER_EXCLUDE and s not in INDEX_YF] + ["NIFTY"]   # the stock replay also needs NIFTY, for its trend
+    return [BOT_INDEX[kind]] if kind in BOT_INDEX else [s for s in UNIVERSE if s not in INDICES and s not in SCANNER_EXCLUDE and s not in INDEX_YF] + ["NIFTY"]   # the stock replay also needs NIFTY, for its trend
 
 
 def replay_load(kind, set_progress):
@@ -9281,10 +9283,10 @@ def replay_load(kind, set_progress):
                 errors.append(f"{sname} {tf}: {e}")
                 continue
             if S:
-                if sname == "NIFTY" and tf == "5m" and kind == "nifty":
+                if kind in BOT_INDEX and sname == BOT_INDEX[kind] and tf == "5m":
                     S["nc_df"] = df
                     try:
-                        S["nc_vw"] = dhan_candles("NIFTY", "5m", _days(PERIODS["5m"]), fut=True) if use_dhan() else None
+                        S["nc_vw"] = dhan_candles(sname, "5m", _days(PERIODS["5m"]), fut=True) if use_dhan() else None
                     except Exception:
                         S["nc_vw"] = None
                 data.setdefault(sname, {})[tf] = S
@@ -9345,11 +9347,11 @@ def replay_mom_cands(data, syms, day, T, endt):
     return out, None
 
 
-def replay_run_nc(data, day, cfg):
-    """The Nifty confluence strategy on one past day, in the same result shape as the other replays."""
-    N = (data.get("NIFTY") or {}).get("5m")
+def replay_run_nc(data, day, cfg, name="NIFTY"):
+    """The index confluence strategy on one past day, in the same result shape as the other replays."""
+    N = (data.get(name) or {}).get("5m")
     if not N or N.get("nc_df") is None:
-        return {"error": "NIFTY 5 minute candles were not loaded."}
+        return {"error": f"{name} 5 minute candles were not loaded."}
     max_trades = int(cfg.get("max_trades", 3))
     first, last = OPTBOT_FIRST_ENTRY.strftime("%H:%M"), OPTBOT_LAST_ENTRY.strftime("%H:%M")
     sets, why, d = nc_signals(N["nc_df"], day, N.get("nc_vw"), last)
@@ -9361,7 +9363,7 @@ def replay_run_nc(data, day, cfg):
     for s_ in sets:
         k5 = where.get(int(d.index[s_["j"]].timestamp())) if s_["j"] is not None else None
         at = _hm(N["close_ts"][k5]) if k5 is not None else s_["time"]
-        sg = {"symbol": "NIFTY", "side": s_["side"], "right": "CE" if s_["side"] == "BUY" else "PE", "tf": "5m", "type": s_["trigger"], "at": at, "signal_time": f"{day} {s_['time']}",
+        sg = {"symbol": name, "side": s_["side"], "right": "CE" if s_["side"] == "BUY" else "PE", "tf": "5m", "type": s_["trigger"], "at": at, "signal_time": f"{day} {s_['time']}",
               "price": round(s_["entry"], 2), "sl": round(s_["sl"], 2), "tps": [round(t, 2) for t in s_["tps"]], "move": None, "taken": False, "why_not": None, "ts": int(d.index[s_["k"]].timestamp()), "day": day}
         signals.append(sg)
         if k5 is None:
@@ -9375,7 +9377,7 @@ def replay_run_nc(data, day, cfg):
         else:
             g = {"side": s_["side"], "dir": s_["dir"], "entry": s_["entry"], "sl": s_["sl"], "tps": s_["tps"], "risk": s_["risk"], "date": day, "time": s_["time"], "j": k5, "hits": 0, "open": True,
                  "tstop": NC_TSTOP_MIN // 5}
-            c = {"symbol": "NIFTY", "tf": "5m", "g": g, "px": s_["entry"], "key": (day, s_["time"], s_["trigger"]), "etype": s_["trigger"], "dist": 0.0, "at": at, "chg": None, "S5": N, "k5": k5, "sts": int(N["ts"][k5])}
+            c = {"symbol": name, "tf": "5m", "g": g, "px": s_["entry"], "key": (day, s_["time"], s_["trigger"]), "etype": s_["trigger"], "dist": 0.0, "at": at, "chg": None, "S5": N, "k5": k5, "sts": int(N["ts"][k5])}
             tr = replay_trade(c, day)
             trades.append(tr)
             sg["taken"] = True
@@ -9394,14 +9396,14 @@ def replay_run_nc(data, day, cfg):
     for t in trades:
         run += t["r"]
         eq.append(round(run, 2))
-    return {"day": day, "bot": "nifty", "equity": eq, "summary": summ, "trades": trades, "signals": signals, "skips": sorted(skips.items(), key=lambda x: -x[1]), "max_trades": max_trades, "entries": "confluence",
+    return {"day": day, "bot": "nifty" if name == "NIFTY" else name.lower(), "equity": eq, "summary": summ, "trades": trades, "signals": signals, "skips": sorted(skips.items(), key=lambda x: -x[1]), "max_trades": max_trades, "entries": "confluence",
             "vwap_proxy": bool(d.attrs.get("vwap_proxy"))}
 
 
 def replay_run(data, kind, day, cfg):
     """One day, one 5 minute step at a time. Returns the signals that qualified, the trades the autopilot would have taken, and why the others were left out."""
-    if kind == "nifty":
-        return replay_run_nc(data, day, cfg)
+    if kind in BOT_INDEX:
+        return replay_run_nc(data, day, cfg, BOT_INDEX[kind])
     ent = cfg.get("entries", "both")
     max_trades = int(cfg.get("max_trades", 3))
     syms = [s for s, v in data.items() if "5m" in v and "15m" in v and not (kind == "scanner" and s == "NIFTY")]
@@ -9589,6 +9591,8 @@ def _expiry_after(symbol, d):
     """The next NSE expiry on or after date d: every Tuesday for NIFTY, the last Tuesday of the month for stocks."""
     if symbol == "NIFTY":
         return d + timedelta(days=(1 - d.weekday()) % 7)
+    if symbol == "SENSEX":   # BSE's weekly expiry is on Thursday
+        return d + timedelta(days=(3 - d.weekday()) % 7)
     for add in (0, 1):
         y, m = d.year + (d.month + add - 1) // 12, (d.month + add - 1) % 12 + 1
         last = (datetime(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1)).date()
@@ -9834,7 +9838,7 @@ def manual_signals(u, kind, old=False):
         if mvs and mvs[0] is not None:
             row["chg"] = round(float(mvs[0]), 2)
         row["sector"] = (mvs[1] if mvs and mvs[1] else None) or row.get("sector") or sector_of(row["symbol"])
-    show = [r for r in rows.values() if old or r.get("type") == "momentum" or r.get("taken") or kind == "nifty" or AUTO_OLD_RULES or not AUTO_MOM]
+    show = [r for r in rows.values() if old or r.get("type") == "momentum" or r.get("taken") or kind in BOT_INDEX or AUTO_OLD_RULES or not AUTO_MOM]
     out = sorted(show, key=lambda r: (0 if r.get("pos") else 1 + MANUAL_ORDER.get(r["status"], 9), -r["ts"]))   # trades that are still open come first
     MANUAL_SIG[k] = (time.time(), out)
     return out
@@ -9960,7 +9964,7 @@ def api_optbot_control(request: Request, payload: dict = Body(...)):
         if err:
             return {"error": err}
         cfg.update(mode=mode, paused=False, last_mode=mode)
-        bot_log(u["id"], f"Play: {'NIFTY' if kind == 'nifty' else 'F&O stocks'} autopilot running in {mode.upper()} mode.", bot=kind)
+        bot_log(u["id"], f"Play: {BOT_TITLE[kind]} autopilot running in {mode.upper()} mode.", bot=kind)
     elif action == "pause":
         if cfg["mode"] == "off":
             return {"error": "The autopilot is not running."}
@@ -11037,6 +11041,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
 <p class="sub" id="cmNote"></p>
 </section>
 <section id="view-autopilot" hidden>
+<div id="apTabs" class="botrow" role="tablist" aria-label="Autopilots" style="margin-bottom:10px;gap:8px"></div>
 <div id="botHost"></div>
 </section>
 <div id="perfBar" class="botrow" style="margin-bottom:10px;gap:8px" hidden><button class="btn" data-pf="journal">Journal</button> <button class="btn" data-pf="history">History</button> <button class="btn" data-pf="backtest">Backtest</button></div>
@@ -11784,7 +11789,9 @@ function scRender(){const d=scData,tb=$("scTable");if(!d||d.error){tb.innerHTML=
    <td><span class="pill ${r.signal.replace(" ","_")}">${r.signal}</span>${confBadge(r)}</td><td>${esc(r.status)}</td><td>${esc(r.signal_time)}</td>
    <td class="act"><button class="mini" data-sc="chart" data-s="${esc(r.symbol)}">Chart</button> ${has?`<button class="mini" data-sc="fut" data-s="${esc(r.symbol)}" data-side="${side}" data-p="${r.price}">Futures</button> `:""}<button class="mini" data-sc="opt" data-s="${esc(r.symbol)}">Options</button></td>
    <td>${esc(r.sector||"–")}</td>${sc}<td>${f2(r.price)}</td>${c}<td>${r.vol!=null?fk(r.vol):"–"}</td><td>${r.val_cr!=null?f2(r.val_cr):"–"}</td>${L?`<td>${f2(L.entry)}</td><td>${f2(L.sl)}</td>`+lv("tp1",0)+lv("tp2",1)+lv("tp3",2)+lv("tp4",3):"<td>–</td>".repeat(6)}</tr>`}).join("")+"</tbody>"}
-let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: F&O stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY"}};
+let botTimer=null;const BOTS={bot:{kind:"scanner",title:"Autopilot 1: F&O stocks"},nbot:{kind:"nifty",title:"Autopilot 2: NIFTY"},sbot:{kind:"sensex",title:"Autopilot 3: SENSEX"}};
+const AP_TABS=[["botBox","F&O stocks"],["nbotBox","NIFTY"],["sbotBox","SENSEX"],["fsBox","Futures swing"]];
+function apTab(id){if(!AP_TABS.some(t=>t[0]===id))id=AP_TABS[0][0];AP_TABS.forEach(([b])=>{const e=$(b);if(e)e.hidden=b!==id});document.querySelectorAll("#apTabs [data-aptab]").forEach(x=>{const on=x.dataset.aptab===id;x.classList.toggle("go",on);x.setAttribute("aria-selected",on)});try{localStorage.setItem("apTab",id)}catch(e){}}
 window.sigSort={};
 const SIG_RANK={taken:1,open:2,passed:4,earlier:5};
 function sigStat(x){return x.status==="taken"?(x.pos?"Open trade":"Closed"):x.status==="open"?"Open now":x.status==="passed"?"Passed":"Earlier"}
@@ -11803,7 +11810,7 @@ function sigPaint(p){const d=window.botD[p]||{},all=d.signals||[],sel=$(p+"SecF"
  $(p+"Sig").innerHTML=sg.length?`<thead><tr>${th}</tr></thead><tbody>`+sg.map(x=>`<tr class="${x.status==="passed"||x.status==="earlier"||(x.status==="taken"&&!x.pos)?"past":""}"><td><b>${esc(x.symbol)}</b></td><td class="sub">${esc(x.sector||"")}</td><td>${pc(x.chg)}</td><td>${x.grade?`<span class="cg cg${x.grade}">${x.grade}</span>`:"–"}</td><td class="act"><button class="mini" data-ap="chart" data-s="${esc(x.symbol)}" data-tf="${x.tf}">Chart</button> <button class="mini" data-ap="ochart" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Option chart</button> <button class="mini go" data-ap="trade" data-s="${esc(x.symbol)}" data-r="${x.right}" data-tf="${x.tf}">Trade ${x.right}</button></td><td>${x.status==="open"||x.pos?"<b>"+sigStat(x)+"</b>":sigStat(x)}</td><td>${x.type==="fresh"?"Fresh "+esc(x.time||""):x.type==="momentum"?"Early mover "+esc(x.time||""):"Continuation"}</td><td>${x.px}</td><td>${x.sl}</td><td>${x.t1}</td><td>${x.t2}</td><td>${x.t3}</td><td>${x.t4}</td><td class="sub" style="min-width:220px">${esc(sigRemark(x))}</td></tr>`).join("")+"</tbody>":`<tbody><tr><td class="sub">${all.length?"No signal in this sector.":"No signals yet today."}</td></tr></tbody>`}
 window.botD={};
 function fsHtml(){return `<div class="card botbox" id="fsBox">
- <div class="ixrow"><b>Autopilot 3: Futures swing</b><span class="sub" id="fsState"></span></div>
+ <div class="ixrow"><b>Autopilot 4: Futures swing</b><span class="sub" id="fsState"></span></div>
  <div class="sub">Buys and sells futures on swing signals of the timeframe you pick and holds them with a stop-loss. Positions stay open from day to day.</div>
  <div class="botrow">
   <label>Mode<select id="fsMode"><option value="paper">Paper</option><option value="live">Live</option></select></label>
@@ -11824,6 +11831,7 @@ function fsHtml(){return `<div class="card botbox" id="fsBox">
   <span class="botpill" id="fsPill"></span>
  </div>
  <div class="tkmsg" id="fsMsg" role="status"></div>
+ <div class="ixrow"><b>Replay past days</b><select id="fsRpDays" aria-label="Period to replay"><option value="90">Last 3 months</option><option value="180">Last 6 months</option><option value="365">Last 1 year</option><option value="1095">Last 3 years</option></select><button class="btn" id="fsRp">Replay</button><span class="sub">Runs the futures strategy on past candles with your funds and shows each trade. 15 min covers about 2 months.</span></div>
  <div class="ixrow"><b>Open positions</b></div>
  <div class="wrap"><table id="fsOpen"></table></div>
  <div class="ixrow"><b>Closed positions</b><span class="sub" id="fsStats"></span></div>
@@ -11850,6 +11858,7 @@ async function fsCtl(action){const D=window.fsD||{};const body={action,mode:$("f
  const d=await post("/api/futbot",body);$("fsMsg").textContent=d.error||({play:"Running.",pause:"Paused. No new trades; open positions are still managed.",stop:"Stopped. Open positions keep their stop-loss.",save:"Saved.",close_all:d.left?`${d.left} position(s) could not be closed. Check your broker app.`:"All positions closed."})[action]||"";fsLoad()}
 function fsInit(){$("botHost").insertAdjacentHTML("beforeend",fsHtml());
  $("fsSave").onclick=()=>fsCtl("save");$("fsPlay").onclick=()=>fsCtl("play");$("fsPause").onclick=()=>fsCtl("pause");$("fsStop").onclick=()=>fsCtl("stop");$("fsCloseAll").onclick=()=>fsCtl("close_all");
+$("fsRp").onclick=()=>{const tf=$("fsTf").value==="15m"?"15m":"1d",d=tf==="15m"?58:+$("fsRpDays").value;document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="swing";$("btTf").value=tf;$("btStrategy").onchange();$("btDays").value=d;btRun()}
  $("fsBt").onclick=()=>{document.querySelector('[data-m="perf"]').click();document.querySelector('[data-pf="backtest"]').click();$("btStrategy").value="swing";$("btTf").value=$("fsTf").value==="15m"?"15m":"1d";$("btStrategy").onchange()}}
 function botHtml(p,t){return `<div class="card botbox" id="${p}Box">
  <div class="ixrow"><b>${t}</b><span class="sub" id="${p}State"></span></div>
@@ -11960,7 +11969,8 @@ async function atmOption(sy,right,tf,m,what){m.textContent=`Loading the ${sy} op
  }catch(e){m.textContent="Could not load the option chain."}}
 async function apOption(b,p,what){b.disabled=true;try{await atmOption(b.dataset.s,b.dataset.r,b.dataset.tf,$(p+"Msg"),what)}finally{b.disabled=false}}
 function initBot(){$("botHost").innerHTML=Object.entries(BOTS).map(([p,v])=>botHtml(p,v.title)).join("");
- for(const p in BOTS){rpDays(p);for(const k of ["RCap","RFee"])$(p+k).onchange=()=>{const l=window.rpLast&&window.rpLast[p];if(l)rpShow(p,l)};$(p+"RRun").onclick=()=>rpRun(p);$(p+"Past").onchange=()=>botLoad();$(p+"SecF").onchange=()=>sigPaint(p);$(p+"Old").onchange=()=>botLoad();$(p+"Sig").onclick=e=>{const h=e.target.closest("th[data-sk]");if(h){const k=h.dataset.sk,o=window.sigSort[p];window.sigSort[p]=o&&o.k===k?(o.d===1?{k,d:-1}:null):{k,d:1};sigPaint(p);return}const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}fsInit()}
+ for(const p in BOTS){rpDays(p);for(const k of ["RCap","RFee"])$(p+k).onchange=()=>{const l=window.rpLast&&window.rpLast[p];if(l)rpShow(p,l)};$(p+"RRun").onclick=()=>rpRun(p);$(p+"Past").onchange=()=>botLoad();$(p+"SecF").onchange=()=>sigPaint(p);$(p+"Old").onchange=()=>botLoad();$(p+"Sig").onclick=e=>{const h=e.target.closest("th[data-sk]");if(h){const k=h.dataset.sk,o=window.sigSort[p];window.sigSort[p]=o&&o.k===k?(o.d===1?{k,d:-1}:null):{k,d:1};sigPaint(p);return}const b=e.target.closest("[data-ap]");if(!b)return;if(b.dataset.ap==="chart")openChart(b.dataset.s,b.dataset.tf);else apOption(b,p,b.dataset.ap)};$(p+"Save").onclick=()=>botCtl(p,"save");$(p+"Play").onclick=()=>botCtl(p,"play");$(p+"Pause").onclick=()=>botCtl(p,"pause");$(p+"Stop").onclick=()=>botCtl(p,"stop")}fsInit();
+ $("apTabs").innerHTML=AP_TABS.map(([b,t])=>`<button class="btn" role="tab" data-aptab="${b}">${t}</button>`).join("");$("apTabs").onclick=e=>{const x=e.target.closest("[data-aptab]");if(x)apTab(x.dataset.aptab)};let sv=null;try{sv=localStorage.getItem("apTab")}catch(e){}apTab(sv)}
 function confBadge(r){const c=r&&r.conf;if(!c)return "";return `<span class="cg cg${c.g}" title="Grade ${c.g}, score ${c.s} of 100">${c.g}<small> ${c.s}</small></span>`}
 let btTimer=null;
 const inr=x=>(x<0?"-":"")+"₹"+Math.abs(Math.round(x)).toLocaleString("en-IN");
