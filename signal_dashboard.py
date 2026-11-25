@@ -715,6 +715,9 @@ def delta_why(sym, tf):
     """Why a chart has no delta, in a plain sentence (empty when it has some)."""
     if tf not in ("5m", "15m", "1h", "1d"):
         return "Delta is shown on the 5 min, 15 min, 1 hour and Daily charts."
+    if not DELTA_STATE["loaded"]:
+        with LIVE_LOCK:
+            delta_load()
     if not use_dhan():
         return "Delta is built from the Dhan live feed, and this server is not using Dhan for market data (set the data source to Dhan under Account)."
     if sym in CASH_SET:
@@ -731,6 +734,8 @@ def delta_why(sym, tf):
 def delta_series(sym, tf, stamps):
     """[buy, sell, partial] for each candle start in stamps (IST timestamps), or None where nothing was seen. 5 minute candles are summed up for the longer ones."""
     with LIVE_LOCK:
+        if not DELTA_STATE["loaded"]:
+            delta_load()   # after a restart outside market hours no tick comes to bring the saved day back
         d = {k: list(v) for k, v in (DELTA5.get(sym) or {}).items()}
     if not d:
         return [None] * len(stamps)
@@ -2173,7 +2178,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-25d"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-25e"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
