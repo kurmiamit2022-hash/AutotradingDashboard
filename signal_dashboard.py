@@ -711,6 +711,23 @@ def delta_flush():
         pass
 
 
+def delta_why(sym, tf):
+    """Why a chart has no delta, in a plain sentence (empty when it has some)."""
+    if tf not in ("5m", "15m", "1h", "1d"):
+        return "Delta is shown on the 5 min, 15 min, 1 hour and Daily charts."
+    if not use_dhan():
+        return "Delta is built from the Dhan live feed, and this server is not using Dhan for market data (set the data source to Dhan under Account)."
+    if sym in CASH_SET:
+        return "Delta is collected for the F&O stocks the live feed follows; this cash-only stock is not one of them."
+    if DHAN_STAT.get("last") and time.time() - DHAN_STAT["last"] > 180:
+        return "The live feed is not sending right now (market closed or reconnecting), and nothing was collected for this stock yet."
+    if not DELTA5:
+        return "No volume has arrived on the live feed since the server started, so no delta has been collected yet."
+    if sym not in DELTA5:
+        return "Nothing collected for this stock yet. Delta starts when the server first sees it trade on the live feed."
+    return "No delta for the candles shown. Delta only exists for candles the server watched, and it keeps 10 days."
+
+
 def delta_series(sym, tf, stamps):
     """[buy, sell, partial] for each candle start in stamps (IST timestamps), or None where nothing was seen. 5 minute candles are summed up for the longer ones."""
     with LIVE_LOCK:
@@ -2156,7 +2173,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-25c"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-25d"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -9021,7 +9038,7 @@ def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0, inst: str = 
     key = (symbol, tf, at, fut)
     hit = CHART_CACHE.get(key)
     if hit and time.time() - hit[0] < 30:
-        return JSONResponse(hit[1])
+        return JSONResponse(dict(hit[1], delta_why=delta_why(symbol, tf)))
     try:
         d = chart_data(symbol, tf, at, fut)
     except DhanDataError as e:
@@ -9033,7 +9050,7 @@ def api_chart(symbol: str, tf: str = DEFAULT_INTERVAL, at: int = 0, inst: str = 
     if len(CHART_CACHE) > 200:
         CHART_CACHE.clear()
     CHART_CACHE[key] = (time.time(), d)
-    return JSONResponse(d)
+    return JSONResponse(dict(d, delta_why=delta_why(symbol, tf)))
 
 
 OPT_HIST = {}   # (symbol, expiry, strike, right, minutes, days) -> (time, candles): option price history kept for a short while
@@ -13017,7 +13034,7 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
   }else{
    const r=await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${cw.tf}&inst=${cw.inst}`);const d=await r.json();if(my!==cw.my)return;
    if(d.error){if(silent)return;$("cwMsg").textContent=d.error;cwClear();return}
-   candles=d.candles;lines=d.lines;intraday=d.intraday;
+   candles=d.candles;lines=d.lines;intraday=d.intraday;cw.dwhy=d.delta_why||"";
    if(cw.inst==="fut"){try{const bd=await (await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=${cw.tf}&inst=stock`)).json();if(my!==cw.my)return;
      if(bd.error||!bd.candles||!bd.candles.length)undErr=bd.error||"";else{und=bd.candles;if(bd.lines&&bd.lines.stop)undLines={stop:bd.lines.stop,ema:bd.lines.ema||[]};undMarks=mkOf(bd.marks,0)}}catch(e){}}
    markers=mkOf(d.marks,0);
@@ -13050,7 +13067,7 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
    const base=markers.slice(),paint=()=>{const r=ch.timeScale().getVisibleLogicalRange(),n=r?r.to-r.from:999,lab=n<=Math.floor($("cwChart").clientWidth/24)?dd.map(c=>{const v=c.d[0]-c.d[1],a=Math.abs(v);return{time:c.time,position:"aboveBar",color:v>=0?up:dn,shape:"circle",size:0,text:(v>=0?"+":"-")+(a>=1e5?(a/1e5).toFixed(1)+"L":a>=1e3?Math.round(a/1e3)+"K":Math.round(a))}}):[];   // the value over each candle once the chart is zoomed in enough to read it
     cs.setMarkers([...base,...lab].sort((x,y)=>x.time<y.time?-1:x.time>y.time?1:0))};
    ch.timeScale().subscribeVisibleLogicalRangeChange(paint);paint()}
-  else if(dOn)$("cwLeg").insertAdjacentHTML("beforeend",'<span class="sub">'+(cw.inst==="stock"?"No delta collected for this chart yet. It is built from the live feed (5 min, 15 min, 1 hour and Daily charts of shares), starting when the server first sees the stock.":"Delta is shown on the Stock chart.")+'</span>')}
+  else if(dOn)$("cwLeg").insertAdjacentHTML("beforeend",'<span class="sub">'+(cw.inst==="stock"?(cw.dwhy||"No delta collected for this chart yet."):"Delta is shown on the Stock chart, not the Futures or Option chart.")+'</span>')}
  if(keep&&keep.r){const d=NB-keep.n;try{ch.timeScale().setVisibleLogicalRange({from:keep.r.from+d,to:keep.r.to+d})}catch(e){}}
  $("cwBaseW").hidden=cw.inst==="stock";document.querySelector(".cwm").classList.toggle("cwopt",cw.inst!=="stock");
  if(cw.inst!=="stock"){$("cwBaseT").innerHTML=und&&und.length?`<b>${esc(sym)}</b> stock chart, same candles${cw.inst==="opt"?" and days as the option":" as the futures"} above`:esc(undErr||"The stock chart is not available for this symbol right now.");
