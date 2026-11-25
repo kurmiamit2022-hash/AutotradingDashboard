@@ -2178,7 +2178,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-25e"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-25f"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -12743,7 +12743,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  <div class="tkbtns"><button class="btn ghost" id="limClose">Close</button><button class="btn" id="limSave">Save</button></div>
 </div></dialog>
 <dialog id="chartDlg"><div class="chbox">
- <div class="chhead"><b id="chTitle"></b><span class="chnav" id="chNav" hidden><button class="btn ghost" id="chPrev" title="Previous stock (↑ or K)" aria-label="Previous stock">▲</button><button class="btn ghost" id="chNext" title="Next stock (↓ or J)" aria-label="Next stock">▼</button><span class="sub" id="chPos"></span></span><span class="sub chlive" id="chLive" aria-live="off"></span><div class="chtfs" id="chTfs"></div><button class="btn ghost" id="chClose">Close</button></div>
+ <div class="chhead"><b id="chTitle"></b><span class="chnav" id="chNav" hidden><button class="btn ghost" id="chPrev" title="Previous stock (↑ or K)" aria-label="Previous stock">▲</button><button class="btn ghost" id="chNext" title="Next stock (↓ or J)" aria-label="Next stock">▼</button><span class="sub" id="chPos"></span></span><span class="sub chlive" id="chLive" aria-live="off"></span><label class="sub" id="chDtL" title="Volume bought minus volume sold in each candle, from the live feed"><input type="checkbox" id="chDlt"> Delta</label><div class="chtfs" id="chTfs"></div><button class="btn ghost" id="chClose">Close</button></div>
  <div class="chleg" id="chLeg"></div>
  <div class="sub" id="chHint" hidden>↑ ↓ next or previous stock in your list · ← → timeframe · Esc closes</div>
  <div class="chtrade" id="chTrade"></div>
@@ -13614,13 +13614,14 @@ function chTradeBar(d){if(d.commodity){$("chTrade").innerHTML='<span class="sub"
 function initChart(){
  $("chTfs").onclick=e=>{const b=e.target.closest("button");if(b){chTf=b.dataset.ct;chAt=0;$("chTfs").querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.ct===chTf));drawChart()}};
  $("chClose").onclick=()=>$("chartDlg").close();
+ {const dc=$("chDlt");try{dc.checked=localStorage.getItem("cwdelta")==="1"}catch(e){}dc.onchange=()=>{try{localStorage.setItem("cwdelta",dc.checked?"1":"0")}catch(e){}drawChart()}}
  $("chPrev").onclick=()=>chGo(-1);$("chNext").onclick=()=>chGo(1);
  $("chartDlg").addEventListener("keydown",e=>{if(e.target.closest("input,select,textarea")||e.ctrlKey||e.metaKey||e.altKey)return;const k=e.key;
   if(k==="ArrowDown"||k==="j"||k==="J"){e.preventDefault();chGo(1)}else if(k==="ArrowUp"||k==="k"||k==="K"){e.preventDefault();chGo(-1)}
   else if(k==="ArrowLeft"||k==="ArrowRight"){const bs=[...$("chTfs").querySelectorAll("button")],i=bs.findIndex(b=>b.dataset.ct===chTf),n=bs[i+(k==="ArrowRight"?1:-1)];if(n){e.preventDefault();n.click()}}});
  $("chartDlg").addEventListener("close",()=>{chCs=null;chBar=null;if(chObj){chObj.remove();chObj=null}})}
 async function drawChart(){
- const my=chSym+chTf+chAt;$("chMsg").textContent="Loading chart…";$("chLeg").innerHTML="";
+ const my=chSym+chTf+chAt;{const o=$("chDl");if(o)o.remove()}$("chMsg").textContent="Loading chart…";$("chLeg").innerHTML="";
  if(chObj){chObj.remove();chObj=null}
  try{await loadLW()}catch(e){$("chMsg").textContent="The chart library did not load. Reload the page and try again.";return}
  let d;try{d=chSec?await (await api(`/api/sector_chart?sector=${encodeURIComponent(chSym)}&tf=${chTf}`)).json():await chFetch(chSym,chTf,chAt);if(chSec&&d.candles){d.markers=[];d.signal=null;d.lines=d.trend?{stop:[],ema:d.trend}:null}}catch(e){$("chMsg").textContent="The server did not return chart data. Try again in a moment.";return}
@@ -13641,6 +13642,19 @@ async function drawChart(){
   leg.unshift(`<b class="${sg.side==="BUY"?"up":"dn"}">${esc(sg.state)}</b> <span>signal candle ${esc(sg.time)}, ${esc(sg.status)}</span>`)}
  else leg.unshift("<span>No signal to show levels for on this timeframe.</span>");
  if(chSec){const mv=a=>a.map(m=>`${esc(m[0])} ${m[1]>0?"+":""}${m[1]}%`).join(", ");leg.unshift(`<b class="${d.direction==="Up"?"up":d.direction==="Down"?"dn":""}">Direction: ${esc(d.direction)}</b> <span>${d.above_pct}% of ${d.n} stocks are above their trend line</span>`,`<span>Leaders: ${mv(d.leaders)} · Laggards: ${mv(d.laggards)}</span>`);$("chLeg").innerHTML=leg.filter(x=>!x.includes("No signal")).join("");$("chTrade").innerHTML="";$("chTrade").onclick=null}else{$("chLeg").innerHTML=leg.join("");chTradeBar(d)}
+ $("chDtL").hidden=chSec;
+ {const dOn=$("chDlt").checked&&!chSec,dd=d.candles.filter(c=>c.d);
+  if(dOn&&dd.length){const dl=new Map(),hs=ch.addHistogramSeries({priceScaleId:"dl",priceLineVisible:false,lastValueVisible:false,priceFormat:{type:"volume"}});
+   ch.priceScale("dl").applyOptions({scaleMargins:{top:0.8,bottom:0}});
+   const data=dd.map(c=>{const v=c.d[0]-c.d[1],t=c.d[0]+c.d[1];dl.set(c.time,[v,t?v/t*100:0,c.d[2]]);return{time:c.time,value:Math.round(v),color:(v>=0?up:dn)+(c.d[2]?"66":"cc")}});hs.setData(data);
+   const lg=document.createElement("div");lg.className="chleg";$("chLeg").after(lg);lg.id="chDl";
+   const show=t=>{const x=dl.get(t)||dl.get(data[data.length-1].time);lg.innerHTML=`Delta <b class="${x[0]>=0?"up":"dn"}">${x[0]>0?"+":""}${fk(Math.round(x[0]))}</b> · score <b class="${x[1]>=0?"up":"dn"}">${x[1]>0?"+":""}${x[1].toFixed(0)}</b>${x[2]?' <span class="sub">(partial candle)</span>':""} <span class="sub">live feed, tick rule</span>`};
+   show(null);ch.subscribeCrosshairMove(pm=>show(pm&&pm.time));
+   const base=d.markers.map(m=>m.side==="BUY"?{time:m.time,position:"belowBar",color:up,shape:"arrowUp",text:"BUY"}:{time:m.time,position:"aboveBar",color:dn,shape:"arrowDown",text:"SELL"}),
+    paint=()=>{const r=ch.timeScale().getVisibleLogicalRange(),n=r?r.to-r.from:999,lab=n<=Math.floor($("chart").clientWidth/24)?dd.map(c=>{const v=c.d[0]-c.d[1],a=Math.abs(v);return{time:c.time,position:"aboveBar",color:v>=0?up:dn,shape:"circle",size:0,text:(v>=0?"+":"-")+(a>=1e5?(a/1e5).toFixed(1)+"L":a>=1e3?Math.round(a/1e3)+"K":Math.round(a))}}):[];
+     cs.setMarkers([...base,...lab].sort((x,y)=>x.time<y.time?-1:x.time>y.time?1:0))};
+   ch.timeScale().subscribeVisibleLogicalRangeChange(paint);paint()}
+  else if(dOn){const lg=document.createElement("div");lg.className="chleg sub";lg.id="chDl";lg.textContent=d.delta_why||"No delta collected for this chart yet.";$("chLeg").after(lg)}}
  ch.timeScale().fitContent();if(d.candles.length>120)ch.timeScale().setVisibleLogicalRange({from:d.candles.length-120,to:d.candles.length+4})}
 const OC_M={oi:["Open interest","oi","n"],doi:["Change in OI","doi","n"],vol:["Volume","vol","n"],ltp:["Premium","ltp","p"]};
 let ocm="oi";try{ocm=localStorage.getItem("ocm")||"oi"}catch(e){}
