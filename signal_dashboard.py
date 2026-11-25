@@ -629,11 +629,132 @@ LASTV = {}     # symbol -> cumulative day volume at the last tick (Dhan's quote 
 REPAIR = {tf: set() for tf in LIVE_TFS}   # symbols whose candle was only partly seen: re-read from the broker's history
 
 
+# ── True delta: the volume traded in each 5 minute candle split into buying and selling with the tick rule (a trade above the previous
+# price is a buy, below it a sell, at the same price it keeps the last side). Built from the live Dhan feed only, kept in the database so a restart keeps
+# the day, and candles the server did not watch from their start are marked partial. ──
+DELTA5 = {}          # symbol -> {5 minute candle start (epoch seconds): [buy volume, sell volume, partial]}
+DELTA_SIDE = {}      # symbol -> +1 or -1, the side of the last trade
+DELTA_SEEN = {}      # symbol -> epoch seconds of the first tick since the feed (re)connected
+DELTA_DIRTY = set()
+DELTA_STATE = {"loaded": False, "flush": 0.0}
+DELTA_KEEP_DAYS = 10
+
+
+def delta_load():
+    """Once per start: bring back the candles saved before a restart (added to anything seen since)."""
+    DELTA_STATE["loaded"] = True
+    try:
+        rows = q("SELECT sym, ts, buy, sell, part FROM delta5 WHERE ts>=?", (int(time.time()) - DELTA_KEEP_DAYS * 86400,))
+    except Exception:
+        return
+    for r in rows:
+        d = DELTA5.setdefault(r["sym"], {})
+        cur = d.get(r["ts"])
+        if cur:
+            cur[0] += float(r["buy"]); cur[1] += float(r["sell"]); cur[2] = 1
+        else:
+            d[r["ts"]] = [float(r["buy"]), float(r["sell"]), int(r["part"])]
+
+
+def delta_add(sym, now, price, prev_p, prev_v, cum, first):
+    if not DELTA_STATE["loaded"]:
+        delta_load()
+    t = now.timestamp()
+    if first:
+        DELTA_SEEN[sym] = t
+        cur = (DELTA5.get(sym) or {}).get(int(live_bucket(now, "5m").timestamp()))
+        if cur:
+            cur[2] = 1   # the connection was down for part of this candle
+    if prev_v is None or prev_p is None or cum <= prev_v:
+        return
+    dv = float(cum - prev_v)
+    if price > prev_p:
+        side = 1
+    elif price < prev_p:
+        side = -1
+    else:
+        side = DELTA_SIDE.get(sym, 0)
+    if side:
+        DELTA_SIDE[sym] = side
+    b = int(live_bucket(now, "5m").timestamp())
+    d = DELTA5.setdefault(sym, {})
+    cur = d.get(b)
+    if cur is None:
+        cur = d[b] = [0.0, 0.0, 1 if b < DELTA_SEEN.get(sym, t) - 20 else 0]
+    if side > 0:
+        cur[0] += dv
+    elif side < 0:
+        cur[1] += dv
+    else:
+        cur[0] += dv / 2; cur[1] += dv / 2
+    DELTA_DIRTY.add((sym, b))
+    if t - DELTA_STATE["flush"] > 30:
+        DELTA_STATE["flush"] = t
+        threading.Thread(target=delta_flush, daemon=True).start()
+
+
+def delta_flush():
+    with LIVE_LOCK:
+        todo = [(k, list(DELTA5[k[0]][k[1]])) for k in list(DELTA_DIRTY) if k[0] in DELTA5 and k[1] in DELTA5[k[0]]]
+        DELTA_DIRTY.clear()
+    for (sym, b), v in todo:
+        try:
+            x("INSERT INTO delta5(sym, ts, buy, sell, part) VALUES(?,?,?,?,?) ON CONFLICT(sym, ts) DO UPDATE SET buy=excluded.buy, sell=excluded.sell, part=excluded.part",
+              (sym, b, v[0], v[1], v[2]))
+        except Exception:
+            with LIVE_LOCK:
+                DELTA_DIRTY.add((sym, b))
+            break
+    try:
+        x("DELETE FROM delta5 WHERE ts<?", (int(time.time()) - DELTA_KEEP_DAYS * 86400,))
+    except Exception:
+        pass
+
+
+def delta_series(sym, tf, stamps):
+    """[buy, sell, partial] for each candle start in stamps (IST timestamps), or None where nothing was seen. 5 minute candles are summed up for the longer ones."""
+    with LIVE_LOCK:
+        d = {k: list(v) for k, v in (DELTA5.get(sym) or {}).items()}
+    if not d:
+        return [None] * len(stamps)
+    byday = {}
+    if tf in DAYLIKE:
+        for k, v in d.items():
+            day = pd.Timestamp.fromtimestamp(k, tz=IST).strftime("%Y-%m-%d")
+            a = byday.setdefault(day, [0.0, 0.0, 0])
+            a[0] += v[0]; a[1] += v[1]; a[2] = a[2] or v[2]
+    out = []
+    for ts in stamps:
+        if tf in DAYLIKE:
+            out.append(byday.get(ts.strftime("%Y-%m-%d")) if tf == "1d" else None)
+            continue
+        n5 = {"5m": 1, "15m": 3, "1h": 12}.get(tf)
+        if not n5:
+            out.append(None)
+            continue
+        base, cells = int(ts.timestamp()), []
+        for j in range(n5):
+            c = d.get(base + 300 * j)
+            if c:
+                cells.append(c)
+        if not cells:
+            out.append(None)
+        else:
+            out.append([sum(c[0] for c in cells), sum(c[1] for c in cells), int(any(c[2] for c in cells))])
+    return out
+
+
 def live_tick(sym, price, now, cum=None):
     """Feed one price (and the day's cumulative volume, when the feed has it) into the 5 and 15 minute candles."""
     with LIVE_LOCK:
         first = sym not in LASTP
         prev_v = LASTV.get(sym)
+        prev_p = LASTP.get(sym)
+        if cum is not None:
+            try:
+                delta_add(sym, now, price, prev_p, prev_v, cum, first)
+            except Exception:
+                pass
         LASTP[sym] = price
         if cum is not None:
             LASTV[sym] = cum
@@ -677,6 +798,7 @@ def live_reset():
         CLOSED.clear()
         LASTP.clear()
         LASTV.clear()
+        DELTA_SEEN.clear()
 
 
 def live_frame(sym, tf):
@@ -2034,7 +2156,7 @@ def _parse_sessions(text):
 
 
 SPECIAL_SESSIONS = _parse_sessions(os.getenv("SPECIAL_SESSIONS", ""))   # e.g. Muhurat trading or a Saturday/Sunday special session
-BUILD_ID = "2026-11-22m"   # shown next to the user name so it is clear which version a server is running
+BUILD_ID = "2026-11-25c"   # shown next to the user name so it is clear which version a server is running
 SESSION_OVERRIDE = {}   # set by an admin from the Admin page for one day: {"date": ..., "start": time, "end": time}
 
 
@@ -2142,6 +2264,7 @@ ALERT_DDL = [
     "CREATE TABLE IF NOT EXISTS alert_seen(k TEXT PRIMARY KEY, ts TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS alert_ap(user_id INTEGER PRIMARY KEY, trades TEXT, manual TEXT)",
     "CREATE TABLE IF NOT EXISTS copy_follow(user_id INTEGER PRIMARY KEY, mode TEXT NOT NULL, scale INTEGER NOT NULL, armed_day TEXT)",
+    "CREATE TABLE IF NOT EXISTS delta5(sym TEXT NOT NULL, ts INTEGER NOT NULL, buy REAL NOT NULL, sell REAL NOT NULL, part INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(sym, ts))",
     "CREATE TABLE IF NOT EXISTS manual_sig(k TEXT PRIMARY KEY, day TEXT NOT NULL, data TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS watchlist(user_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(user_id, symbol))",
     "CREATE TABLE IF NOT EXISTS kill(scope TEXT PRIMARY KEY, day TEXT NOT NULL, reason TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, ts TEXT NOT NULL)",
@@ -3658,7 +3781,12 @@ def chain_for(symbol, expiry, u):
         alt = broker_chain(symbol, expiry, u)
         if not alt.get("error"):
             return alt
-    return ch
+        return ch
+    try:
+        lot = bt_lot_for(symbol)
+    except Exception:
+        lot = None
+    return {**ch, "lot": lot}   # NSE counts open interest and volume in contracts; broker apps usually show contracts x lot size
 
 
 # ── Options autopilot: buys an at-the-money option in paper or live mode. Two autopilots with the same rules: one for the Intraday Scanner's
@@ -8616,6 +8744,8 @@ def chart_data(symbol, tf, at=0, fut=False):
     def tm(ts):
         return ts.strftime("%Y-%m-%d") if tf in DAYLIKE else int(ts.timestamp()) + 19800  # IST on the axis
 
+    vols = None
+
     past = next((i for i in range(n) if at and int(df.index[i].timestamp()) == at and (buy[i] or sell[i])), None) if at else None
     start = max(0, n - CHART_BARS[tf])
     if past is not None:
@@ -8624,7 +8754,9 @@ def chart_data(symbol, tf, at=0, fut=False):
 
     out = {"symbol": symbol, "tf": tf, "intraday": tf not in DAYLIKE, "index": symbol in INDEX_YF, "commodity": symbol in COMMODITIES,
            "candles": [{"time": t[k], "open": round(float(df["Open"].iloc[i]), 2), "high": round(float(df["High"].iloc[i]), 2),
-                        "low": round(float(df["Low"].iloc[i]), 2), "close": round(float(c[i]), 2)} for k, i in enumerate(range(start, n))],
+                        "low": round(float(df["Low"].iloc[i]), 2), "close": round(float(c[i]), 2),
+                        **({"d": [round(dd[0]), round(dd[1]), dd[2]]} if dd else {})}
+                       for k, (i, dd) in enumerate(zip(range(start, n), delta_series(symbol, tf, [df.index[i] for i in range(start, n)])))],
            "markers": [{"time": t[i - start], "side": "BUY" if buy[i] else "SELL"} for i in range(start, n) if buy[i] or sell[i]][-1:],
            "marks": [[t[i - start], "BUY" if buy[i] else "SELL"] for i in range(start, n) if buy[i] or sell[i]],   # every signal in the chart range, for the Trade Desk
            "lines": None, "signal": None}
@@ -12304,6 +12436,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
  </aside>
  <div class="cwm">
   <div class="cwbar"><b id="cwTitle">Charts</b><button id="cwStar" class="cwstar" aria-pressed="false" title="Add to my watchlist" aria-label="Add to my watchlist">☆</button><div class="seg" id="cwInst" role="group" aria-label="Instrument"><button data-i="stock">Stock</button><button data-i="fut">Futures</button><button data-i="opt">Option</button></div>
+   <label class="sub" title="Volume bought minus volume sold in each candle, from the live feed"><input type="checkbox" id="cwDlt"> Delta</label>
    <div class="seg" id="cwTf" role="group" aria-label="Timeframe" style="margin-left:auto"></div></div>
   <div class="cwev" id="cwEv" hidden role="status"></div>
   <div class="cwtr" id="cwTr"><button class="b" data-sd="BUY" id="cwBuy">Buy</button><button class="s" data-sd="SELL" id="cwSell">Sell</button><span class="sub" id="cwTrN"></span></div>
@@ -12322,6 +12455,7 @@ tr.flash td:first-child{box-shadow:inset 6px 0 0 var(--hot)}
       <span class="oleg"><i style="background:#ff9f43"></i>Calls <i style="background:#35c9ff"></i>Puts</span><span class="sub" id="ocNote"></span></div>
      <div class="wrap" id="ocSvg"></div></div>
     <label class="more"><input type="checkbox" id="omore"> Show volume and IV</label>
+    <label class="more">OI and volume in <select id="ounit" aria-label="OI and volume units"><option value="q">Quantity (as in broker apps)</option><option value="c">Contracts (as on NSE)</option></select></label>
     <div class="wrap"><table class="otab" id="otable"></table></div>
     <div class="note" id="onote">Pick a script on the left. Every F&amp;O stock and index has a chain. Sensex and Bankex chains are priced by your broker and show no open interest.</div>
   
@@ -12906,6 +13040,17 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
  if(levels){const lastT=candles[candles.length-1].time,lv=(price,color,title,style)=>{const s=ch.addLineSeries({color,lineWidth:2,lineStyle:style,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false,title,autoscaleInfoProvider:()=>null});s.setData([{time:levels.from,value:price},{time:lastT,value:price}])};
   lv(levels.entry,ink,"Entry",0);lv(levels.sl,dn,"SL"+(levels.sl_hit?" ✖":""),0);levels.tps.forEach((p,i)=>lv(p,up,"T"+(i+1)+(levels.hits>i?" ✓":""),2))}
  $("cwLeg").innerHTML=legend.join("")+'<span class="cwlive" id="cwLive"></span>';ch.timeScale().setVisibleLogicalRange({from:Math.max(-1,NB-120),to:NB+7})   /* the latest candles sit clear of the price scale */
+ {const dOn=$("cwDlt").checked,dd=candles.filter(c=>c.d);
+  if(dOn&&cw.inst==="stock"&&dd.length){const dl=new Map(),hs=ch.addHistogramSeries({priceScaleId:"dl",priceLineVisible:false,lastValueVisible:false,priceFormat:{type:"volume"}});
+   ch.priceScale("dl").applyOptions({scaleMargins:{top:0.8,bottom:0}});
+   const data=dd.map(c=>{const v=c.d[0]-c.d[1],t=c.d[0]+c.d[1];dl.set(c.time,[v,t?v/t*100:0,c.d[2]]);return{time:c.time,value:Math.round(v),color:(v>=0?up:dn)+(c.d[2]?"66":"cc")}});hs.setData(data);
+   const lg=document.createElement("span");lg.id="cwDl";lg.className="cwlive";$("cwLeg").appendChild(lg);
+   const show=t=>{const x=dl.get(t)||dl.get(data[data.length-1].time);lg.innerHTML=`Delta <b class="${x[0]>=0?"up":"dn"}">${x[0]>0?"+":""}${fk(Math.round(x[0]))}</b> · score <b class="${x[1]>=0?"up":"dn"}">${x[1]>0?"+":""}${x[1].toFixed(0)}</b>${x[2]?' <span class="sub">(partial candle)</span>':""} <span class="sub">live feed, tick rule; only candles seen since the server began collecting</span>`};
+   show(null);ch.subscribeCrosshairMove(pm=>show(pm&&pm.time));
+   const base=markers.slice(),paint=()=>{const r=ch.timeScale().getVisibleLogicalRange(),n=r?r.to-r.from:999,lab=n<=Math.floor($("cwChart").clientWidth/24)?dd.map(c=>{const v=c.d[0]-c.d[1],a=Math.abs(v);return{time:c.time,position:"aboveBar",color:v>=0?up:dn,shape:"circle",size:0,text:(v>=0?"+":"-")+(a>=1e5?(a/1e5).toFixed(1)+"L":a>=1e3?Math.round(a/1e3)+"K":Math.round(a))}}):[];   // the value over each candle once the chart is zoomed in enough to read it
+    cs.setMarkers([...base,...lab].sort((x,y)=>x.time<y.time?-1:x.time>y.time?1:0))};
+   ch.timeScale().subscribeVisibleLogicalRangeChange(paint);paint()}
+  else if(dOn)$("cwLeg").insertAdjacentHTML("beforeend",'<span class="sub">'+(cw.inst==="stock"?"No delta collected for this chart yet. It is built from the live feed (5 min, 15 min, 1 hour and Daily charts of shares), starting when the server first sees the stock.":"Delta is shown on the Stock chart.")+'</span>')}
  if(keep&&keep.r){const d=NB-keep.n;try{ch.timeScale().setVisibleLogicalRange({from:keep.r.from+d,to:keep.r.to+d})}catch(e){}}
  $("cwBaseW").hidden=cw.inst==="stock";document.querySelector(".cwm").classList.toggle("cwopt",cw.inst!=="stock");
  if(cw.inst!=="stock"){$("cwBaseT").innerHTML=und&&und.length?`<b>${esc(sym)}</b> stock chart, same candles${cw.inst==="opt"?" and days as the option":" as the futures"} above`:esc(undErr||"The stock chart is not available for this symbol right now.");
@@ -12918,6 +13063,7 @@ async function cwLoad(silent){const my=++cw.my,sym=cw.sym;if(!sym)return;if(!sil
    try{if(same){const r=ch.timeScale().getVisibleLogicalRange();if(r)c2.timeScale().setVisibleLogicalRange(r)}else{const r=ch.timeScale().getVisibleRange();if(r)c2.timeScale().setVisibleRange(r)}}catch(e){}}}
  cwDrawLevels();cwDepthPoll()}
 const cw_REFRESH_MS=12000;
+{const dc=document.getElementById("cwDlt");try{dc.checked=localStorage.getItem("cwdelta")==="1"}catch(e){}dc.onchange=()=>{try{localStorage.setItem("cwdelta",dc.checked?"1":"0")}catch(e){}if(cw.sym)cwLoad()}}
 const dpn=n=>Number(n).toLocaleString("en-IN");
 function dpHtml(d){   // best 5 bids and offers side by side, with the buyer and seller totals in the table itself
  if(!d)return "";if(d.error)return `<div class="sub">${esc(d.error)}</div>`;if(d.nodepth)return "";
@@ -13014,6 +13160,8 @@ function initConf(){$("confOnly").onchange=()=>render()}
 document.getElementById("perfBar").onclick=e=>{const b=e.target.closest("[data-pf]");if(b)setMode(b.dataset.pf)};
 document.getElementById("mode").onclick=e=>{const b=e.target.closest("button");if(b)setMode(b.dataset.m)};
 document.getElementById("omore").onchange=()=>{if(lastChain)renderChain(lastChain)};
+{const ou=document.getElementById("ounit");try{ou.value=localStorage.getItem("oiunit")==="c"?"c":"q"}catch(e){}
+ou.onchange=()=>{try{localStorage.setItem("oiunit",ou.value)}catch(e){}if(lastChain)renderChain(lastChain)}}
 async function loadChain(quiet){
  if(!osym)return;const my=++oreq,box=document.getElementById("onote");
  if(!quiet){document.getElementById("otable").innerHTML="";document.getElementById("osum").hidden=true;box.textContent=`Loading the ${osym} option chain…`}
@@ -13596,10 +13744,11 @@ function renderChain(d){
  const sb=document.getElementById("osug");if(sb)sb.onclick=()=>openTicket({kind:"option",symbol:d.symbol,expiry:d.expiry,strike:+sb.dataset.strike,right:sb.dataset.right,side:"BUY",price:+sb.dataset.ltp,label:`${d.symbol} ${+sb.dataset.strike} ${sb.dataset.right} ${d.expiry}`});
  document.getElementById("oexp").onchange=e=>{oexp=e.target.value;cw.exp=oexp;loadChain();if(cw.inst==="opt")cwLoad()};
  const more=document.getElementById("omore").checked,cls=(...a)=>a.filter(Boolean).join(" ");
- const iv=l=>l.iv==null?"–":l.iv.toFixed(1);
+ const mul=document.getElementById("ounit").value==="q"&&d.lot>0?d.lot:1,sc=v=>v==null?null:v*mul;
+ const iv=l=>(l.iv==null||l.iv<=0)?"–":l.iv.toFixed(1);
  const rows=d.rows.map(r=>{const atm=r.strike===d.atm;
-  const ce=(more?[fk(r.ce.oi),sgn(r.ce.doi),fk(r.ce.vol),iv(r.ce),ltpBtn(r,"CE")]:[fk(r.ce.oi),sgn(r.ce.doi),ltpBtn(r,"CE")]);
-  const pe=(more?[ltpBtn(r,"PE"),iv(r.pe),fk(r.pe.vol),sgn(r.pe.doi),fk(r.pe.oi)]:[ltpBtn(r,"PE"),sgn(r.pe.doi),fk(r.pe.oi)]);
+  const ce=(more?[fk(sc(r.ce.oi)),sgn(sc(r.ce.doi)),fk(sc(r.ce.vol)),iv(r.ce),ltpBtn(r,"CE")]:[fk(sc(r.ce.oi)),sgn(sc(r.ce.doi)),ltpBtn(r,"CE")]);
+  const pe=(more?[ltpBtn(r,"PE"),iv(r.pe),fk(sc(r.pe.vol)),sgn(sc(r.pe.doi)),fk(sc(r.pe.oi))]:[ltpBtn(r,"PE"),sgn(sc(r.pe.doi)),fk(sc(r.pe.oi))]);
   const pickC=d.suggested&&d.suggested.side==="CE"&&atm,pickP=d.suggested&&d.suggested.side==="PE"&&atm;
   const ch=ce.map((c,i)=>`<td class="${cls(d.bias==="CE"&&"bias-ce",pickC&&i===ce.length-1&&"pick-ce")}">${c}</td>`).join("");
   const ph=pe.map((c,i)=>`<td class="${cls(d.bias==="PE"&&"bias-pe",pickP&&i===0&&"pick-pe")}">${c}</td>`).join("");
@@ -13607,7 +13756,7 @@ function renderChain(d){
  const cH=more?["OI","Chg OI","Volume","IV","LTP"]:["OI","Chg OI","LTP"],pH=more?["LTP","IV","Volume","Chg OI","OI"]:["LTP","Chg OI","OI"];
  drawChain(d);
  tb.innerHTML=`<thead><tr><th class="g" colspan="${cH.length}">Calls</th><th class="k" rowspan="2">Strike</th><th class="g" colspan="${pH.length}">Puts</th></tr><tr>${cH.map(h=>`<th>${h}</th>`).join("")}${pH.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${rows}</tbody>`;
- box.textContent=(d.note?d.note+" ":"")+(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The signal is calculated on the underlying's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click B or S beside a price to buy or sell that option.";
+ box.textContent=(d.note?d.note+" ":"")+(d.timestamp?`NSE data as of ${d.timestamp}. `:"")+(document.getElementById("ounit").value==="q"&&!(d.lot>0)?"Lot size not known for this symbol, so OI and volume are in contracts. ":"")+(mul>1?`OI and volume shown as quantity (contracts × lot size ${d.lot}). `:"")+(d.stale?"NSE did not respond just now, so this is the last copy received. ":"")+"Calls are tinted when the stock has a BUY signal and puts when it has a SELL signal. The signal is calculated on the underlying's own candles, not on option prices, because NSE does not provide option candle history. The at-the-money strike is shaded. Click B or S beside a price to buy or sell that option.";
 }
 {const _rc=renderChain;renderChain=function(d){_rc(d);try{cwRecoPaint()}catch(e){}}}
 setInterval(()=>{if(mode==="charts"&&osym){loadChain(true);cwRecLoad(cw.sym,true)}},60000);
